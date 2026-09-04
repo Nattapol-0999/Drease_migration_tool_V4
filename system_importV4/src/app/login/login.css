@@ -1,0 +1,95 @@
+/* Login screen. Kept in its own file so the shared globals.css is left alone. */
+
+.login-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+}
+
+.login-card h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.login-card .login-sub {
+  color: var(--muted);
+  margin: 0 0 20px;
+  font-size: 13px;
+}
+
+.login-field {
+  display: block;
+  margin: 0 0 14px;
+}
+
+.login-field span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.login-field input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.login-field input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+.login-btn {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.login-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.login-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.login-btn:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+/* role="alert" so the message is announced, not just shown. */
+.login-error {
+  margin: 0 0 14px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--bad);
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--text);
+  font-size: 13px;
+}

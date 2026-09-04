@@ -1,0 +1,21 @@
+# Build artifact. Rebuilt with: go build -o system_cliv4.exe .
+*.exe
+# Cross-compiled for the deployed server. Rebuilt with:
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o system_cliv4_linux_amd64 .
+system_cliv4_linux_amd64
+
+# GENERATED SQL — CONTAINS REAL PATIENT DATA.
+# Every file in out/ carries patient names, HNs, invoice numbers and amounts for a
+# real clinic. These are the artifact of one run, not source; they belong in the
+# operator's records, never in version control.
+/out/
+
+# Scratch files from investigating a dump (row counts, name comparisons, psql output).
+*.tsv
+*.txt
+!README.txt
+
+# Local dumps. A clinic's export must never be committed.
+*.sql
+*.js
+*.ods

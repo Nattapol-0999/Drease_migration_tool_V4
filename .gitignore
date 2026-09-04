@@ -1,0 +1,25 @@
+# Belt and braces. Each project keeps its own .gitignore with the rules that only make
+# sense inside it (the CLI ignores *.sql / *.js / *.ods because those are clinic dumps,
+# which would be wrong to apply to the TypeScript project). These are the rules that must
+# hold everywhere in the tree.
+
+# Dependencies and build output
+node_modules/
+.next/
+*.tsbuildinfo
+
+# Compiled CLI. Rebuilt with:
+#   go build -o system_cliv4.exe .                              (windows)
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o system_cliv4_linux_amd64 .
+*.exe
+system_cliv4_linux_amd64
+
+# Secrets. The database password, the session signing key and the operator's password
+# hash all live in .env.local, which is why it is never committed.
+.env
+.env*.local
+*.pem
+
+# Editor / OS noise
+.DS_Store
+.vscode/
