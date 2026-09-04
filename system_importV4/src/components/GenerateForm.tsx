@@ -9,6 +9,10 @@ import {
   type ImportGroup,
   type LegacySourceStatus,
   type PullResponse,
+  type ClinicAPIStatus,
+  type ClinicAPIStatusResponse,
+  type CreateClinicResponse,
+  type ProvisionedClinic,
   type TargetId,
   type TargetInfo,
   type TargetsResponse,
@@ -58,6 +62,17 @@ export default function GenerateForm() {
   // production should be a choice made now, not one inherited from a previous session.
   const [targetId, setTargetId] = useState<TargetId>("test");
   const [serverConfirm, setServerConfirm] = useState("");
+
+  // Creating the clinic at the target. Availability is probed rather than assumed, so the
+  // control is never offered when it cannot work — and says which part is missing.
+  const [clinicApi, setClinicApi] = useState<ClinicAPIStatus[] | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState<string | null>(null);
+  const [created, setCreated] = useState<ProvisionedClinic | null>(null);
+  const [newThaName, setNewThaName] = useState("");
+  const [ownerName, setOwnerName] = useState("");
+  const [ownerEmail, setOwnerEmail] = useState("");
   const [importing, setImporting] = useState(false);
   const [checking, setChecking] = useState(false);
   // Everything by default; an operator narrows it when the target already has some.
@@ -78,11 +93,57 @@ export default function GenerateForm() {
       .then((r) => r.json())
       .then(setLegacy)
       .catch(() => setLegacy({ configured: false }));
+    // Probes each backend; read-only, and the probe deliberately sends an invalid code so
+    // it cannot create anything.
+    fetch("/api/clinic-api-status")
+      .then((r) => r.json() as Promise<ClinicAPIStatusResponse>)
+      .then((j) => setClinicApi(j.targets ?? []))
+      .catch(() => setClinicApi([]));
   }, []);
 
   const chosen = CLI_INPUTS.filter((i) => files[i.field]);
   const selected = targets?.find((t) => t.id === targetId) ?? null;
   const onProduction = selected?.isProduction === true;
+  const createApi = clinicApi?.find((c) => c.id === targetId) ?? null;
+
+  /**
+   * createClinic asks the selected environment's backend to provision the clinic.
+   *
+   * On success the code is written into the clinic_code field, because that is the value
+   * every step below needs and re-typing a generated code is how a typo gets imported.
+   */
+  async function createClinic() {
+    setCreateErr(null);
+    setCreated(null);
+    setCreating(true);
+    try {
+      const res = await fetch("/api/create-clinic", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetId,
+          clinicCode: clinic.trim(),
+          thaName: newThaName.trim(),
+          ownerName: ownerName.trim(),
+          ownerEmail: ownerEmail.trim(),
+        }),
+      });
+      const json = (await res.json()) as CreateClinicResponse;
+      if (!json.ok) {
+        setCreateErr(json.error);
+        return;
+      }
+      setCreated(json.clinic);
+      setClinic(json.clinic.clinic_code);
+      // The clinic exists now, so any earlier "not found at the target" verdict is stale.
+      setImportDone(null);
+      setImportErr(null);
+    } catch (e) {
+      setCreateErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
 
   async function submit() {
     setErr(null);
@@ -339,6 +400,209 @@ export default function GenerateForm() {
           onChange={(e) => setClinic(e.target.value)}
           placeholder="เช่น C9D4865"
         />
+
+        {/* Creating the clinic at the target. Shown as its own step because it WRITES to
+            the target, unlike everything else in this panel. */}
+        {clinicApi === null ? (
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            กำลังตรวจว่าสร้างคลินิกที่ปลายทางได้ไหม…
+          </div>
+        ) : !createApi?.available ? (
+          <div className="msg warn" style={{ marginTop: 8 }}>
+            ยังสร้างคลินิกจากหน้านี้ไม่ได้ — {createApi?.reason ?? "ไม่ทราบสาเหตุ"}
+            {createApi?.api ? (
+              <>
+                <br />
+                ปลายทางที่จะเรียก: <code>{createApi.api}</code>
+              </>
+            ) : null}
+            <br />
+            ระหว่างนี้ต้องสร้างคลินิกในระบบ V4 เองก่อน แล้วกรอก <code>clinic_code</code> ข้างบน
+          </div>
+        ) : !showCreate ? (
+          <div className="row" style={{ marginTop: 8 }}>
+            <button type="button" className="secondary" onClick={() => setShowCreate(true)}>
+              ยังไม่มีคลินิกนี้? สร้างที่ปลายทาง
+            </button>
+            <span className="muted" style={{ fontSize: 12 }}>
+              เรียก backend ของ {selected?.label ?? targetId} ให้สร้างให้ — เว้น{" "}
+              <code>clinic_code</code> ว่างไว้ได้ ระบบจะสุ่มรหัสให้
+            </span>
+          </div>
+        ) : (
+          <div className={onProduction ? "tgt-danger" : "panel"} style={{ marginTop: 8 }}>
+            <b>สร้างคลินิกที่ {selected?.label ?? targetId}</b>
+            {onProduction && (
+              <>
+                {" "}
+                — <strong>เซิร์ฟเวอร์ของจริง</strong>
+              </>
+            )}
+            <div className="muted" style={{ fontSize: 12, margin: "4px 0 8px" }}>
+              สร้างตัวคลินิก + สาขาแรก + ฟีเจอร์ + subscription ในทรานแซกชันเดียว ·
+              เรียกซ้ำด้วยรหัสเดิมไม่สร้างของซ้ำ (รายงานว่าอะไรมีอยู่แล้ว)
+            </div>
+
+            <label htmlFor="new-clinic-name">ชื่อคลินิก (ไม่ใส่ก็ได้ — จะใช้ clinic_code เป็นชื่อ)</label>
+            <input
+              id="new-clinic-name"
+              type="text"
+              value={newThaName}
+              onChange={(e) => setNewThaName(e.target.value)}
+              placeholder="เช่น คลินิกตัวอย่าง"
+            />
+
+            <h3 style={{ marginTop: 14 }}>บัญชี owner (ไม่ใส่ก็ได้)</h3>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+              ใส่อีเมลแล้วระบบจะสร้างบัญชีผู้ดูแลคลินิกให้ในทรานแซกชันเดียวกัน — ได้ role{" "}
+              <code>owner</code> และโผล่ในหน้า Settings › ผู้ใช้งาน ·{" "}
+              <b>ไม่ต้องกรอกรหัสผ่าน ระบบสุ่มให้แล้วแสดงครั้งเดียว</b>
+            </div>
+
+            <label htmlFor="owner-name">ชื่อ owner</label>
+            <input
+              id="owner-name"
+              type="text"
+              value={ownerName}
+              onChange={(e) => setOwnerName(e.target.value)}
+              placeholder="เช่น คุณสมชาย"
+              autoComplete="off"
+            />
+
+            <label htmlFor="owner-email">อีเมล owner (ใช้ล็อกอิน)</label>
+            <input
+              id="owner-email"
+              type="email"
+              value={ownerEmail}
+              onChange={(e) => setOwnerEmail(e.target.value)}
+              placeholder="owner@example.com"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              อีเมลต้องไม่ถูกใช้โดยบัญชีของคลินิกอื่น — <code>users.email</code> ไม่ซ้ำได้ทั้งระบบ
+            </div>
+
+            <div className="row" style={{ marginTop: 10 }}>
+              <button type="button" onClick={createClinic} disabled={creating}>
+                {creating
+                  ? "กำลังสร้าง…"
+                  : clinic.trim()
+                    ? `สร้าง ${clinic.trim()}`
+                    : "สร้าง (สุ่มรหัสให้)"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => {
+                  setShowCreate(false);
+                  setCreateErr(null);
+                }}
+                disabled={creating}
+              >
+                ยกเลิก
+              </button>
+            </div>
+
+            {createErr && <div className="msg error">{createErr}</div>}
+
+            {created && (
+              <div className="msg ok">
+                <b>
+                  {created.identity === "created" ? "สร้างคลินิกแล้ว" : "คลินิกนี้มีอยู่แล้ว"} ·{" "}
+                  <code>{created.clinic_code}</code>
+                </b>
+                {created.generated && <> (รหัสสุ่มให้)</>}
+                <ul className="tight">
+                  <li>
+                    ตัวคลินิก: <b>{created.identity === "created" ? "สร้างใหม่" : "มีอยู่แล้ว"}</b>
+                  </li>
+                  <li>
+                    สาขา:{" "}
+                    <b>
+                      {created.branch === "created"
+                        ? `สร้างใหม่ ${created.branch_code ?? ""}`
+                        : `มีอยู่แล้ว ${created.branch_count} สาขา`}
+                    </b>
+                    {created.branch === "created" && created.identity === "existed" && (
+                      <>
+                        {" "}
+                        — คลินิกนี้เดิมไม่มีสาขา ซึ่งทำให้บันทึกคนไข้ไม่ได้ ตอนนี้แก้แล้ว
+                      </>
+                    )}
+                  </li>
+                  <li>
+                    subscription: <b>{created.subscription}</b>
+                    {created.subscription_status ? <> ({created.subscription_status})</> : null} ·{" "}
+                    {created.never_expires ? (
+                      <b style={{ color: "var(--ok)" }}>ไม่มีวันหมดอายุ</b>
+                    ) : (
+                      <b style={{ color: "var(--bad)" }}>หมดอายุ {created.expires_on}</b>
+                    )}{" "}
+                    · ฟีเจอร์: <b>{created.features}</b>
+                  </li>
+                </ul>
+
+                {!created.never_expires && (
+                  <div className="msg warn" style={{ margin: "8px 0" }}>
+                    คลินิกนี้มี subscription เดิมอยู่แล้วและ<b>ยังนับถอยหลังถึง {created.expires_on}</b> —
+                    ระบบไม่เขียนทับให้ เพราะใบเดิมอาจเป็นแพ็กเกจที่จ่ายเงินอยู่ ถ้าต้องการให้ไม่หมดอายุ
+                    ต้องแก้ที่ระบบ V4 เอง
+                  </div>
+                )}
+
+                {created.owner ? (
+                  <div style={{ marginTop: 8 }}>
+                    <b>บัญชี owner</b>
+                    <ul className="tight">
+                      <li>
+                        <code>{created.owner.email}</code> · {created.owner.name} (user_id{" "}
+                        {created.owner.user_id})
+                      </li>
+                      <li>
+                        บัญชี: <b>{created.owner.user === "created" ? "สร้างใหม่" : "มีอยู่แล้ว"}</b> ·
+                        สิทธิ์ owner: <b>{created.owner.membership === "created" ? "ผูกให้แล้ว" : "มีอยู่แล้ว"}</b> ·
+                        ทะเบียนพนักงาน: <b>{created.owner.staff === "created" ? "สร้างใหม่" : "มีอยู่แล้ว"}</b>
+                      </li>
+                      {created.owner.clinic_already_had_owner && created.owner.user === "existed" && (
+                        <li className="muted">คลินิกนี้มี owner อยู่ก่อนแล้ว ระบบไม่ได้แตะรหัสผ่านเดิม</li>
+                      )}
+                    </ul>
+
+                    {created.owner.generated_password ? (
+                      <div className="tgt-danger" role="alert">
+                        <strong>รหัสผ่านนี้แสดงครั้งเดียว</strong> — คัดลอกเก็บไว้เดี๋ยวนี้ ระบบเก็บไว้เป็น
+                        bcrypt hash เท่านั้น เปิดดูซ้ำไม่ได้
+                        <br />
+                        <code style={{ fontSize: 15, letterSpacing: 1 }}>
+                          {created.owner.generated_password}
+                        </code>
+                        {created.owner.must_change_password && (
+                          <>
+                            <br />
+                            ต้องเปลี่ยนรหัสผ่านตอนล็อกอินครั้งแรก
+                          </>
+                        )}
+                      </div>
+                    ) : created.owner.user === "created" ? (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        ใช้รหัสผ่านที่ส่งมาในคำขอ (ไม่แสดงซ้ำ)
+                      </div>
+                    ) : null}
+                  </div>
+                ) : ownerEmail.trim() ? null : (
+                  <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                    ยังไม่ได้สร้างบัญชี owner (ไม่ได้กรอกอีเมล) — คลินิกนี้จะยังไม่มีใครล็อกอินเข้าไปดูแลได้
+                  </div>
+                )}
+
+                <div style={{ marginTop: 8 }}>
+                  รหัสถูกเติมลงช่อง <code>clinic_code</code> ให้แล้ว — ไปขั้นถัดไปได้เลย
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         <label>owner_username (จำเป็นเมื่อแนบไฟล์ SQL)</label>
         <input

@@ -130,3 +130,73 @@ export interface TargetsResponse {
   /** Environments that are configured incompletely, and what they are missing. */
   problems?: { id: TargetId; missing: string[] }[];
 }
+
+// ── สร้างคลินิกที่ปลายทาง (เรียก POST /v3/import/clinics ของ backend) ─────────
+
+/** Whether creating a clinic is possible on one environment right now, and why not. */
+export interface ClinicAPIStatus {
+  id: TargetId;
+  available: boolean;
+  /** What to fix. Present only when available is false. */
+  reason?: string;
+  missing?: string[];
+  /** Where the request goes. Never carries the token. */
+  api?: string;
+  probeStatus?: number;
+}
+
+/** GET /api/clinic-api-status */
+export interface ClinicAPIStatusResponse {
+  targets: ClinicAPIStatus[];
+}
+
+/** The owner account, as the backend reports it. Mirrors admin.OwnerResult. */
+export interface ProvisionedOwner {
+  user_id: number;
+  email: string;
+  name: string;
+  /** "created" | "existed" */
+  user: string;
+  /** "created" | "existed" — the clinic_user membership carrying the owner role. */
+  membership: string;
+  /** "created" | "existed" — the clinic_staff row shown on Settings › ผู้ใช้งาน. */
+  staff: string;
+  /** Present ONCE, and only when the server generated it. Not stored in readable form. */
+  generated_password?: string;
+  must_change_password: boolean;
+  /** True when the clinic already had somebody holding the owner role. */
+  clinic_already_had_owner: boolean;
+}
+
+/** What the backend reports back after provisioning. Mirrors admin.ProvisionResult. */
+export interface ProvisionedClinic {
+  clinic_code: string;
+  generated: boolean;
+  /** "created" | "existed" */
+  identity: string;
+  /** "created" | "existed" */
+  branch: string;
+  branch_code?: string;
+  branch_count: number;
+  /** "created" | "existed" | "skipped" */
+  subscription: string;
+  /** "stamped" | "kept" */
+  features: string;
+  tha_name: string;
+  eng_name: string;
+  active: boolean;
+  /**
+   * Whether the clinic can stop working on a date. Reported separately from
+   * `subscription` so "existed" can never hide a row that is still counting down.
+   */
+  never_expires: boolean;
+  /** Set only when the subscription DOES have an end date. */
+  expires_on?: string;
+  subscription_status?: string;
+  owner?: ProvisionedOwner;
+}
+
+/** POST /api/create-clinic */
+export type CreateClinicResponse =
+  | { ok: true; target: string; seconds: string; clinic: ProvisionedClinic }
+  | { ok: false; error: string; status?: number; target?: string; missing?: string[]; raw?: string };
