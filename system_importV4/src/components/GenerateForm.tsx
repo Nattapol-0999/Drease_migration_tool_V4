@@ -9,7 +9,12 @@ import {
   type ImportGroup,
   type LegacySourceStatus,
   type PullResponse,
+  type TargetId,
+  type TargetInfo,
+  type TargetsResponse,
 } from "@/lib/types";
+
+import "./target-picker.css";
 
 /** base64 → bytes, so a pulled dump becomes a File with its bytes intact. */
 function base64ToBytes(b64: string): Uint8Array {
@@ -45,9 +50,13 @@ export default function GenerateForm() {
   const [pulledFrom, setPulledFrom] = useState<string | null>(null);
   const [pulledFields, setPulledFields] = useState<CliInputField[]>([]);
 
-  // "import to server" state. The target comes from the server so the browser never
-  // sees the key path or the password.
-  const [target, setTarget] = useState<{ configured: boolean; description?: string; missing?: string[] } | null>(null);
+  // "import to server" state. The environments come from the server so the browser never
+  // sees a host, a key path or a password — only an ID it may send back.
+  const [targets, setTargets] = useState<TargetInfo[] | null>(null);
+  const [targetProblems, setTargetProblems] = useState<{ id: TargetId; missing: string[] }[]>([]);
+  // Always test on load, and deliberately not remembered across a refresh: firing at
+  // production should be a choice made now, not one inherited from a previous session.
+  const [targetId, setTargetId] = useState<TargetId>("test");
   const [serverConfirm, setServerConfirm] = useState("");
   const [importing, setImporting] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -59,9 +68,12 @@ export default function GenerateForm() {
 
   useEffect(() => {
     fetch("/api/target")
-      .then((r) => r.json())
-      .then(setTarget)
-      .catch(() => setTarget({ configured: false }));
+      .then((r) => r.json() as Promise<TargetsResponse>)
+      .then((j) => {
+        setTargets(j.targets ?? []);
+        setTargetProblems(j.problems ?? []);
+      })
+      .catch(() => setTargets([]));
     fetch("/api/legacy-source")
       .then((r) => r.json())
       .then(setLegacy)
@@ -69,6 +81,8 @@ export default function GenerateForm() {
   }, []);
 
   const chosen = CLI_INPUTS.filter((i) => files[i.field]);
+  const selected = targets?.find((t) => t.id === targetId) ?? null;
+  const onProduction = selected?.isProduction === true;
 
   async function submit() {
     setErr(null);
@@ -186,7 +200,7 @@ export default function GenerateForm() {
       const res = await fetch("/api/check-target", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ clinicCode: clinic.trim() }),
+        body: JSON.stringify({ clinicCode: clinic.trim(), targetId }),
       });
       const json = (await res.json()) as {
         ok: boolean;
@@ -200,10 +214,11 @@ export default function GenerateForm() {
         setImportErr(json.error ?? "ตรวจไม่ผ่าน");
         return;
       }
+      const where = json.target ?? targetId;
       setImportDone(
         json.clinicExists
-          ? `เชื่อมต่อได้ · พบ clinic_code ${clinic.trim()} ที่ปลายทาง — พร้อมนำเข้า`
-          : `เชื่อมต่อได้ แต่ยังไม่พบ clinic_code ${clinic.trim()} ที่ปลายทาง — ต้องสร้างคลินิกก่อน ไม่งั้นสคริปต์จะหยุดเอง`,
+          ? `เชื่อมต่อได้ (${where}) · พบ clinic_code ${clinic.trim()} ที่ปลายทาง — พร้อมนำเข้า`
+          : `เชื่อมต่อได้ (${where}) แต่ยังไม่พบ clinic_code ${clinic.trim()} ที่ปลายทาง — ต้องสร้างคลินิกก่อน ไม่งั้นสคริปต์จะหยุดเอง`,
       );
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
@@ -225,6 +240,7 @@ export default function GenerateForm() {
           sql: result.sql,
           clinicCode: clinic.trim(),
           confirm: serverConfirm.trim(),
+          targetId,
         }),
       });
       const json = (await res.json()) as {
@@ -251,6 +267,66 @@ export default function GenerateForm() {
     <div>
       <div className="panel">
         <h2>1 · ปลายทาง</h2>
+
+        <label htmlFor="target-select">เซิร์ฟเวอร์ปลายทาง</label>
+        {targets === null ? (
+          <div className="muted" style={{ fontSize: 12 }}>กำลังอ่านรายการปลายทาง…</div>
+        ) : targets.length === 0 ? (
+          <div className="msg warn">
+            ยังไม่มีปลายทางที่ตั้งค่าครบใน <code>.env.local</code>
+            {targetProblems.map((p) => (
+              <div key={p.id}>
+                <code>{p.id}</code> ขาด {p.missing.join(", ")}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <>
+            <div className="tgt-row">
+              <select
+                id="target-select"
+                className={`tgt-select${onProduction ? " is-prod" : ""}`}
+                value={targetId}
+                onChange={(e) => {
+                  setTargetId(e.target.value as TargetId);
+                  // A different server makes the previous check meaningless.
+                  setImportDone(null);
+                  setImportErr(null);
+                  setImportLog(null);
+                }}
+              >
+                {targets.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.isProduction ? `${t.label} — ของจริง` : t.label}
+                  </option>
+                ))}
+              </select>
+              {selected && <span className="tgt-where">{selected.description}</span>}
+            </div>
+            {targetProblems.length > 0 && (
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                ตั้งค่าไม่ครบ:{" "}
+                {targetProblems.map((p) => `${p.id} (ขาด ${p.missing.join(", ")})`).join(" · ")}
+              </div>
+            )}
+          </>
+        )}
+
+        {onProduction && (
+          <div className="tgt-danger" role="alert">
+            <strong>นี่คือเซิร์ฟเวอร์ของจริง</strong> — ทุกอย่างที่กดต่อจากนี้เขียนลงข้อมูลคนไข้จริง
+            <br />
+            ปลายทาง: <code>{selected?.description}</code>
+            <br />
+            ระวังเป็นพิเศษ: ชื่อฐานข้อมูลของ <code>production</code> กับ <code>test</code>{" "}
+            <b>เหมือนกันทั้งคู่</b> (<code>drease_temporary</code>) สิ่งเดียวที่แยกสองระบบคือ IP
+            ด่านพิมพ์ <code>clinic_code</code> ยืนยันจึงไม่ช่วยจับกรณีเลือกเซิร์ฟเวอร์ผิด
+            <br />
+            ถ้าคลินิกนี้มีข้อมูลอยู่แล้วที่ปลายทาง การนำเข้าสิทธิ์คอร์สจะ{" "}
+            <b>ลบแถวเดิมแล้วสร้างใหม่</b> — กด &quot;ตรวจการเชื่อมต่อ&quot; ก่อนเพื่อดูว่ามีอะไรอยู่
+          </div>
+        )}
+
         <div className="msg info">
           คลินิกต้อง <b>สร้างในระบบก่อน</b> — สคริปต์ที่ได้จะตรวจและหยุดทันทีถ้าไม่พบ{" "}
           <code>clinic_code</code> นี้ในฐานข้อมูล
@@ -523,16 +599,25 @@ export default function GenerateForm() {
             </div>
 
             <h3>นำเข้าไปที่เซิร์ฟเวอร์</h3>
-            {!target?.configured ? (
+            {!selected ? (
               <div className="msg warn">
-                ปุ่มนี้ปิดอยู่ — ยังไม่ได้ตั้งค่าปลายทางใน <code>.env.local</code>
-                {target?.missing?.length ? <> (ขาด {target.missing.join(", ")})</> : null}
+                ปุ่มนี้ปิดอยู่ — ยังไม่ได้เลือกปลายทางที่ตั้งค่าครบ (ดูกล่อง 1 · ปลายทาง)
               </div>
             ) : (
               <>
-                <div className="msg warn">
-                  <b>เขียนลงฐานข้อมูลจริง ย้อนยาก</b> — ปลายทาง:{" "}
-                  <code>{target.description}</code>
+                <div className={onProduction ? "tgt-danger" : "msg warn"} role={onProduction ? "alert" : undefined}>
+                  {onProduction ? (
+                    <>
+                      <strong>กำลังจะเขียนลงเซิร์ฟเวอร์ของจริง</strong>
+                      <br />
+                    </>
+                  ) : (
+                    <>
+                      <b>เขียนลงฐานข้อมูลจริง ย้อนยาก</b>
+                      <br />
+                    </>
+                  )}
+                  ปลายทาง: <code>{selected.description}</code>
                   <br />
                   สคริปต์อยู่ในทรานแซกชันเดียว ถ้ามีอะไรผิดจะ rollback ทั้งหมด และถ้าไม่พบ{" "}
                   <code>clinic_code</code> ที่ปลายทาง จะหยุดทันที
@@ -555,13 +640,19 @@ export default function GenerateForm() {
                 />
                 <div className="row" style={{ marginTop: 10 }}>
                   <button
-                    className="go"
+                    className={`go${onProduction ? " is-prod" : ""}`}
                     onClick={importToServer}
                     disabled={importing || !clinic.trim() || serverConfirm.trim() !== clinic.trim()}
                   >
-                    {importing ? "กำลังนำเข้า…" : "import to server"}
+                    {importing
+                      ? "กำลังนำเข้า…"
+                      : onProduction
+                        ? `import to ${selected.label} (ของจริง)`
+                        : `import to ${selected.label}`}
                   </button>
-                  {importing && <span className="muted">กำลังรัน psql บนเซิร์ฟเวอร์…</span>}
+                  {importing && (
+                    <span className="muted">กำลังรัน psql บน {selected.label}…</span>
+                  )}
                 </div>
 
                 {importDone && <div className="msg ok">{importDone}</div>}

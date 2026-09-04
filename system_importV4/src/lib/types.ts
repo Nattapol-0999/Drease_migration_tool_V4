@@ -103,3 +103,30 @@ export interface LegacySourceStatus {
   /** Empty/absent means any host may be entered. */
   hostsAllowed?: string[];
 }
+
+// ── ปลายทาง: test / production ────────────────────────────────────────────────
+//
+// The browser sends an ID from this list and nothing else. Every host, database name and
+// credential lives on the server, so a tampered request cannot point an import at a
+// server that was never configured.
+
+export const TARGET_IDS = ["test", "production"] as const;
+export type TargetId = (typeof TARGET_IDS)[number];
+
+/** One environment, as the UI is allowed to see it. Never carries a key path or password. */
+export interface TargetInfo {
+  id: TargetId;
+  /** Short name for the dropdown, e.g. "test". */
+  label: string;
+  /** Where it points, safe to display: "test · ubuntu@1.2.3.4 · drease_temporary (peer)". */
+  description: string;
+  /** Drives the red warning. True for the environment holding real clinic data. */
+  isProduction: boolean;
+}
+
+/** GET /api/target */
+export interface TargetsResponse {
+  targets: TargetInfo[];
+  /** Environments that are configured incompletely, and what they are missing. */
+  problems?: { id: TargetId; missing: string[] }[];
+}

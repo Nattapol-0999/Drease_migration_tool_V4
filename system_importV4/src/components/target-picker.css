@@ -1,0 +1,66 @@
+/* The environment picker and its production warning.
+   Kept out of globals.css so the shared stylesheet is left alone. */
+
+.tgt-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.tgt-select {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  min-width: 260px;
+}
+
+.tgt-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Production borrows the danger colour so the difference is visible before reading. */
+.tgt-select.is-prod {
+  border-color: var(--bad);
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.tgt-where {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The one guard on a production run: make it impossible to miss which server is selected. */
+.tgt-danger {
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  border: 2px solid var(--bad);
+  border-left-width: 6px;
+  border-radius: 6px;
+  background: rgba(248, 81, 73, 0.14);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.tgt-danger strong {
+  color: var(--bad);
+}
+
+.tgt-danger code {
+  color: var(--text);
+}
+
+/* Applied to the green import button when production is the selected environment, so the
+   final click does not look like the routine one. */
+.go.is-prod {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+}

@@ -5,7 +5,7 @@ import {
   describeTarget,
   hint,
   psqlCommand,
-  readServerTarget,
+  resolveTarget,
   runSSH,
   sshArgs,
 } from "@/lib/server-target";
@@ -14,14 +14,15 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // This endpoint WRITES to a real database. Everything below exists to make that
-// deliberate: the target must be fully configured, the caller must retype the
-// clinic_code, and the SQL it runs is exactly the reviewed artifact — the server is
-// never handed anything the operator has not seen.
+// deliberate: the environment must be one that was configured on the server, the caller
+// must retype the clinic_code, and the SQL it runs is exactly the reviewed artifact —
+// the server is never handed anything the operator has not seen.
 
 interface Body {
   sql?: string;
   clinicCode?: string;
   confirm?: string;
+  targetId?: string;
 }
 
 function fail(error: string, status = 400): Response {
@@ -33,19 +34,23 @@ export async function POST(req: Request): Promise<Response> {
   const auth = await requireSession(req);
   if ("denied" in auth) return auth.denied;
 
-  const { target, missing } = readServerTarget();
-  if (!target) {
-    return fail(
-      `ยังไม่ได้ตั้งค่าปลายทาง — ขาด ${missing.join(", ")} ใน .env.local แล้วรีสตาร์ต dev server`,
-      503,
-    );
-  }
-
   let body: Body;
   try {
     body = (await req.json()) as Body;
   } catch {
     return fail("อ่าน body ไม่ได้");
+  }
+
+  // The environment is resolved from a fixed list on the server. The browser sends an ID,
+  // never a host: a request cannot point this at a database that was not configured here,
+  // and there is no fallback default, because falling back is how a run meant for test
+  // lands on production.
+  const target = resolveTarget(body.targetId);
+  if (!target) {
+    return fail(
+      `ปลายทาง "${body.targetId ?? ""}" ไม่ถูกตั้งค่าไว้ — เลือกจากรายการที่มี`,
+      400,
+    );
   }
 
   const sql = (body.sql ?? "").trim();
@@ -68,6 +73,23 @@ export async function POST(req: Request): Promise<Response> {
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const log = [r.stdout, r.stderr].filter(Boolean).join("\n").trim();
 
+  // Every write attempt is recorded, successful or not. Without it there is no way to
+  // answer "who ran what, where, and when" after the fact.
+  console.log(
+    JSON.stringify({
+      event: "import-to-server",
+      at: new Date().toISOString(),
+      user: auth.session.user,
+      target: target.id,
+      host: target.sshHost,
+      database: target.dbName,
+      clinic,
+      bytes: sql.length,
+      exit: r.code,
+      seconds,
+    }),
+  );
+
   if (r.code !== 0) {
     return Response.json(
       {
@@ -76,6 +98,7 @@ export async function POST(req: Request): Promise<Response> {
           hint(r) ||
           `นำเข้าไม่สำเร็จ (exit ${r.code}) — ฐานข้อมูลไม่ถูกเปลี่ยน เพราะสคริปต์อยู่ในทรานแซกชันเดียว`,
         target: describeTarget(target),
+        isProduction: target.isProduction,
         seconds,
         log,
       },
@@ -86,6 +109,7 @@ export async function POST(req: Request): Promise<Response> {
   return Response.json({
     ok: true,
     target: describeTarget(target),
+    isProduction: target.isProduction,
     seconds,
     log: log || "psql ไม่ได้ส่งข้อความใด (สำเร็จ)",
   });
