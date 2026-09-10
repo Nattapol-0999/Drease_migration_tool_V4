@@ -4,21 +4,155 @@ import { useEffect, useState } from "react";
 import {
   CLI_INPUTS,
   IMPORT_GROUPS,
+  CHUNK_BYTES,
+  JOB_POLL_MS,
+  MAX_UPLOAD_BYTES,
+  MONGO_COLLECTIONS_USED,
+  branchMapArg,
+  type BranchSurvey,
+  type BranchSurveyRow,
   type CliInputField,
-  type GenerateResponse,
+  type JobStartResponse,
+  type JobStatusResponse,
+  type JobView,
   type ImportGroup,
   type LegacySourceStatus,
+  type ProvisionBranchInput,
   type PullResponse,
+  type SurveyBranchesResponse,
+  type TaxProfileInput,
   type ClinicAPIStatus,
   type ClinicAPIStatusResponse,
   type CreateClinicResponse,
+  type PhotoImportResponse,
   type ProvisionedClinic,
   type TargetId,
   type TargetInfo,
   type TargetsResponse,
 } from "@/lib/types";
 
+import BusyOverlay, { type BusyState } from "./BusyOverlay";
+
 import "./target-picker.css";
+
+/**
+ * postFormWithProgress posts a FormData and reports how many bytes have left the browser.
+ *
+ * fetch() cannot do this — no browser implements an upload-progress event for it — so a
+ * 240 MB body is indistinguishable from a hung request. XMLHttpRequest still exposes
+ * `upload.onprogress`, and that is the only measured number available on this path.
+ *
+ * The response is handed back as raw text with its status: a rejected upload often comes
+ * back as HTML from a proxy (413), and JSON.parse-ing that produces a syntax error
+ * instead of the reason.
+ */
+function postFormWithProgress(
+  url: string,
+  body: FormData,
+  onProgress: (loaded: number, total: number) => void,
+  onUploaded: () => void,
+): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(e.loaded, e.total);
+    };
+    xhr.upload.onload = () => onUploaded();
+    xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText });
+    // Every failure path says what happened. A silent handler here is how a dropped
+    // connection halfway through a large upload turns into a form that simply stops.
+    xhr.onerror = () =>
+      reject(
+        new Error(
+          "ส่งไฟล์ไม่สำเร็จ — การเชื่อมต่อขาดกลางทาง (ไฟล์ใหญ่เกินที่ proxy ยอมรับก็ขึ้นแบบนี้)",
+        ),
+      );
+    xhr.ontimeout = () => reject(new Error("ส่งไฟล์ไม่สำเร็จ — หมดเวลารอ"));
+    xhr.onabort = () => reject(new Error("การส่งไฟล์ถูกยกเลิก"));
+    xhr.send(body);
+  });
+}
+
+/**
+ * uploadOneChunk posts a single slice and returns the session it belongs to.
+ *
+ * Slices go out one at a time rather than in parallel: the server appends them and refuses
+ * anything that does not start exactly where the file currently ends, which is what makes
+ * a scrambled dump impossible. Sequential is also kinder to a home upstream link.
+ */
+async function uploadOneChunk(
+  sessionId: string,
+  field: CliInputField,
+  offset: number,
+  slice: Blob,
+  onProgress: (loadedInSlice: number) => void,
+): Promise<string> {
+  const body = new FormData();
+  if (sessionId) body.append("sessionId", sessionId);
+  body.append("field", field);
+  body.append("offset", String(offset));
+  body.append("chunk", slice);
+
+  const res = await postFormWithProgress(
+    "/api/upload-chunk",
+    body,
+    (loaded) => onProgress(loaded),
+    () => {},
+  );
+
+  let json: { ok: boolean; sessionId?: string; error?: string };
+  try {
+    json = JSON.parse(res.text) as typeof json;
+  } catch {
+    throw new Error(
+      `ส่งชิ้นไฟล์แล้วได้คำตอบที่ไม่ใช่ JSON (HTTP ${res.status}) — ${
+        res.text.trim().slice(0, 200) || "ไม่มีเนื้อหา"
+      }`,
+    );
+  }
+  if (!json.ok || !json.sessionId) {
+    throw new Error(json.error ?? `ส่งชิ้นไฟล์ไม่สำเร็จ (HTTP ${res.status})`);
+  }
+  return json.sessionId;
+}
+
+/**
+ * waitForJob polls a job until it finishes, reporting each phase change.
+ *
+ * Polling rather than one long request because Cloudflare closes a proxied request that
+ * has not answered in 100 seconds, and this work takes minutes. Every poll is a few bytes,
+ * so the cost of asking often is nothing.
+ */
+async function waitForJob(jobId: string, onTick: (job: JobView) => void): Promise<JobView> {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, JOB_POLL_MS));
+
+    const res = await fetch(`/api/job?jobId=${encodeURIComponent(jobId)}`, { cache: "no-store" });
+    const text = await res.text();
+    let json: JobStatusResponse;
+    try {
+      json = JSON.parse(text) as JobStatusResponse;
+    } catch {
+      throw new Error(
+        `ถามสถานะงานแล้วได้คำตอบที่ไม่ใช่ JSON (HTTP ${res.status}) — ${
+          text.trim().slice(0, 200) || "ไม่มีเนื้อหา"
+        }`,
+      );
+    }
+    if (!json.ok || !json.job) {
+      throw new Error(json.error ?? `ถามสถานะงานไม่สำเร็จ (HTTP ${res.status})`);
+    }
+
+    onTick(json.job);
+    if (json.job.state === "running") continue;
+    if (json.job.state === "failed") {
+      const detail = json.job.log.length ? `\n\n${json.job.log.join("\n")}` : "";
+      throw new Error((json.job.error ?? "งานล้มเหลว") + detail);
+    }
+    return json.job;
+  }
+}
 
 /** base64 → bytes, so a pulled dump becomes a File with its bytes intact. */
 function base64ToBytes(b64: string): Uint8Array {
@@ -34,13 +168,80 @@ function human(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/**
+ * The subscription tiers, with the branch ceiling each one allows.
+ *
+ * This is here because the ceiling is enforced by the BACKEND and refuses the whole
+ * provision when it is exceeded — a nine-branch tenant on the default plan fails, and
+ * without this control the operator has no way to fix it from this page. The numbers
+ * mirror the server's plan table; the server remains the authority, this only stops the
+ * request that is already known to be refused.
+ */
+const TIERS = [
+  { tier: "", label: "ค่าเริ่มต้นของระบบ (standard)", maxBranches: 3 },
+  { tier: "starter", label: "starter — 1 สาขา", maxBranches: 1 },
+  { tier: "standard", label: "standard — 3 สาขา", maxBranches: 3 },
+  { tier: "elite", label: "elite — 20 สาขา", maxBranches: 20 },
+] as const;
+
+/**
+ * howMuchDataNamesThisBranch is the number that tells an operator a branch is real.
+ *
+ * The legacy branch table happily holds rows nobody ever used, and it holds departments
+ * that are not clinics at all (a marketing desk, an online-service desk). The counts are
+ * the only honest way to tell those apart, so they are added up and shown rather than the
+ * operator being asked to recognise names.
+ */
+function branchDataCount(b: BranchSurveyRow): number {
+  return (
+    b.patients + b.appointments + b.rooms + b.bills + b.receipts + b.courses_bought + b.stock_lots
+  );
+}
+
+/**
+ * Whether two branches can live in the same V4 clinic.
+ *
+ * The test is the TAX ID, because that is what a receipt and a tax invoice print and what
+ * clinic_settings can only hold one of. Company NAMES in these exports are typed by hand
+ * and disagree with themselves — one tenant spelled the same company three ways across its
+ * branches — so a name comparison would split one company apart while missing the branches
+ * that really do belong to another.
+ *
+ * A blank tax id means "not recorded", not "a different company", so it does not separate.
+ */
+function sameTaxEntity(a: BranchSurveyRow, b: BranchSurveyRow): boolean {
+  const x = a.tax_id.trim();
+  const y = b.tax_id.trim();
+  if (x === "" || y === "") return true;
+  return x === y;
+}
+
+/** A stable identity for the attached files, so a swapped file invalidates the upload. */
+function filesSignature(files: Partial<Record<CliInputField, File>>): string {
+  return CLI_INPUTS.map((i) => {
+    const f = files[i.field];
+    return f ? `${i.field}:${f.name}:${f.size}:${f.lastModified}` : `${i.field}:-`;
+  }).join("|");
+}
+
 export default function GenerateForm() {
   const [clinic, setClinic] = useState("");
   const [owner, setOwner] = useState("");
   const [files, setFiles] = useState<Partial<Record<CliInputField, File>>>({});
   const [busy, setBusy] = useState(false);
+  // Non-null while "สร้างไฟล์ .sql" is in flight; drives the full-screen overlay.
+  const [busyState, setBusyState] = useState<BusyState | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [result, setResult] = useState<{ filename: string; sql: string; report: string } | null>(null);
+  // The generated script stays on the server: it can be hundreds of megabytes, so the
+  // browser holds only its identity, size and head.
+  const [result, setResult] = useState<{
+    jobId: string;
+    filename: string;
+    sqlBytes: number;
+    preview: string;
+    report: string;
+    log: string[];
+  } | null>(null);
 
   // Where the dumps come from: tab 1 = แนบไฟล์เอง · tab 2 = ให้เซิร์ฟเวอร์ไปดึงมาให้.
   // Both fill the same `files` slots, so everything below panel 2 is unchanged.
@@ -73,6 +274,27 @@ export default function GenerateForm() {
   const [newThaName, setNewThaName] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [ownerEmail, setOwnerEmail] = useState("");
+  // Empty means "whatever the backend defaults to". It matters here only because the plan
+  // caps how many branches a clinic may have, and this tool routinely needs more than the
+  // default allows.
+  const [tier, setTier] = useState("");
+
+  // ── สาขา ────────────────────────────────────────────────────────────────────
+  //
+  // The upload now happens BEFORE the clinic is created, because the branch list has to be
+  // read out of the dump first: V4 allocates its own branch codes, so the legacy "01" can
+  // only be translated after both sides exist. `sessionId` is that upload, kept so the
+  // generate step does not send a multi-gigabyte file twice.
+  const [sessionId, setSessionId] = useState("");
+  const [uploadedBytes, setUploadedBytes] = useState(0);
+  const [surveying, setSurveying] = useState(false);
+  const [surveyErr, setSurveyErr] = useState<string | null>(null);
+  const [survey, setSurvey] = useState<BranchSurvey | null>(null);
+  const [surveySeconds, setSurveySeconds] = useState("");
+  /** Legacy branch codes the operator wants this clinic to hold. */
+  const [picked, setPicked] = useState<string[]>([]);
+  /** The legacy code of the main branch — also the destination for unresolvable rows. */
+  const [mainCode, setMainCode] = useState("");
   const [importing, setImporting] = useState(false);
   const [checking, setChecking] = useState(false);
   // Everything by default; an operator narrows it when the target already has some.
@@ -80,6 +302,18 @@ export default function GenerateForm() {
   const [importErr, setImportErr] = useState<string | null>(null);
   const [importLog, setImportLog] = useState<string | null>(null);
   const [importDone, setImportDone] = useState<string | null>(null);
+
+  // ── รูปหน้าเวชระเบียนจากระบบเก่า ────────────────────────────────────────────
+  // Lives inside box 2 because it reads the SAME MongoDB (.js) file the catalog does —
+  // one attachment, two things read out of it. Only the archive of image bytes is its
+  // own input, because that is not a dump and cannot come from the same place.
+  const [imgFile, setImgFile] = useState<File | null>(null);
+  const [photoBusy, setPhotoBusy] = useState<"" | "survey" | "apply">("");
+  const [photoSurvey, setPhotoSurvey] = useState<PhotoImportResponse | null>(null);
+  const [photoErr, setPhotoErr] = useState<string | null>(null);
+  const [photoDone, setPhotoDone] = useState<string | null>(null);
+  const [photoLog, setPhotoLog] = useState<string | null>(null);
+  const [photoConfirm, setPhotoConfirm] = useState("");
 
   useEffect(() => {
     fetch("/api/target")
@@ -102,9 +336,248 @@ export default function GenerateForm() {
   }, []);
 
   const chosen = CLI_INPUTS.filter((i) => files[i.field]);
+  const chosenBytes = chosen.reduce((n, i) => n + (files[i.field]?.size ?? 0), 0);
+  const tooBig = chosenBytes > MAX_UPLOAD_BYTES;
   const selected = targets?.find((t) => t.id === targetId) ?? null;
   const onProduction = selected?.isProduction === true;
   const createApi = clinicApi?.find((c) => c.id === targetId) ?? null;
+
+  // ── สาขาที่จะสร้าง ──────────────────────────────────────────────────────────
+  const surveyRows = survey?.branches ?? [];
+  const pickedRows = surveyRows.filter((b) => picked.includes(b.code));
+  const mainRow = surveyRows.find((b) => b.code === mainCode) ?? null;
+  /** Legacy codes present in the DATA but not in the branch table — typos, a few rows. */
+  const strayCodes = Object.entries(survey?.unknown_in_data ?? {});
+  /** The map the CLI will be given, straight from what the backend actually created. */
+  const branchMap = created?.branches ? branchMapArg(created.branches) : "";
+  const mainBranchCode =
+    created?.branches?.find((b) => b.is_main)?.branch_code ??
+    created?.branches?.find((b) => (b.source_code ?? "") === mainCode)?.branch_code ??
+    "";
+  const tierCap = TIERS.find((t) => t.tier === tier)?.maxBranches ?? 3;
+  const overTierCap = pickedRows.length > tierCap;
+
+  /**
+   * A swapped or cleared file makes the upload on the server, and every answer derived
+   * from it, describe a file that is no longer attached. Both are dropped rather than
+   * left to look current — a branch list read from the previous dump is exactly the kind
+   * of stale answer that gets 14,000 patients filed at the wrong place.
+   */
+  const filesSig = filesSignature(files);
+  useEffect(() => {
+    setSessionId("");
+    setUploadedBytes(0);
+    setSurvey(null);
+    setSurveyErr(null);
+    setPicked([]);
+    setMainCode("");
+  }, [filesSig]);
+
+  /**
+   * uploadAll sends every attached dump to the staging directory and returns the session.
+   *
+   * Extracted from the generate step because the branch list has to be read on the server
+   * before the clinic is created, and that means the bytes have to be there first. Sending
+   * them once and keeping the session id is the whole point: these files reach gigabytes,
+   * and uploading them twice for two questions about the same dump is not a rounding error.
+   *
+   * Slices go out one at a time; the server refuses a chunk that does not begin exactly
+   * where the file currently ends, which is what makes a scrambled dump impossible.
+   */
+  async function uploadAll(title: string): Promise<string> {
+    const totalBytes = chosenBytes;
+    const chunkCount = chosen.reduce(
+      (n, i) => n + Math.ceil((files[i.field]?.size ?? 0) / CHUNK_BYTES),
+      0,
+    );
+
+    setBusyState({
+      title,
+      phase: `กำลังส่งไฟล์ขึ้นเซิร์ฟเวอร์ (ชิ้น 1/${chunkCount})`,
+      percent: 0,
+      detail: `0 B / ${human(totalBytes)}`,
+      startedAt: Date.now(),
+      note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้ — ไฟล์กำลังส่งอยู่",
+    });
+
+    let sid = "";
+    let sentBytes = 0;
+    let chunkNo = 0;
+    for (const { field } of CLI_INPUTS) {
+      const f = files[field];
+      if (!f) continue;
+      for (let offset = 0; offset < f.size; offset += CHUNK_BYTES) {
+        const slice = f.slice(offset, Math.min(offset + CHUNK_BYTES, f.size));
+        chunkNo++;
+        const base = sentBytes;
+        const label = `กำลังส่งไฟล์ขึ้นเซิร์ฟเวอร์ (ชิ้น ${chunkNo}/${chunkCount})`;
+        sid = await uploadOneChunk(sid, field, offset, slice, (loadedInSlice) =>
+          setBusyState((s) =>
+            s
+              ? {
+                  ...s,
+                  phase: label,
+                  percent: ((base + loadedInSlice) / totalBytes) * 100,
+                  detail: `${human(base + loadedInSlice)} / ${human(totalBytes)}`,
+                }
+              : s,
+          ),
+        );
+        sentBytes += slice.size;
+      }
+    }
+
+    setSessionId(sid);
+    setUploadedBytes(sentBytes);
+    return sid;
+  }
+
+  /**
+   * uploadAndSurvey puts the dumps on the server and reads the legacy branch table.
+   *
+   * WHY THIS IS THE FIRST STEP AND NOT AN OPTION
+   * A V2 tenant can have many branches — one export had nine — and every patient, bill,
+   * room and stock lot in it names the one it belongs to. V4 will not accept those names:
+   * it allocates its own branch codes, each carrying a branch_no that the HNs issued at
+   * that branch keep for life. So the legacy code has to be TRANSLATED, the translation
+   * table can only be built once both sides exist, and the V4 side can only be built once
+   * somebody has seen what the export contains. Reading the table first is not a
+   * convenience, it is the only order that works.
+   *
+   * Nothing is written anywhere by this: the CLI's survey mode takes no clinic and produces
+   * no script.
+   */
+  async function uploadAndSurvey() {
+    setSurveyErr(null);
+    setSurvey(null);
+    setResult(null);
+    if (chosen.length === 0) {
+      setSurveyErr("เลือกไฟล์ dump อย่างน้อยหนึ่งไฟล์ก่อน");
+      return;
+    }
+    if (!files.sql) {
+      setSurveyErr(
+        "ตารางสาขา (branch) อยู่ในไฟล์ MySQL — ต้องแนบช่อง MySQL (.sql) ก่อน จะอ่านสาขาจากไฟล์ MongoDB ไม่ได้",
+      );
+      return;
+    }
+    if (tooBig) {
+      setSurveyErr(
+        `ไฟล์รวมกัน ${human(chosenBytes)} เกินเพดาน ${human(MAX_UPLOAD_BYTES)} — ยังไม่ได้ส่งอะไรออกไป`,
+      );
+      return;
+    }
+
+    setSurveying(true);
+    try {
+      const sid = await uploadAll("อ่านสาขาจาก dump");
+
+      setBusyState((s) =>
+        s
+          ? {
+              ...s,
+              phase: "กำลังอ่านตาราง branch จากไฟล์ MySQL",
+              percent: null,
+              detail: `ส่งครบแล้ว ${human(chosenBytes)}`,
+              note: "อ่านอย่างเดียว ไม่เขียนอะไรทั้งที่นี่และที่ปลายทาง",
+            }
+          : s,
+      );
+
+      const res = await fetch("/api/survey-branches", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: sid }),
+      });
+      const text = await res.text();
+      let json: SurveyBranchesResponse;
+      try {
+        json = JSON.parse(text) as SurveyBranchesResponse;
+      } catch {
+        setSurveyErr(
+          `เซิร์ฟเวอร์ตอบไม่ใช่ JSON (HTTP ${res.status}) — ${
+            text.trim().slice(0, 300) || "ไม่มีเนื้อหา"
+          }`,
+        );
+        return;
+      }
+      if (!json.ok) {
+        setSurveyErr(json.error);
+        return;
+      }
+
+      setSurvey(json.survey);
+      setSurveySeconds(json.seconds);
+
+      // Pre-selection follows the LEGAL ENTITY, not the row count. One TIN per clinic is a
+      // hard V4 constraint — clinic_settings holds a single tax id — so a branch belonging
+      // to another company cannot be imported into this clinic at all: its receipts would
+      // print the wrong company's name and number. The busiest branch is taken as the main
+      // one and everything under its company is ticked; the operator can change both.
+      //
+      // Matched on TAX ID, not on the company name. In one real export the same company
+      // appeared as "บริษัท แอนจาลี คลินิก (2015) จำกัด", "แอนจาลีคลินิก" and "แอนจาลี คลีนิก"
+      // across branches while carrying one tax id or none — matching the strings would have
+      // split one company into three and hidden the two that really are separate.
+      const rows = json.survey.branches ?? [];
+      if (rows.length > 0) {
+        const main = rows.reduce((a, b) => (branchDataCount(b) > branchDataCount(a) ? b : a));
+        setMainCode(main.code);
+        // A blank tax id is UNKNOWN, not "a different company", so those branches are
+        // included: leaving a branch out silently drops its patients from the import
+        // entirely, which is the worse of the two mistakes and the harder one to notice.
+        const sameEntity = rows.filter(
+          (b) => sameTaxEntity(b, main),
+        );
+        setPicked((sameEntity.length > 0 ? sameEntity : rows).map((b) => b.code));
+      }
+    } catch (e) {
+      setSurveyErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSurveying(false);
+      setBusyState(null);
+    }
+  }
+
+  /** The branch list to provision, in survey order so the result is reproducible. */
+  function branchesToCreate(): ProvisionBranchInput[] {
+    return pickedRows.map((b) => ({
+      source_code: b.code,
+      name: b.name || b.code,
+      name_en: b.name_en,
+      address: b.address,
+      phone: b.phone,
+      is_main: b.code === mainCode,
+    }));
+  }
+
+  /**
+   * taxProfileToSend takes the receipt header from the MAIN branch's own row.
+   *
+   * tax_id is deliberately left EMPTY (decided 9 Sep 2026). The export's tax ids are not
+   * consistent enough to print on a tax invoice — in one tenant three different companies
+   * appeared and four branches had no number at all — and a wrong number on a tax document
+   * is a legal problem, not a data problem. The backend writes this profile only when the
+   * clinic has none saved, so a human filling the number in afterwards is never overwritten
+   * by a re-run.
+   */
+  function taxProfileToSend(): TaxProfileInput | null {
+    if (!mainRow) return null;
+    const legal = (mainRow.legal_name || mainRow.name || "").trim();
+    if (!legal) return null;
+    return {
+      legal_name: legal,
+      tax_id: "",
+      tax_branch_type: "",
+      tax_branch_code: "",
+      tax_address: mainRow.address,
+      phone: mainRow.phone,
+      email: mainRow.email,
+      website: "",
+      receipt_footer: "",
+      logo_url: "",
+    };
+  }
 
   /**
    * createClinic asks the selected environment's backend to provision the clinic.
@@ -126,6 +599,12 @@ export default function GenerateForm() {
           thaName: newThaName.trim(),
           ownerName: ownerName.trim(),
           ownerEmail: ownerEmail.trim(),
+          tier: tier.trim(),
+          // Sent only when the branch table was actually read and branches chosen. An empty
+          // list is omitted entirely so the backend keeps its own "one branch named after
+          // the clinic" default instead of interpreting a blank.
+          branches: pickedRows.length > 0 ? branchesToCreate() : undefined,
+          taxProfile: pickedRows.length > 0 ? taxProfileToSend() : undefined,
         }),
       });
       const json = (await res.json()) as CreateClinicResponse;
@@ -145,6 +624,75 @@ export default function GenerateForm() {
     }
   }
 
+  // Swapping the MongoDB file invalidates the photo survey: the plan was derived from the
+  // old file's `page` collection, and offering an apply built on a file that is no longer
+  // attached is how the wrong images get written.
+  const mongoName = files.mongo?.name ?? "";
+  const mongoSize = files.mongo?.size ?? 0;
+  useEffect(() => {
+    setPhotoSurvey(null);
+    setPhotoDone(null);
+    setPhotoErr(null);
+    setPhotoLog(null);
+  }, [mongoName, mongoSize]);
+
+  /**
+   * runPhotoImport calls the one route in either mode.
+   *
+   * Both modes post the same two files. The survey is not cached and replayed as the
+   * apply: the server rebuilds the plan from the dump each time, so what the operator
+   * confirmed is what runs even if they changed a file in between — a stale preview is
+   * how the wrong images get written.
+   */
+  async function runPhotoImport(mode: "survey" | "apply") {
+    const dump = files.mongo;
+    if (!dump || !imgFile) return;
+    setPhotoErr(null);
+    setPhotoLog(null);
+    if (mode === "survey") {
+      setPhotoSurvey(null);
+      setPhotoDone(null);
+    }
+    setPhotoBusy(mode);
+    try {
+      const body = new FormData();
+      body.append("mode", mode);
+      body.append("targetId", targetId);
+      body.append("clinicCode", clinic.trim());
+      // The same file the catalog is read from. The CLI picks the `page` collection out
+      // of it and ignores the rest, exactly as it already ignores collections it has no
+      // mapping for.
+      body.append("page", dump);
+      body.append("images", imgFile);
+      if (mode === "apply") body.append("confirm", photoConfirm.trim());
+
+      const res = await fetch("/api/import-photos", { method: "POST", body });
+      const json = (await res.json()) as PhotoImportResponse;
+
+      if (!json.ok) {
+        setPhotoErr(json.error);
+        if (json.log) setPhotoLog(json.log);
+        // A failed apply still carries the counts, which is how an operator learns that
+        // the bytes went over even though the rows did not.
+        if (json.planned !== undefined) setPhotoSurvey(json as PhotoImportResponse);
+        return;
+      }
+      if (json.mode === "survey") {
+        setPhotoSurvey(json);
+        return;
+      }
+      setPhotoSurvey(json);
+      setPhotoDone(
+        `นำเข้าแล้ว · คัดลอก ${json.filesSent} ไฟล์ (${(json.bytesSent / 1024 / 1024).toFixed(1)} MB) → ${json.uploads} · เขียน ${json.rows} แถว → ${json.target} (${json.seconds}s)`,
+      );
+      setPhotoLog(json.log);
+    } catch (e) {
+      setPhotoErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPhotoBusy("");
+    }
+  }
+
   async function submit() {
     setErr(null);
     setResult(null);
@@ -160,32 +708,130 @@ export default function GenerateForm() {
       setErr("ไฟล์ SQL มีตาราง users → ต้องระบุ owner_username");
       return;
     }
+    // Checked before anything is sent. This ceiling is about staging disk, not the proxy:
+    // the slices below are each small enough for Cloudflare and nginx.
+    if (chosenBytes > MAX_UPLOAD_BYTES) {
+      setErr(
+        `ไฟล์รวมกัน ${human(chosenBytes)} เกินเพดาน ${human(MAX_UPLOAD_BYTES)} — ยังไม่ได้ส่งอะไรออกไป`,
+      );
+      return;
+    }
 
-    const body = new FormData();
-    body.append("clinic_code", clinic.trim());
-    if (owner.trim()) body.append("owner_username", owner.trim());
-    // Only send `only` when it is a real subset; empty means everything.
-    if (groups.length > 0 && groups.length < IMPORT_GROUPS.length) {
-      body.append("only", groups.join(","));
+    // Refusing here rather than importing a single-branch clinic by accident. The stray
+    // codes and the unpicked branches are both real data that would land at the default
+    // branch, and a run that files them silently looks exactly like a successful one.
+    if (survey && survey.has_branch_table && surveyRows.length > 1 && !branchMap) {
+      setErr(
+        `dump นี้มี ${surveyRows.length} สาขา แต่ยังไม่มีแผนที่สาขา — ต้องสร้างคลินิกพร้อมสาขาในกล่อง 3 ก่อน ` +
+          "ไม่งั้นทุกแถวจะถูกเขียนไปสาขาเดียว และคนไข้ทั้งหมดจะไปอยู่สาขาที่ไม่ใช่ของตัวเอง",
+      );
+      return;
     }
-    for (const { field } of CLI_INPUTS) {
-      const f = files[field];
-      if (f) body.append(field, f);
-    }
+
+    const totalBytes = chosenBytes;
 
     setBusy(true);
+    // The dumps are usually already on the server: the branch step put them there and kept
+    // the session. Re-sending gigabytes to ask a second question about the same file is
+    // avoided, but a session that was never opened (single-branch clinic, survey skipped)
+    // or was invalidated by a swapped file still has to be uploaded now.
+    let sid = sessionId;
     try {
-      const res = await fetch("/api/generate", { method: "POST", body });
-      const json = (await res.json()) as GenerateResponse;
-      if (!json.ok) {
-        setErr(json.error);
+      if (!sid) {
+        sid = await uploadAll("สร้างไฟล์ .sql");
+      } else {
+        setBusyState({
+          title: "สร้างไฟล์ .sql",
+          phase: "ใช้ไฟล์ที่อัปโหลดไว้แล้วตอนอ่านสาขา — ไม่ต้องส่งซ้ำ",
+          percent: null,
+          detail: `บนเซิร์ฟเวอร์แล้ว ${human(uploadedBytes || totalBytes)}`,
+          startedAt: Date.now(),
+          note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้",
+        });
+      }
+
+      // From here the server filters the dump and runs the CLI, neither of which reports
+      // progress, so the number goes away rather than being invented.
+      setBusyState((s) =>
+        s
+          ? {
+              ...s,
+              phase: "เซิร์ฟเวอร์กำลังกรอง collection ที่ไม่ใช้ออก แล้วสร้างสคริปต์ด้วย CLI",
+              percent: null,
+              detail: `ไฟล์บนเซิร์ฟเวอร์ ${human(uploadedBytes || totalBytes)}`,
+              note: "ขั้นนี้ไม่มีเปอร์เซ็นต์ — การกรองและ CLI ไม่รายงานความคืบหน้าออกมา ตัวเลขที่ปลอมขึ้นมาจะหลอกตัวเอง",
+            }
+          : s,
+      );
+
+      // Starts the work and returns an id. Waiting for the result in one request would be
+      // cut off by Cloudflare at 100 seconds; a real clinic takes minutes.
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sessionId: sid,
+          clinicCode: clinic.trim(),
+          owner: owner.trim(),
+          // Only send `only` when it is a real subset; empty means everything.
+          only:
+            groups.length > 0 && groups.length < IMPORT_GROUPS.length ? groups.join(",") : "",
+          // Built from what the backend actually created, never from what was requested:
+          // the branch codes are the server's to assign.
+          branchMap,
+          defaultBranch: branchMap ? mainBranchCode : "",
+        }),
+      });
+      const text = await res.text();
+
+      let start: JobStartResponse;
+      try {
+        start = JSON.parse(text) as JobStartResponse;
+      } catch {
+        // Not JSON: a proxy or the platform answered instead of the route. Show the
+        // status and what came back, because that names the real limit that was hit.
+        setErr(
+          `เซิร์ฟเวอร์ตอบไม่ใช่ JSON (HTTP ${res.status}) — ${
+            text.trim().slice(0, 300) || "ไม่มีเนื้อหา"
+          }`,
+        );
         return;
       }
-      setResult({ filename: json.filename, sql: json.sql, report: json.report });
+      if (!start.ok || !start.jobId) {
+        setErr(start.error ?? `เริ่มงานไม่สำเร็จ (HTTP ${res.status})`);
+        return;
+      }
+
+      const done = await waitForJob(start.jobId, (job) =>
+        setBusyState((s) =>
+          s
+            ? {
+                ...s,
+                phase: job.phase,
+                percent: null,
+                detail: job.log.length ? job.log[job.log.length - 1].split("\n")[0] : s.detail,
+              }
+            : s,
+        ),
+      );
+
+      setResult({
+        jobId: done.id,
+        filename: done.filename ?? `import_${clinic.trim()}.sql`,
+        sqlBytes: done.sqlBytes ?? 0,
+        preview: done.preview ?? "",
+        report: done.report ?? "",
+        log: done.log,
+      });
+      // The server deletes the staging session once the CLI has run, so the id it held is
+      // no longer usable. Forgetting it here means a second attempt uploads again instead
+      // of failing with "session not found", which would be true but unhelpful.
+      setSessionId("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+      setBusyState(null);
     }
   }
 
@@ -241,15 +887,16 @@ export default function GenerateForm() {
     setPulledFields((prev) => prev.filter((f) => f !== field));
   }
 
+  /**
+   * download hands the browser a URL instead of building a Blob.
+   *
+   * The script never passes through this page: a Blob of a 500 MB script would have to
+   * exist in the tab's memory first. The endpoint streams it from disk and the browser
+   * writes it straight to the download folder.
+   */
   function download() {
     if (!result) return;
-    const blob = new Blob([result.sql], { type: "application/sql;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = result.filename;
-    a.click();
-    URL.revokeObjectURL(url);
+    window.location.href = `/api/job/download?jobId=${encodeURIComponent(result.jobId)}`;
   }
 
   async function checkTarget() {
@@ -288,46 +935,76 @@ export default function GenerateForm() {
     }
   }
 
+  /**
+   * importToServer names the artifact by job id rather than sending it.
+   *
+   * The script is already on the server from generation; posting it back would move
+   * hundreds of megabytes for no reason and put them in memory at both ends. psql reads it
+   * from disk. Like generation this is a job, because psql on a large script runs longer
+   * than the 100 seconds Cloudflare allows.
+   */
   async function importToServer() {
     if (!result) return;
     setImportErr(null);
     setImportLog(null);
+    setImportDone(null);
     setImporting(true);
+    setBusyState({
+      title: `นำเข้าไปที่ ${selected?.label ?? targetId}`,
+      phase: "กำลังเริ่ม",
+      percent: null,
+      detail: `สคริปต์ ${human(result.sqlBytes)}`,
+      startedAt: Date.now(),
+      note: "สคริปต์อยู่ในทรานแซกชันเดียว ถ้ามีอะไรผิดฐานข้อมูลจะไม่ถูกเปลี่ยน",
+    });
     try {
       const res = await fetch("/api/import-to-server", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          sql: result.sql,
+          jobId: result.jobId,
           clinicCode: clinic.trim(),
           confirm: serverConfirm.trim(),
           targetId,
         }),
       });
-      const json = (await res.json()) as {
-        ok: boolean;
-        error?: string;
-        log?: string;
-        target?: string;
-        seconds?: string;
-      };
-      setImportLog(json.log ?? null);
-      if (!json.ok) {
-        setImportErr(json.error ?? "นำเข้าไม่สำเร็จ");
+      const text = await res.text();
+      let start: JobStartResponse;
+      try {
+        start = JSON.parse(text) as JobStartResponse;
+      } catch {
+        setImportErr(
+          `เซิร์ฟเวอร์ตอบไม่ใช่ JSON (HTTP ${res.status}) — ${
+            text.trim().slice(0, 300) || "ไม่มีเนื้อหา"
+          }`,
+        );
         return;
       }
-      setImportDone(`นำเข้าสำเร็จ → ${json.target} (${json.seconds}s)`);
+      if (!start.ok || !start.jobId) {
+        setImportErr(start.error ?? `เริ่มนำเข้าไม่สำเร็จ (HTTP ${res.status})`);
+        return;
+      }
+
+      const done = await waitForJob(start.jobId, (job) =>
+        setBusyState((s) => (s ? { ...s, phase: job.phase } : s)),
+      );
+      setImportLog(done.psqlLog ?? null);
+      setImportDone(`นำเข้าสำเร็จ → ${done.target ?? targetId} (${done.seconds}s)`);
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
     } finally {
       setImporting(false);
+      setBusyState(null);
     }
   }
 
-  return (
-    <div>
+  // Each step is built as its own value and ordered in the return below, so the DOM order
+  // is a single readable list instead of being implied by 1,600 lines of nesting. The
+  // order matters: the dump has to be read before the clinic can be created, because the
+  // branches it names are what the clinic has to be created WITH.
+  const panelTarget = (
       <div className="panel">
-        <h2>1 · ปลายทาง</h2>
+        <h2>3 · ปลายทาง และสร้างคลินิก</h2>
 
         <label htmlFor="target-select">เซิร์ฟเวอร์ปลายทาง</label>
         {targets === null ? (
@@ -439,9 +1116,22 @@ export default function GenerateForm() {
               </>
             )}
             <div className="muted" style={{ fontSize: 12, margin: "4px 0 8px" }}>
-              สร้างตัวคลินิก + สาขาแรก + ฟีเจอร์ + subscription ในทรานแซกชันเดียว ·
+              สร้างตัวคลินิก + สาขา + ฟีเจอร์ + subscription ในทรานแซกชันเดียว ·
               เรียกซ้ำด้วยรหัสเดิมไม่สร้างของซ้ำ (รายงานว่าอะไรมีอยู่แล้ว)
             </div>
+            {pickedRows.length > 0 ? (
+              <div className="msg info">
+                จะสร้างพร้อม <b>{pickedRows.length} สาขา</b> ตามที่ติ๊กไว้ในกล่อง 2 · สาขาหลัก{" "}
+                <code>{mainCode}</code> {mainRow ? `(${mainRow.name})` : ""}
+                <br />
+                ปลายทางจะคืน <b>รหัสสาขาของ V4</b> กลับมา ซึ่งเป็นค่าที่ขั้นสร้างสคริปต์ใช้เป็นแผนที่สาขา
+              </div>
+            ) : (
+              <div className="msg warn">
+                ยังไม่ได้อ่านสาขาในกล่อง 2 — จะสร้างเป็นคลินิก <b>สาขาเดียว</b>{" "}
+                ถ้าคลินิกนี้มีหลายสาขาจริง ให้กลับไปกด &quot;อัปโหลด + อ่านสาขา&quot; ก่อน
+              </div>
+            )}
 
             <label htmlFor="new-clinic-name">ชื่อคลินิก (ไม่ใส่ก็ได้ — จะใช้ clinic_code เป็นชื่อ)</label>
             <input
@@ -451,6 +1141,29 @@ export default function GenerateForm() {
               onChange={(e) => setNewThaName(e.target.value)}
               placeholder="เช่น คลินิกตัวอย่าง"
             />
+
+            {/* Here because the plan decides how many branches the clinic may have, and a
+                multi-branch import routinely needs more than the default allows. The backend
+                refuses the whole provision when the list exceeds the cap. */}
+            <label htmlFor="new-tier">แพ็กเกจ (คุมจำนวนสาขาที่สร้างได้)</label>
+            <select
+              id="new-tier"
+              value={tier}
+              onChange={(e) => setTier(e.target.value)}
+              style={{ width: "100%" }}
+            >
+              {TIERS.map((t) => (
+                <option key={t.tier || "default"} value={t.tier}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+            {pickedRows.length > 0 && (
+              <div className={overTierCap ? "msg error" : "muted"} style={{ fontSize: 12, marginTop: 4 }}>
+                กล่อง 2 ติ๊กไว้ {pickedRows.length} สาขา · แพ็กเกจนี้ให้ได้ {tierCap} สาขา
+                {overTierCap && <> — เกินเพดาน backend จะปฏิเสธทั้งคำขอและไม่สร้างอะไรเลย</>}
+              </div>
+            )}
 
             <h3 style={{ marginTop: 14 }}>บัญชี owner (ไม่ใส่ก็ได้)</h3>
             <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
@@ -617,8 +1330,11 @@ export default function GenerateForm() {
         </div>
       </div>
 
+  );
+
+  const panelSource = (
       <div className="panel">
-        <h2>2 · ที่มาของข้อมูล</h2>
+        <h2>1 · ที่มาของข้อมูล</h2>
 
         <div className="tabs" role="tablist" aria-label="ที่มาของไฟล์ dump">
           <button
@@ -806,14 +1522,572 @@ export default function GenerateForm() {
         )}
 
         <div className="msg warn" style={{ marginTop: 10 }}>
-          ช่อง <code>mongo</code> อ่าน <b>แคตตาล็อกเท่านั้น</b> — collection ฝั่งเงิน
-          (<code>bills</code>, <code>payment_summary</code>, <code>course_bills</code>)
-          อยู่ในไฟล์เดียวกันแต่ <b>ยังไม่ถูกนำเข้า</b> เพราะยังไม่ได้เคาะวิธีลงบัญชีย้อนหลัง
+          ช่อง <code>mongo</code> อ่าน <b>แคตตาล็อก</b> และ <b><code>page</code> (รูปหน้าเวชระเบียน)</b>{" "}
+          — collection ฝั่งเงิน (<code>bills</code>, <code>payment_summary</code>,{" "}
+          <code>course_bills</code>) อยู่ในไฟล์เดียวกันแต่ <b>ยังไม่ถูกนำเข้า</b>{" "}
+          เพราะยังไม่ได้เคาะวิธีลงบัญชีย้อนหลัง
+        </div>
+
+        {/*
+          รูปหน้าเวชระเบียน — อ่าน collection `page` จากไฟล์ MongoDB ช่องเดียวกันข้างบน
+          ไม่ต้องแนบใหม่ ส่วนไบต์ของรูปมาเป็น .tar.gz แยก เพราะไม่ใช่ dump
+        */}
+        <div
+          style={{
+            marginTop: 14,
+            paddingTop: 12,
+            borderTop: "1px solid var(--border)",
+          }}
+        >
+          <h3 style={{ marginTop: 0 }}>รูปหน้าเวชระเบียน (จาก collection <code>page</code>)</h3>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            ย้ายรูปใน <code>mris.page</code> ของ V2 มาเป็นรูปแนบในแฟ้มคนไข้ของ V4 (
+            <code>photos</code>) · เอา <b>rev ล่าสุดของแต่ละหน้า</b> เท่านั้น ·
+            รูปจะไปโผล่ในแฟ้ม OPD ของ HN นั้น
+          </div>
+
+          {/*
+            ช่องแนบไฟล์รูปโชว์เสมอ ไม่ผูกกับว่าแนบ .js แล้วหรือยัง — สองไฟล์นี้ไม่ขึ้นกัน
+            และช่องที่ถูกซ่อนคือช่องที่ผู้ใช้ไม่รู้ว่ามีอยู่ · เงื่อนไขไปอยู่ที่ปุ่มตรวจแทน
+            ซึ่งบอกได้ด้วยว่ายังขาดอะไร
+          */}
+          <label htmlFor="img-tar">ไฟล์รูป (.tar.gz)</label>
+          <input
+            id="img-tar"
+            type="file"
+            accept=".gz,.tgz,.tar"
+            onChange={(e) => {
+              setImgFile(e.target.files?.[0] ?? null);
+              setPhotoSurvey(null);
+              setPhotoDone(null);
+            }}
+          />
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            {imgFile ? (
+              <>
+                <span className="tag">แนบเอง</span> <code>{imgFile.name}</code> ·{" "}
+                {human(imgFile.size)}
+                <br />
+              </>
+            ) : null}
+            <code>
+              tar -czvf public_img.tar.gz -C /var/www/html/doctoreasetemporary/public/
+              nas-doctorease/
+            </code>
+            <br />
+            ต้องมีโฟลเดอร์ <code>nas-doctorease/</code> อยู่ในถุง · รวมกับไฟล์ .js แล้วไม่เกิน 64 MB
+          </div>
+
+          {files.mongo ? (
+            <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+              จะอ่าน <code>page</code> จาก <code>{files.mongo.name}</code> · ถ้าในไฟล์ไม่มี
+              collection นี้ ระบบจะบอกว่าเจอ collection อะไรแทน
+            </div>
+          ) : (
+            <div className="msg warn">
+              ยังไม่ได้แนบไฟล์ <b>MongoDB (.js)</b> ในตารางข้างบน — ปุ่มตรวจจะเปิดเมื่อแนบแล้ว
+              <br />
+              <span className="muted" style={{ fontSize: 12 }}>
+                <code>page</code> อยู่ในฐาน <code>mris</code> ซึ่ง <b>คนละฐานกับแคตตาล็อก</b>{" "}
+                ฉะนั้นไฟล์เดียวนั้นต้องมีทั้งสองส่วน — ต่อท้าย export ของ <code>page</code>{" "}
+                เข้าไปในไฟล์เดิมได้เลย ตัวอ่านแยก collection ให้เอง
+                <br />
+                <code>mongoexport --db=mris --collection=page {">>"} dbmongo.js</code>
+                <br />
+                หรือใช้ <code>scripts/export-v2-mongo.sh</code> บนเครื่องระบบเก่า —
+                ดึงครบทั้ง {MONGO_COLLECTIONS_USED.length} collection ที่ระบบนี้อ่าน ลงไฟล์เดียว
+                และไม่ลากของที่ไม่ใช้มาให้เกินเพดาน {human(MAX_UPLOAD_BYTES)}
+              </span>
+            </div>
+          )}
+
+          {!clinic.trim() ? (
+            <div className="msg warn">
+              กรอก <code>clinic_code</code> ในกล่อง 1 ก่อน — รูปต้องผูกกับคลินิกที่มีอยู่จริง
+            </div>
+          ) : (
+            <>
+              {(() => {
+                // Say which attachment is still missing instead of a dead button with no
+                // explanation. Both are needed: the dump names the images, the archive holds
+                // their bytes.
+                const need: string[] = [];
+                if (!files.mongo) need.push("MongoDB (.js)");
+                if (!imgFile) need.push("ไฟล์รูป (.tar.gz)");
+                return (
+                  <>
+                    <div className="row" style={{ marginBottom: 4 }}>
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={() => runPhotoImport("survey")}
+                        disabled={photoBusy !== "" || need.length > 0}
+                      >
+                        {photoBusy === "survey" ? "กำลังตรวจ…" : "ตรวจก่อน (อ่านอย่างเดียว)"}
+                      </button>
+                      <span className="muted" style={{ fontSize: 12 }}>
+                        {need.length > 0
+                          ? `ยังขาด: ${need.join(" · ")}`
+                          : "จับคู่รูปในถุงกับที่ dump บอก — ไม่คัดลอกไฟล์ ไม่เขียนฐาน"}
+                      </span>
+                    </div>
+                  </>
+                );
+              })()}
+
+                  {photoSurvey && photoSurvey.planned !== undefined && (
+                    <div
+                      className={
+                        photoSurvey.missing && photoSurvey.missing.length > 0 ? "msg warn" : "msg ok"
+                      }
+                    >
+                      <b>
+                        dump บอกว่ามี {photoSurvey.planned} รูป · เจอในถุง {photoSurvey.matched} รูป
+                        {photoSurvey.totalBytes !== undefined && (
+                          <> ({(photoSurvey.totalBytes / 1024 / 1024).toFixed(1)} MB)</>
+                        )}
+                      </b>
+                      <ul className="tight">
+                        <li>
+                          ไฟล์รูปจะไปที่ <code>{photoSurvey.uploads}</code>
+                        </li>
+                        <li>
+                          แถวจะไปที่ <code>{photoSurvey.target}</code> — {photoSurvey.rows} แถว
+                        </li>
+                        {photoSurvey.extraCount ? (
+                          <li>
+                            ในถุงมีอีก {photoSurvey.extraCount} ไฟล์ที่ dump ไม่ได้อ้าง —
+                            ไม่ถูกนำเข้า
+                            {photoSurvey.extraSample && photoSurvey.extraSample.length > 0 && (
+                              <>
+                                {" "}
+                                (เช่น <code>{photoSurvey.extraSample[0]}</code>)
+                              </>
+                            )}
+                          </li>
+                        ) : null}
+                      </ul>
+                      {photoSurvey.missing && photoSurvey.missing.length > 0 && (
+                        <>
+                          <b>
+                            หาไฟล์ไม่เจอ {photoSurvey.missing.length} รูป — จะไม่ถูกนำเข้า
+                            (แถวที่ชี้ไปไฟล์ที่ไม่มี = รูปเสียในเวชระเบียน)
+                          </b>
+                          <pre
+                            style={{
+                              background: "var(--panel-2)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6,
+                              padding: 8,
+                              maxHeight: 160,
+                              overflow: "auto",
+                              fontSize: 11,
+                              whiteSpace: "pre-wrap",
+                            }}
+                          >
+                            {photoSurvey.missing
+                              .slice(0, 50)
+                              .map((m) => `hn ${m.hn}  ${m.expected_path}`)
+                              .join("\n")}
+                            {photoSurvey.missing.length > 50
+                              ? `\n… อีก ${photoSurvey.missing.length - 50} รายการ`
+                              : ""}
+                          </pre>
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {photoSurvey &&
+                    photoSurvey.ok &&
+                    photoSurvey.mode === "survey" &&
+                    photoSurvey.matched > 0 && (
+                      <>
+                        <div
+                          className={onProduction ? "tgt-danger" : "msg warn"}
+                          role={onProduction ? "alert" : undefined}
+                        >
+                          {onProduction ? (
+                            <>
+                              <strong>กำลังจะเขียนลงเซิร์ฟเวอร์ของจริง</strong>
+                              <br />
+                            </>
+                          ) : null}
+                          คัดลอกไฟล์รูปขึ้นเครื่องปลายทาง<b>ก่อน</b> แล้วจึงเขียนแถว —
+                          ถ้าคัดลอกไม่สำเร็จ จะไม่มีแถวใดถูกเขียนเลย · แถวอยู่ในทรานแซกชันเดียว ·
+                          รันซ้ำไม่เพิ่มของซ้ำ
+                        </div>
+
+                        <label>พิมพ์ clinic_code ซ้ำเพื่อยืนยัน</label>
+                        <input
+                          type="text"
+                          value={photoConfirm}
+                          onChange={(e) => setPhotoConfirm(e.target.value)}
+                          placeholder={clinic.trim()}
+                        />
+                        <div className="row" style={{ marginTop: 10 }}>
+                          <button
+                            className={`go${onProduction ? " is-prod" : ""}`}
+                            type="button"
+                            onClick={() => runPhotoImport("apply")}
+                            disabled={photoBusy !== "" || photoConfirm.trim() !== clinic.trim()}
+                          >
+                            {photoBusy === "apply"
+                              ? "กำลังนำเข้ารูป…"
+                              : `นำเข้ารูป ${photoSurvey.matched} ไฟล์ → ${targetId}`}
+                          </button>
+                        </div>
+                      </>
+                    )}
+
+                  {photoDone && <div className="msg ok">{photoDone}</div>}
+                  {photoErr && <div className="msg error">{photoErr}</div>}
+                  {photoSurvey?.report && (
+                    <>
+                      <h3>รายงานจาก CLI (รูป)</h3>
+                      <pre
+                        style={{
+                          background: "var(--panel-2)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 6,
+                          padding: 12,
+                          overflowX: "auto",
+                          fontSize: 12,
+                          whiteSpace: "pre-wrap",
+                        }}
+                      >
+                        {photoSurvey.report}
+                      </pre>
+                    </>
+                  )}
+                  {photoLog && (
+                    <>
+                      <h3>ผลจากเครื่องปลายทาง</h3>
+                      <pre
+                        style={{
+                          background: "var(--panel-2)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 6,
+                          padding: 12,
+                          overflowX: "auto",
+                          fontSize: 12,
+                          whiteSpace: "pre-wrap",
+                        }}
+                      >
+                        {photoLog}
+                      </pre>
+                    </>
+                  )}
+            </>
+          )}
         </div>
       </div>
 
+  );
+
+  const panelBranches = (
+    <div className="panel">
+      <h2>2 · สาขาในไฟล์</h2>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        อ่านตาราง <code>branch</code> จากไฟล์ MySQL ที่แนบไว้ · <b>อ่านอย่างเดียว</b> ไม่เขียนอะไรทั้งที่นี่และที่ปลายทาง
+        <br />
+        ต้องทำขั้นนี้ก่อนสร้างคลินิก เพราะ V4 ออกรหัสสาขาเอง (<code>BR00001</code>…) และเลขสาขาจะติดไปกับ{" "}
+        <code>HN</code> ของคนไข้ตลอดชีวิต — รหัสเดิม <code>01</code> เขียนลงไปตรง ๆ ไม่ได้ ต้องแปลง
+      </div>
+
+      <div className="row">
+        <button
+          type="button"
+          onClick={uploadAndSurvey}
+          disabled={surveying || busy || chosen.length === 0 || !files.sql || tooBig}
+        >
+          {surveying ? "กำลังอ่าน…" : sessionId ? "อ่านสาขาอีกครั้ง" : "อัปโหลด + อ่านสาขา"}
+        </button>
+        <span className="muted" style={{ fontSize: 12 }}>
+          {chosen.length === 0
+            ? "ยังไม่ได้แนบไฟล์ในกล่อง 1"
+            : !files.sql
+              ? "ยังไม่ได้แนบช่อง MySQL (.sql) — ตารางสาขาอยู่ในไฟล์นี้"
+              : sessionId
+                ? `ไฟล์อยู่บนเซิร์ฟเวอร์แล้ว ${human(uploadedBytes)} — ขั้นสร้างสคริปต์จะใช้ไฟล์เดิม ไม่ส่งซ้ำ`
+                : `ส่งไฟล์ขึ้นเซิร์ฟเวอร์ครั้งเดียว (${human(chosenBytes)}) แล้วอ่านสาขา — ขั้นสร้างสคริปต์จะใช้ไฟล์เดิม`}
+        </span>
+      </div>
+
+      {surveyErr && <div className="msg error">{surveyErr}</div>}
+
+      {survey && !survey.has_branch_table && (
+        <div className="msg info">
+          ไฟล์นี้<b>ไม่มีตาราง <code>branch</code></b> — จะนำเข้าเป็นคลินิกสาขาเดียวตามพฤติกรรมเดิม
+          <br />
+          <span className="muted" style={{ fontSize: 12 }}>
+            ถ้าคลินิกนี้มีหลายสาขาจริง แปลว่า dump ไม่ครบ — ต้อง <code>mysqldump</code> ตาราง{" "}
+            <code>branch</code> มาด้วย ไม่งั้นคนไข้ทุกคนจะไปอยู่สาขาเดียวกันหมด
+          </span>
+        </div>
+      )}
+
+      {survey && survey.has_branch_table && surveyRows.length > 0 && (
+        <>
+          <div className="muted" style={{ fontSize: 12, margin: "10px 0 4px" }}>
+            อ่านเสร็จใน {surveySeconds}s · พบ {surveyRows.length} สาขา ·{" "}
+            {survey.legal_entities?.length ?? 0} นิติบุคคล · คนไข้ {survey.total_patients.toLocaleString()} คน ·
+            นัด {survey.total_appointments.toLocaleString()} · บิล {survey.total_bills.toLocaleString()}
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>เอา</th>
+                <th>หลัก</th>
+                <th>รหัสเดิม</th>
+                <th>ชื่อสาขา</th>
+                <th>นิติบุคคล</th>
+                <th>คนไข้</th>
+                <th>นัด</th>
+                <th>ห้อง</th>
+                <th>บิล</th>
+                <th>คอร์ส</th>
+                <th>ล็อตสต็อก</th>
+              </tr>
+            </thead>
+            <tbody>
+              {surveyRows.map((b) => {
+                const on = picked.includes(b.code);
+                const empty = branchDataCount(b) === 0;
+                return (
+                  <tr key={b.code} style={on ? undefined : { opacity: 0.55 }}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        aria-label={`เอาสาขา ${b.code} ${b.name}`}
+                        checked={on}
+                        onChange={(e) =>
+                          setPicked((prev) => {
+                            const next = e.target.checked
+                              ? [...prev, b.code]
+                              : prev.filter((c) => c !== b.code);
+                            // Unticking the main branch would leave the main-branch choice
+                            // pointing at a branch that will not exist, and the main branch
+                            // is also where unresolvable rows are filed. Moved, not dropped.
+                            if (!e.target.checked && b.code === mainCode) {
+                              setMainCode(next[0] ?? "");
+                            }
+                            if (e.target.checked && !mainCode) setMainCode(b.code);
+                            return next;
+                          })
+                        }
+                      />
+                    </td>
+                    <td>
+                      <input
+                        type="radio"
+                        name="main-branch"
+                        aria-label={`ตั้งสาขา ${b.code} เป็นสาขาหลัก`}
+                        checked={mainCode === b.code}
+                        disabled={!on}
+                        onChange={() => setMainCode(b.code)}
+                      />
+                    </td>
+                    <td>
+                      <code>{b.code}</code>
+                      {!b.active && (
+                        <>
+                          {" "}
+                          <span className="tag">ปิดใช้</span>
+                        </>
+                      )}
+                    </td>
+                    <td>
+                      {b.name || <span className="muted">(ไม่มีชื่อ)</span>}
+                      {empty && (
+                        <>
+                          {" "}
+                          <span className="muted" style={{ fontSize: 11 }}>
+                            ไม่มีข้อมูลอ้างถึงเลย
+                          </span>
+                        </>
+                      )}
+                    </td>
+                    <td style={{ fontSize: 12 }}>
+                      {b.legal_name || <span className="muted">(ไม่ระบุ)</span>}
+                      {b.tax_id ? (
+                        <>
+                          <br />
+                          <code style={{ fontSize: 11 }}>{b.tax_id}</code>
+                        </>
+                      ) : null}
+                    </td>
+                    <td>{b.patients.toLocaleString()}</td>
+                    <td>{b.appointments.toLocaleString()}</td>
+                    <td>{b.rooms.toLocaleString()}</td>
+                    <td>{b.bills.toLocaleString()}</td>
+                    <td>{b.courses_bought.toLocaleString()}</td>
+                    <td>{b.stock_lots.toLocaleString()}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {/* One TIN per clinic is a database fact, not a preference: clinic_settings holds
+              a single tax id. Branches under two companies in one clinic means one of them
+              prints the other's name on its receipts. */}
+          {(() => {
+            // Grouped by TAX ID, which is the value clinic_settings can only hold one of.
+            // Blank ids are left out of the count because "not recorded" is not evidence of
+            // a second company, and treating it as one would block every export whose
+            // branch table is half-filled.
+            const ids = Array.from(
+              new Set(pickedRows.map((b) => b.tax_id.trim()).filter((t) => t !== "")),
+            );
+            if (ids.length <= 1) return null;
+            return (
+              <div className="msg error">
+                สาขาที่ติ๊กไว้อยู่ใต้ <b>{ids.length} เลขผู้เสียภาษี</b> — V4 เก็บเลขนี้ได้{" "}
+                <b>ค่าเดียวต่อคลินิก</b> (<code>clinic_settings</code>) ฉะนั้นใบเสร็จและใบกำกับภาษีของสาขาที่เป็น
+                นิติบุคคลอื่นจะพิมพ์หัวผิดนิติบุคคล
+                <ul className="tight">
+                  {ids.map((id) => {
+                    const rows = pickedRows.filter((b) => b.tax_id.trim() === id);
+                    return (
+                      <li key={id}>
+                        <code>{id}</code> — {rows[0].legal_name || "(ไม่ระบุชื่อ)"} · สาขา{" "}
+                        {rows.map((b) => b.code).join(", ")}
+                      </li>
+                    );
+                  })}
+                </ul>
+                ต้องแยกเป็นคลินิกละนิติบุคคล — ติ๊กเฉพาะสาขาของเลขเดียวรอบนี้ แล้วทำอีกรอบให้ที่เหลือ
+              </div>
+            );
+          })()}
+
+          {overTierCap && (
+            <div className="msg error">
+              ติ๊กไว้ {pickedRows.length} สาขา แต่แพ็กเกจที่เลือกในกล่อง 3 (
+              <b>{TIERS.find((t) => t.tier === tier)?.label}</b>) ให้ได้{" "}
+              <b>{tierCap} สาขา</b> — backend จะปฏิเสธทั้งคำขอและไม่สร้างอะไรเลย ·
+              เปลี่ยนแพ็กเกจในกล่อง 3 หรือติ๊กสาขาให้น้อยลง
+            </div>
+          )}
+
+          {strayCodes.length > 0 && (
+            <div className="msg warn">
+              ในข้อมูลมีรหัสสาขาที่<b>ไม่มีในตาราง branch</b>:{" "}
+              {strayCodes.map(([code, n]) => `${code} (${n} แถว)`).join(" · ")} — แถวเหล่านี้จะถูกเขียนไป{" "}
+              <b>สาขาหลัก</b> ไม่ถูกทิ้ง เพราะ <code>branch_code</code> เป็น NOT NULL ทุกตาราง
+            </div>
+          )}
+
+          {survey.cross_branch_hn && survey.cross_branch_hn.length > 0 && (
+            <div className="msg warn">
+              มี HN ที่โผล่ใต้หลายสาขา {survey.cross_branch_hn.length} ราย — คนไข้คนเดียวจะถูกจัดไปสาขาแรกที่พบ
+              <br />
+              <span className="muted" style={{ fontSize: 12 }}>
+                ตัวอย่าง: {survey.cross_branch_hn.slice(0, 10).join(", ")}
+              </span>
+            </div>
+          )}
+
+          {survey.appointments_no_branch > 0 && (
+            <div className="msg info">
+              นัด {survey.appointments_no_branch.toLocaleString()} รายการไม่มีสาขาในต้นทาง — ไม่ต้องแก้อะไร
+              เพราะ V4 ตั้งสาขาของนัด<b>จากห้องที่จอง</b>เองด้วย trigger{" "}
+              <code>validate_appointment_assignment</code>
+            </div>
+          )}
+
+          <div className={pickedRows.length > 0 && mainRow ? "msg ok" : "msg warn"}>
+            {pickedRows.length === 0 ? (
+              <>ยังไม่ได้ติ๊กสาขาเลย — ถ้าสร้างคลินิกตอนนี้จะได้สาขาเดียวตามค่าเริ่มต้นของ backend</>
+            ) : !mainRow ? (
+              <>ยังไม่ได้เลือกสาขาหลัก — ต้องเลือกหนึ่งสาขา เพราะเป็นทั้งสาขาตั้งต้นของเอกสารและปลายทางของแถวที่หาสาขาไม่ได้</>
+            ) : (
+              <>
+                จะสร้าง <b>{pickedRows.length} สาขา</b> · สาขาหลัก:{" "}
+                <b>
+                  {mainRow.name} (<code>{mainRow.code}</code>)
+                </b>
+                <br />
+                หัวใบเสร็จจะใช้ชื่อนิติบุคคลของสาขาหลัก:{" "}
+                <b>{mainRow.legal_name || mainRow.name || "(ไม่ระบุ)"}</b>{" "}
+                <span className="muted" style={{ fontSize: 12 }}>
+                  · เลขผู้เสียภาษี<b>เว้นว่างไว้</b>ตามที่ตกลง ไปกรอกในระบบทีหลัง (import จะไม่เขียนทับของที่คนกรอกเอง)
+                </span>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      {created?.branches && created.branches.length > 0 && (
+        <div className="msg ok">
+          <b>แผนที่สาขาที่ได้จากปลายทาง</b> — ค่านี้คือสิ่งที่ CLI จะใช้ ไม่ใช่สิ่งที่เราขอไป
+          <table>
+            <thead>
+              <tr>
+                <th>รหัสเดิม</th>
+                <th>สาขาใน V4</th>
+                <th>ชื่อ</th>
+                <th>สถานะ</th>
+                <th>หลัก</th>
+              </tr>
+            </thead>
+            <tbody>
+              {created.branches.map((b) => (
+                <tr key={b.branch_code}>
+                  <td>
+                    <code>{b.source_code || "—"}</code>
+                  </td>
+                  <td>
+                    <code>{b.branch_code}</code>
+                  </td>
+                  <td>{b.name}</td>
+                  <td>{b.status === "created" ? "สร้างใหม่" : "มีอยู่แล้ว"}</td>
+                  <td>{b.is_main ? "✓" : ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="muted" style={{ fontSize: 12 }}>
+            <code>-branch-map {branchMap}</code>
+            {mainBranchCode ? (
+              <>
+                <br />
+                <code>-default-branch {mainBranchCode}</code> — แถวที่หาสาขาไม่ได้ไปที่นี่
+              </>
+            ) : null}
+          </div>
+          {created.settings ? (
+            <div style={{ marginTop: 4 }}>
+              หัวใบเสร็จ/ภาษี:{" "}
+              <b>
+                {created.settings === "written"
+                  ? "เขียนให้แล้ว"
+                  : created.settings === "kept"
+                    ? "มีอยู่แล้ว ไม่แตะของเดิม"
+                    : created.settings}
+              </b>
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Covers the page while a request is running: the button that started it is at the
+          bottom of a long form, where "กำลังสร้าง…" is easy to miss. */}
+      <BusyOverlay state={busyState} />
+
+      {panelSource}
+      {panelBranches}
+      {panelTarget}
+
       <div className="panel">
-        <h2>3 · เลือกสิ่งที่จะนำเข้า</h2>
+        <h2>4 · เลือกสิ่งที่จะนำเข้า</h2>
         <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
           ค่าเริ่มต้นคือทั้งหมด — ติ๊กออกเมื่อปลายทางมีข้อมูลส่วนนั้นอยู่แล้ว
           (การนำเข้าทับจะเขียนค่าจากไฟล์ลงบนของเดิม)
@@ -839,28 +2113,76 @@ export default function GenerateForm() {
       </div>
 
       <div className="panel">
-        <h2>4 · สร้างสคริปต์</h2>
+        <h2>5 · สร้างสคริปต์</h2>
         <div className="row">
-          <button onClick={submit} disabled={busy || groups.length === 0}>
+          <button onClick={submit} disabled={busy || groups.length === 0 || tooBig}>
             {busy ? "กำลังสร้าง…" : "สร้างไฟล์ .sql"}
           </button>
           {chosen.length > 0 && (
-            <span className="muted">เลือกไว้ {chosen.length} ไฟล์</span>
+            <span className="muted">
+              เลือกไว้ {chosen.length} ไฟล์ · รวม {human(chosenBytes)}
+            </span>
           )}
         </div>
+
+        {tooBig && (
+          <div className="msg error">
+            ไฟล์ที่แนบรวมกัน <b>{human(chosenBytes)}</b> เกินเพดาน <b>{human(MAX_UPLOAD_BYTES)}</b> —
+            ปุ่มถูกปิดไว้ ยังไม่ได้ส่งอะไรออกไป
+          </div>
+        )}
+
+        {chosen.length > 0 && !tooBig && (
+          <div className="msg info">
+            ไฟล์จะถูกหั่นเป็นชิ้นละ {human(CHUNK_BYTES)} แล้วส่งทีละชิ้น (
+            {chosen.reduce((n, i) => n + Math.ceil((files[i.field]?.size ?? 0) / CHUNK_BYTES), 0)}{" "}
+            ชิ้น) — ไฟล์ใหญ่เท่าไรก็ส่งได้ เพราะแต่ละชิ้นเล็กพอที่ proxy ยอมรับ
+            <br />
+            เซิร์ฟเวอร์จะ<b>กรองเฉพาะ {MONGO_COLLECTIONS_USED.length} collection ที่ระบบนี้อ่าน</b>{" "}
+            ก่อนส่งให้ CLI · ที่เหลือ (log ต่าง ๆ) ถูกทิ้งเหมือนที่ CLI ทิ้งอยู่แล้ว
+            และจะมีรายงานว่าเก็บอะไรทิ้งอะไรทุกครั้ง
+          </div>
+        )}
 
         {err && <div className="msg error">{err}</div>}
 
         {result && (
           <>
             <div className="msg info">
-              สร้างเสร็จ: <code>{result.filename}</code> — <b>อ่านไฟล์ก่อนรัน</b> แล้วรันด้วย
+              สร้างเสร็จ: <code>{result.filename}</code> · <b>{human(result.sqlBytes)}</b> —{" "}
+              <b>อ่านไฟล์ก่อนรัน</b> แล้วรันด้วย
               <br />
               <code>psql &quot;$DATABASE_URL&quot; -v ON_ERROR_STOP=1 -f {result.filename}</code>
+              <br />
+              <span className="muted" style={{ fontSize: 12 }}>
+                ไฟล์อยู่บนเซิร์ฟเวอร์เครื่องมือ ไม่ได้ถูกส่งมาที่เบราว์เซอร์ (สคริปต์ของคลินิกใหญ่
+                มีขนาดหลายร้อย MB) · กดดาวน์โหลดแล้วเบราว์เซอร์จะรับเป็นสตรีมตรงลงเครื่อง ·
+                เก็บไว้ 6 ชั่วโมงแล้วถูกล้าง
+              </span>
             </div>
             <div className="row">
               <button onClick={download}>ดาวน์โหลด {result.filename}</button>
             </div>
+
+            {result.preview && (
+              <>
+                <h3>หัวไฟล์ (8 KB แรก)</h3>
+                <pre
+                  style={{
+                    background: "var(--panel-2)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: 12,
+                    overflowX: "auto",
+                    fontSize: 12,
+                    whiteSpace: "pre-wrap",
+                    maxHeight: 260,
+                  }}
+                >
+                  {result.preview}
+                </pre>
+              </>
+            )}
 
             <h3>นำเข้าไปที่เซิร์ฟเวอร์</h3>
             {!selected ? (
@@ -941,6 +2263,25 @@ export default function GenerateForm() {
                 )}
               </>
             )}
+            {result.log.length > 0 && (
+              <>
+                <h3>สิ่งที่เซิร์ฟเวอร์ทำก่อนเรียก CLI</h3>
+                <pre
+                  style={{
+                    background: "var(--panel-2)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: 12,
+                    overflowX: "auto",
+                    fontSize: 12,
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {result.log.join("\n")}
+                </pre>
+              </>
+            )}
+
             <h3>รายงานจาก CLI</h3>
             <pre
               style={{

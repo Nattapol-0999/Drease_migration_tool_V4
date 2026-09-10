@@ -1,0 +1,116 @@
+/* Full-screen busy overlay.
+ *
+ * Exists because "สร้างไฟล์ .sql" uploads hundreds of megabytes and then waits on a CLI:
+ * a disabled button that says "กำลังสร้าง…" at the bottom of a long page is invisible,
+ * and an operator who cannot tell the difference between "working" and "stuck" reloads
+ * the page mid-upload. It also blocks the form while a request is in flight, which is
+ * the cheapest way to stop a second submit of a 240 MB body.
+ */
+
+.busy-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(8, 10, 14, 0.78);
+  backdrop-filter: blur(2px);
+}
+
+.busy-card {
+  width: 100%;
+  max-width: 460px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 22px 24px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+.busy-card h2 {
+  margin: 0 0 2px;
+  font-size: 16px;
+}
+
+.busy-phase {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+/* The number is the point of the whole overlay, so it gets the largest type on screen. */
+.busy-pct {
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.busy-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 10px 0 8px;
+}
+
+.busy-bar > i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.15s linear;
+}
+
+/* Shown only while the server is working, where there is no real progress to report.
+ * A sliding bar says "alive", not "42% done" — an invented percentage would be a lie. */
+.busy-bar.indeterminate > i {
+  width: 40%;
+  animation: busy-slide 1.15s ease-in-out infinite;
+  transition: none;
+}
+
+@keyframes busy-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.busy-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.busy-note {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy-bar.indeterminate > i {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+
+  .busy-bar > i {
+    transition: none;
+  }
+
+  .busy-overlay {
+    backdrop-filter: none;
+  }
+}

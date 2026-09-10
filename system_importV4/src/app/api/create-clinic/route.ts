@@ -2,7 +2,12 @@ import "server-only";
 
 import { requireSession } from "@/lib/require-session";
 import { callBackend, describeClinicAPI, explainFailure, readClinicAPI } from "@/lib/clinic-api";
-import { TARGET_IDS, type TargetId } from "@/lib/types";
+import {
+  TARGET_IDS,
+  type ProvisionBranchInput,
+  type TargetId,
+  type TaxProfileInput,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,6 +30,66 @@ interface Body {
   ownerName?: string;
   ownerEmail?: string;
   ownerPassword?: string;
+  /**
+   * The branches this clinic should have, read out of the legacy `branch` table by
+   * /api/survey-branches and chosen by the operator. Omitted keeps the old behaviour:
+   * one branch named after the clinic.
+   */
+  branches?: ProvisionBranchInput[];
+  /** Receipt/tax header taken from the main branch's row. Written only if none is saved. */
+  taxProfile?: TaxProfileInput | null;
+}
+
+/**
+ * clinic.branch_no is a smallint constrained to 1..99 (migration 0321) and the number is
+ * permanent — it is the prefix every HN issued at that branch carries for life. Ninety-nine
+ * is therefore a hard architectural ceiling, not a policy choice this tool may relax.
+ */
+const MAX_BRANCHES = 99;
+
+/**
+ * A legacy branch code has to survive being written into the CLI's -branch-map argument,
+ * which is parsed as `code=BRANCH,code=BRANCH`. A code containing `=` or `,` would split
+ * in the wrong place and silently attribute one branch's rows to another, so it is refused
+ * here rather than discovered as a wrong branch on 14,000 patients.
+ */
+const SOURCE_CODE_RE = /^[^=,\s][^=,]{0,31}$/;
+
+/** Validates the branch list, returning a Thai error message or null. */
+function checkBranches(branches: ProvisionBranchInput[]): string | null {
+  if (branches.length > MAX_BRANCHES) {
+    return `เลือกสาขามา ${branches.length} สาขา แต่ V4 รองรับได้ไม่เกิน ${MAX_BRANCHES} สาขาต่อคลินิก (branch_no เป็น 1..99 และเลขนี้ติดไปกับ HN ตลอดชีวิต)`;
+  }
+
+  const seen = new Set<string>();
+  let mains = 0;
+  for (const [i, b] of branches.entries()) {
+    const at = `สาขาลำดับที่ ${i + 1}`;
+    const source = (b.source_code ?? "").trim();
+    if (!source) {
+      return `${at}: ไม่มีรหัสสาขาเดิม (source_code) — ถ้าไม่มีรหัส จะบอก CLI ไม่ได้ว่าแถวไหนของสาขานี้`;
+    }
+    if (!SOURCE_CODE_RE.test(source)) {
+      return `${at}: รหัสสาขาเดิม ${JSON.stringify(source)} มีอักขระที่ใช้ไม่ได้ — ห้ามมี = หรือ , เพราะเป็นตัวคั่นของ -branch-map`;
+    }
+    if (seen.has(source)) {
+      return `รหัสสาขาเดิม ${JSON.stringify(source)} ซ้ำกันในรายการที่ส่งมา — แผนที่สาขาจะชี้ได้ที่เดียว`;
+    }
+    seen.add(source);
+
+    if (!(b.name ?? "").trim()) {
+      return `${at} (${source}): ไม่มีชื่อสาขา แต่ clinic.tha_name เป็น NOT NULL`;
+    }
+    if (b.is_main) mains++;
+  }
+
+  // Exactly one, not "at least one": the main branch is also the destination for every row
+  // whose branch cannot be resolved (-default-branch), so leaving it ambiguous decides
+  // where unattributed patients and stock lots land by accident.
+  if (mains !== 1) {
+    return `ต้องเลือกสาขาหลักให้ได้หนึ่งสาขาพอดี (ตอนนี้เลือกไว้ ${mains} สาขา) — สาขาหลักเป็นทั้งสาขาตั้งต้นของเอกสารและปลายทางของแถวที่หาสาขาไม่ได้`;
+  }
+  return null;
 }
 
 function fail(error: string, status = 400, extra: Record<string, unknown> = {}): Response {
@@ -69,6 +134,12 @@ export async function POST(req: Request): Promise<Response> {
     return fail("อีเมล owner ไม่ถูกรูป");
   }
 
+  const branches = Array.isArray(body.branches) ? body.branches : [];
+  if (branches.length > 0) {
+    const branchErr = checkBranches(branches);
+    if (branchErr) return fail(branchErr);
+  }
+
   const started = Date.now();
   const call = await callBackend(api, "POST", "/v3/import/clinics", {
     clinic_code: clinicCode,
@@ -80,6 +151,36 @@ export async function POST(req: Request): Promise<Response> {
     owner_name: (body.ownerName ?? "").trim(),
     owner_email: ownerEmail,
     owner_password: body.ownerPassword ?? "",
+    // Omitted entirely when empty so the backend keeps its "one branch named after the
+    // clinic" default instead of receiving an empty list to interpret.
+    ...(branches.length > 0
+      ? {
+          branches: branches.map((b) => ({
+            source_code: (b.source_code ?? "").trim(),
+            name: (b.name ?? "").trim(),
+            name_en: (b.name_en ?? "").trim(),
+            address: (b.address ?? "").trim(),
+            phone: (b.phone ?? "").trim(),
+            is_main: Boolean(b.is_main),
+          })),
+        }
+      : {}),
+    ...(body.taxProfile
+      ? {
+          tax_profile: {
+            legal_name: (body.taxProfile.legal_name ?? "").trim(),
+            tax_id: (body.taxProfile.tax_id ?? "").trim(),
+            tax_branch_type: (body.taxProfile.tax_branch_type ?? "").trim(),
+            tax_branch_code: (body.taxProfile.tax_branch_code ?? "").trim(),
+            tax_address: (body.taxProfile.tax_address ?? "").trim(),
+            phone: (body.taxProfile.phone ?? "").trim(),
+            email: (body.taxProfile.email ?? "").trim(),
+            website: (body.taxProfile.website ?? "").trim(),
+            receipt_footer: (body.taxProfile.receipt_footer ?? "").trim(),
+            logo_url: (body.taxProfile.logo_url ?? "").trim(),
+          },
+        }
+      : {}),
   });
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
 
@@ -93,6 +194,8 @@ export async function POST(req: Request): Promise<Response> {
       target: id,
       requested: clinicCode || "(generate)",
       owner: ownerEmail || "(none)",
+      branches: branches.length,
+      taxProfile: body.taxProfile ? "sent" : "(none)",
       status: call.status,
       seconds,
     }),
@@ -130,6 +233,45 @@ export async function POST(req: Request): Promise<Response> {
     parsed && typeof parsed === "object" && "clinic" in (parsed as Record<string, unknown>)
       ? (parsed as Record<string, unknown>).clinic
       : parsed;
+
+  // ── the silent-drop guard ──
+  //
+  // Gin's ShouldBindJSON ignores fields it does not know, so a backend built before
+  // multi-branch provisioning answers 200 OK to a nine-branch request having created ONE
+  // branch, and says nothing about it. Everything after this point would then look healthy:
+  // the map would come back empty, the CLI would fall back to its single-branch behaviour,
+  // and 14,264 patients would land at one branch with no error anywhere in the chain.
+  //
+  // The response's own `branches` array is the proof the list was understood, so its
+  // absence is treated as a failure rather than a formatting difference. Reported as 502 —
+  // the request was fine, the target is not what this tool needs.
+  if (branches.length > 0) {
+    const echoed = (clinic as { branches?: unknown } | null)?.branches;
+    if (!Array.isArray(echoed) || echoed.length === 0) {
+      return fail(
+        `ส่งรายการสาขาไป ${branches.length} สาขา แต่ backend ตอบกลับมาโดยไม่มีรายการสาขาเลย ` +
+          "— เวอร์ชันของ backend ที่ปลายทางนี้ยังไม่รองรับ branches[] (Gin ทิ้งฟิลด์ที่ไม่รู้จักแบบไม่ฟ้อง) " +
+          "จึงสร้างสาขาเดียวไปแล้ว และแผนที่สาขาที่ CLI ต้องใช้จะว่าง " +
+          "— ต้อง deploy backend ตัวใหม่ก่อน แล้วตรวจสาขาของคลินิกนี้ด้วยมือ",
+        502,
+        { target: describeClinicAPI(api), clinic },
+      );
+    }
+    // A branch answered without its source_code cannot be attributed to a legacy code, and
+    // a partial map is worse than none: the branches it misses fall to the default and look
+    // imported. Named individually so the operator can see which ones.
+    const unlabelled = (echoed as { source_code?: string; branch_code?: string }[])
+      .filter((b) => !(b.source_code ?? "").trim())
+      .map((b) => b.branch_code ?? "(ไม่มีรหัส)");
+    if (unlabelled.length > 0) {
+      return fail(
+        `backend คืนสาขามา ${echoed.length} สาขา แต่ ${unlabelled.length} สาขาไม่มี source_code ` +
+          `(${unlabelled.join(", ")}) — จับคู่กับรหัสสาขาเดิมไม่ได้ แผนที่สาขาจะไม่ครบ`,
+        502,
+        { target: describeClinicAPI(api), clinic },
+      );
+    }
+  }
 
   return Response.json({
     ok: true,

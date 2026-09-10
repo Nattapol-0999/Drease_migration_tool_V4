@@ -65,9 +65,15 @@ export interface PullResult {
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_STDERR_CHARS = 64 * 1024;
 
-// The five MySQL tables the CLI maps. `clinic` is the legacy ROOM master — the name is
-// the legacy schema's, not a mistake (see system_CLIV4 README).
-const DEFAULT_TABLES = "users,doctor,clinic,patient,appointment";
+// The MySQL tables the CLI needs. `clinic` is the legacy ROOM master — the name is the
+// legacy schema's, not a mistake (see system_CLIV4 README).
+//
+// `branch` is here even though NOTHING is imported from it. It is the tenant's branch
+// registry, and it is what /api/survey-branches reads to find out how many branches the
+// clinic has, which company owns each one, and how much data names it. Without it a
+// multi-branch tenant pulled through this tab looks single-branch, and every patient in it
+// gets filed at one branch with no error anywhere to say so. It is a handful of rows.
+const DEFAULT_TABLES = "users,doctor,clinic,patient,appointment,branch";
 
 // The catalog collections the CLI reads out of the dbmongo half. `stocks` is here
 // because slot_stock (one row per lot) is built from it.

@@ -1,0 +1,478 @@
+import "server-only";
+
+// Moving the legacy patient page images into V4.
+//
+// The images and the rows that point at them live on DIFFERENT machines: the bytes go to
+// the backend host's uploads dir, the rows go to the database host. So this is not one
+// write but two, and the order they happen in is a decision:
+//
+//   bytes first, then rows.
+//
+// A byte with no row is an unreferenced file nobody sees. A row with no byte is a broken
+// image in a patient's record. Only one of those is recoverable by doing nothing, so the
+// copy goes first and the INSERT second.
+//
+// WHAT THIS FILE DOES NOT DECIDE
+//
+// Nothing about the mapping. Which revision wins, which HN owns an image, what
+// area_tag/doctor_code/taken_at become and where the bytes must land are all settled by
+// system_CLIV4 (internal/legacyimport/page.go) and arrive here as a manifest. This file
+// adds exactly one value the CLI could not know — file_size, read off the file it is
+// about to copy — and then does as it is told. Two implementations of the same mapping
+// would drift, and the one that drifts silently is the one writing medical records.
+
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, stat, copyFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { promisify } from "node:util";
+
+import { TARGET_IDS, type TargetId } from "@/lib/types";
+import { shellQuote } from "@/lib/server-target";
+
+const run = promisify(execFile);
+
+/** One image, as the CLI planned it. Mirrors legacyimport.PhotoFile. */
+export interface ManifestFile {
+  source_path: string;
+  source_url: string;
+  target_path: string;
+  hn: string;
+  clinic_code: string;
+  taken_at: string;
+  doctor_code?: string;
+  created_by?: string;
+  area_tag: string;
+  note?: string;
+}
+
+/** The whole copy plan. Mirrors legacyimport.PhotoManifest. */
+export interface Manifest {
+  clinic_code: string;
+  uploads_subdir: string;
+  files: ManifestFile[];
+}
+
+/**
+ * Where the image BYTES go. Separate from the clinic-API target on purpose: that one
+ * exists to reach :8090 and can legitimately be cleared to switch to a direct HTTP call,
+ * which has nothing to do with whether this host holds the uploads directory.
+ */
+export interface UploadsTarget {
+  id: TargetId;
+  sshHost: string;
+  sshUser: string;
+  sshPort: string;
+  sshKey: string;
+  /** Absolute path of the uploads base on that host (the container's /app/uploads). */
+  dir: string;
+}
+
+function env(k: string): string {
+  return (process.env[k] ?? "").trim();
+}
+
+/**
+ * readUploadsTarget resolves where one environment's image files live, or reports what is
+ * missing. The default dir matches the bind mount in docker-compose.prod.yml
+ * (./storage/uploads → /app/uploads); it is still overridable, because a host that was
+ * laid out differently must not need a code change.
+ */
+export function readUploadsTarget(id: TargetId): {
+  target: UploadsTarget | null;
+  missing: string[];
+} {
+  const up = id.toUpperCase();
+  const t: UploadsTarget = {
+    id,
+    sshHost: env(`TARGET_${up}_UPLOADS_SSH_HOST`),
+    sshUser: env("IMPORT_SSH_USER") || "ubuntu",
+    sshPort: env("IMPORT_SSH_PORT") || "22",
+    sshKey: env("IMPORT_SSH_KEY"),
+    dir: env(`TARGET_${up}_UPLOADS_DIR`) || "/var/www/dreasev4-back/storage/uploads",
+  };
+  const missing: string[] = [];
+  if (!t.sshHost) missing.push(`TARGET_${up}_UPLOADS_SSH_HOST`);
+  if (!t.sshKey) missing.push("IMPORT_SSH_KEY");
+  return { target: missing.length === 0 ? t : null, missing };
+}
+
+/** A short, non-secret description for the UI. Never includes the key path. */
+export function describeUploads(t: UploadsTarget): string {
+  return `${t.sshUser}@${t.sshHost}:${t.dir}`;
+}
+
+/** TARGET_IDS re-exported so a caller validating an id needs one import. */
+export { TARGET_IDS };
+
+// ── the survey ───────────────────────────────────────────────────────────────
+
+export interface SurveyFile {
+  hn: string;
+  source_url: string;
+  target_path: string;
+  bytes: number;
+}
+
+export interface Survey {
+  /** Every manifest entry whose file is present in the archive, with its real size. */
+  matched: SurveyFile[];
+  /** Manifest entries with no file in the archive. These CANNOT be imported. */
+  missing: { hn: string; source_url: string; expected_path: string }[];
+  /** Files in the archive that no manifest entry asked for. Harmless, but worth knowing. */
+  extraCount: number;
+  extraSample: string[];
+  totalBytes: number;
+}
+
+/**
+ * surveyArchive matches the manifest against the extracted archive and weighs each file.
+ *
+ * A manifest entry whose file is absent is reported and NEVER imported: a photos row
+ * whose file_path points at nothing renders as a broken image inside a medical record,
+ * which is worse than the image simply not having been migrated yet.
+ */
+export async function surveyArchive(manifest: Manifest, root: string): Promise<Survey> {
+  const matched: SurveyFile[] = [];
+  const missing: Survey["missing"] = [];
+  let totalBytes = 0;
+
+  for (const f of manifest.files) {
+    const abs = join(root, f.source_path);
+    try {
+      const st = await stat(abs);
+      if (!st.isFile()) throw new Error("not a file");
+      matched.push({
+        hn: f.hn,
+        source_url: f.source_url,
+        target_path: f.target_path,
+        bytes: st.size,
+      });
+      totalBytes += st.size;
+    } catch {
+      missing.push({ hn: f.hn, source_url: f.source_url, expected_path: f.source_path });
+    }
+  }
+
+  // Counting the extras needs the archive's own listing, not the manifest's.
+  const listed = await listArchiveFiles(root);
+  const wanted = new Set(manifest.files.map((f) => f.source_path));
+  const extras = listed.filter((p) => !wanted.has(p));
+
+  return {
+    matched,
+    missing,
+    extraCount: extras.length,
+    extraSample: extras.slice(0, 10),
+    totalBytes,
+  };
+}
+
+/** listArchiveFiles walks the extracted tree and returns paths relative to root. */
+async function listArchiveFiles(root: string): Promise<string[]> {
+  // `find` is used rather than a recursive JS walk because the archive can hold tens of
+  // thousands of entries and this is one process instead of that many syscall round trips
+  // through the event loop.
+  const { stdout } = await run("find", [root, "-type", "f"], { maxBuffer: 64 * 1024 * 1024 });
+  const prefix = root.endsWith("/") ? root : root + "/";
+  return stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((p) => (p.startsWith(prefix) ? p.slice(prefix.length) : p));
+}
+
+// ── extracting ───────────────────────────────────────────────────────────────
+
+/**
+ * extractArchive unpacks the operator's tar into a fresh directory and returns it.
+ *
+ * The whole archive is extracted even for a survey. Listing it without unpacking would
+ * mean parsing `tar -tv` output, whose columns shift with tar version and locale, to
+ * learn a file size — and getting a size wrong here corrupts the duplicate key the import
+ * relies on. Twenty-odd MB of scans is cheap; a misparsed column is not.
+ */
+export async function extractArchive(tarPath: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "importv4-img-"));
+  try {
+    await run("tar", ["-xzf", tarPath, "-C", dir], { maxBuffer: 8 * 1024 * 1024 });
+  } catch (err) {
+    await rm(dir, { recursive: true, force: true });
+    const e = err as { stderr?: string; message?: string };
+    throw new Error(`แตกไฟล์ .tar.gz ไม่ได้: ${(e.stderr || e.message || "").trim()}`);
+  }
+  return dir;
+}
+
+// ── shipping the bytes ───────────────────────────────────────────────────────
+
+export interface ShipResult {
+  filesSent: number;
+  bytesSent: number;
+  log: string;
+}
+
+/**
+ * shipFiles copies the matched images to the target host under their FINAL relative
+ * paths.
+ *
+ * They travel as one repacked archive rather than N scp calls: several hundred separate
+ * ssh sessions would take minutes and fail half way through with no way to say how far it
+ * got. One archive is one round trip, and tar on the far side either unpacks it or does
+ * not.
+ *
+ * Nothing is deleted on the far side and nothing outside the clinic's own subdirectory is
+ * written: every entry in the archive is <clinic>/opd-photo/<name>, built here from the
+ * manifest, never from a path inside the operator's upload. That matters more than usual
+ * because the remote half runs under sudo — the paths it is handed are derived from the
+ * manifest and shell-quoted, so a crafted value in the dump cannot become a path outside
+ * the clinic's folder or a second command.
+ */
+export async function shipFiles(
+  t: UploadsTarget,
+  manifest: Manifest,
+  survey: Survey,
+  extractRoot: string,
+): Promise<ShipResult> {
+  const stage = await mkdtemp(join(tmpdir(), "importv4-stage-"));
+  const bundle = join(stage, "..", `importv4-bundle-${process.pid}.tar.gz`);
+  const payload = join(stage, "payload");
+
+  try {
+    const byTarget = new Map(manifest.files.map((f) => [f.target_path, f]));
+    let files = 0;
+    let bytes = 0;
+
+    for (const m of survey.matched) {
+      const f = byTarget.get(m.target_path);
+      if (!f) continue;
+      const dest = join(payload, f.target_path);
+      await mkdir(dirname(dest), { recursive: true });
+      await copyFile(join(extractRoot, f.source_path), dest);
+      files++;
+      bytes += m.bytes;
+    }
+    if (files === 0) throw new Error("ไม่มีไฟล์ที่จับคู่ได้เลย จึงไม่มีอะไรจะส่ง");
+
+    await run("tar", ["-czf", bundle, "-C", payload, "."], { maxBuffer: 8 * 1024 * 1024 });
+
+    // scp the bundle, then unpack it on the far side into the uploads base. `-m` on
+    // mkdir keeps the mode explicit rather than inheriting a surprising umask; the
+    // container reads these files as a different uid than the one writing them.
+    const remoteTmp = `/tmp/importv4-photos-${Date.now()}.tar.gz`;
+    await run(
+      "scp",
+      [
+        "-i", t.sshKey,
+        "-P", t.sshPort,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "IdentitiesOnly=yes",
+        bundle,
+        `${t.sshUser}@${t.sshHost}:${remoteTmp}`,
+      ],
+      { maxBuffer: 8 * 1024 * 1024 },
+    );
+
+    // The uploads tree is root-owned: the API container runs as uid 0 and every file
+    // already in there is root:root 0644. The ssh account is ubuntu (uid 1000) and cannot
+    // even mkdir inside it, so the copy runs under sudo -n.
+    //
+    // -n, never an interactive prompt: stdin here carries no keyboard, so a sudo that
+    // decided to ask for a password would hang the request until the timeout instead of
+    // failing with a reason.
+    //
+    // Ownership and mode are then set EXPLICITLY rather than left to tar. For root, GNU
+    // tar defaults to --same-owner --same-permissions, so it would faithfully restore
+    // uid 1000 and whatever mode the legacy server happened to use — leaving imported
+    // files that differ from every file the app writes itself. That difference is not
+    // cosmetic: it is the kind of thing somebody has to investigate a year from now. The
+    // flags below plus the explicit chown/chmod make the result identical to
+    // storage.Write's own output (root:root, dirs 755, files 644), and they are scoped to
+    // this clinic's opd-photo directory so nothing else in the tree is touched.
+    const subdir = join(t.dir, manifest.uploads_subdir).replaceAll("\\", "/");
+    const remote = [
+      `set -e`,
+      `sudo -n mkdir -p ${shellQuote(subdir)}`,
+      `sudo -n tar --no-same-owner --no-same-permissions -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(t.dir)}`,
+      `sudo -n chown -R root:root ${shellQuote(subdir)}`,
+      `sudo -n find ${shellQuote(subdir)} -type d -exec chmod 755 {} +`,
+      `sudo -n find ${shellQuote(subdir)} -type f -exec chmod 644 {} +`,
+      `rm -f ${shellQuote(remoteTmp)}`,
+      `find ${shellQuote(subdir)} -type f | wc -l`,
+    ].join(" && ");
+
+    const { stdout, stderr } = await run(
+      "ssh",
+      [
+        "-i", t.sshKey,
+        "-p", t.sshPort,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "IdentitiesOnly=yes",
+        `${t.sshUser}@${t.sshHost}`,
+        remote,
+      ],
+      { maxBuffer: 8 * 1024 * 1024 },
+    );
+
+    return {
+      filesSent: files,
+      bytesSent: bytes,
+      log: [`ไฟล์ในโฟลเดอร์ปลายทางหลังแตกไฟล์: ${stdout.trim()}`, stderr.trim()]
+        .filter(Boolean)
+        .join("\n"),
+    };
+  } finally {
+    await rm(stage, { recursive: true, force: true });
+    await rm(bundle, { force: true });
+  }
+}
+
+// ── the rows ─────────────────────────────────────────────────────────────────
+
+/** lit renders a Postgres string literal, doubling embedded single quotes. */
+function lit(s: string): string {
+  return "'" + s.replaceAll("'", "''") + "'";
+}
+
+function nullLit(s: string | undefined): string {
+  const v = (s ?? "").trim();
+  return v === "" ? "NULL" : lit(v);
+}
+
+/** intOrNull keeps a non-numeric legacy value out of an integer column. */
+function intOrNull(s: string | undefined): string {
+  const v = (s ?? "").trim();
+  return /^-?\d+$/.test(v) ? v : "NULL";
+}
+
+/**
+ * buildInsertSQL renders the rows for the images that were actually shipped.
+ *
+ * Shape of each statement, and why:
+ *
+ *   - INSERT … SELECT … WHERE NOT EXISTS, keyed on
+ *     (clinic_code, hn, taken_at, file_size). There is no migrate_source_ref column on
+ *     photos and the owner chose not to add one, so this triple is the only thing that
+ *     can tell "already imported" from "import again". taken_at carries millisecond
+ *     precision from the source revision, so two genuinely different pages colliding on
+ *     it AND on byte count is not a case that occurs; when the manifest itself contains
+ *     such a pair the CLI says so in its warnings.
+ *   - visit_id NULL. See page.go: SaveMedia hard-deletes a visit's rows before rewriting
+ *     them, so a row bound to a visit would be destroyed the first time a doctor saved
+ *     media there.
+ *   - consent_given true, by the clinic owner's decision.
+ *   - One transaction, with a guard that the clinic exists first. `photos` has no foreign
+ *     key to `clinic`, so a wrong clinic_code would insert rows that no tenant can ever
+ *     see — the failure that looks like success.
+ */
+export function buildInsertSQL(
+  clinic: string,
+  manifest: Manifest,
+  survey: Survey,
+): { sql: string; rows: number } {
+  const byTarget = new Map(manifest.files.map((f) => [f.target_path, f]));
+  const out: string[] = [];
+
+  out.push("-- ══════════════════════════════════════════════════════════════════════════");
+  out.push("-- Dr.Ease V2 → V4: รูปหน้าเวชระเบียน (mris.page → public.photos)");
+  out.push(`-- clinic_code : ${clinic}`);
+  out.push(`-- รูป         : ${survey.matched.length} ไฟล์ (rev ล่าสุดของแต่ละหน้า)`);
+  out.push("--");
+  out.push("-- ไบต์ของรูปถูกคัดลอกขึ้นเครื่องปลายทางก่อนสคริปต์นี้จะรัน — แถวที่ไม่มีไฟล์คู่กัน");
+  out.push("-- คือรูปเสียในเวชระเบียน จึงไม่มีแถวใดถูกเขียนก่อนไฟล์ถึงที่");
+  out.push("--");
+  out.push("-- insert-only · รันซ้ำไม่เพิ่มของซ้ำ (กันด้วย clinic_code + hn + taken_at + file_size)");
+  out.push("-- ══════════════════════════════════════════════════════════════════════════");
+  out.push("");
+  out.push("BEGIN;");
+  out.push("");
+  out.push("SET LOCAL standard_conforming_strings = on;");
+  out.push(`SET LOCAL app.clinic_code = ${lit(clinic)};`);
+  out.push("");
+  out.push("-- GUARD: คลินิกต้องมีอยู่จริง — photos ไม่มี FK ไป clinic ฉะนั้นรหัสผิดจะเขียนผ่าน");
+  out.push("-- เงียบ ๆ แล้วไม่มี tenant ไหนมองเห็นแถวนั้นได้เลย");
+  out.push("DO $guard$");
+  out.push("BEGIN");
+  out.push(`    IF NOT EXISTS (SELECT 1 FROM clinic WHERE clinic_code = ${lit(clinic)}) THEN`);
+  out.push(
+    `        RAISE EXCEPTION 'clinic_code % ไม่มีในระบบ — สร้างคลินิกก่อนแล้วนำเข้ารูปอีกครั้ง', ${lit(clinic)};`,
+  );
+  out.push("    END IF;");
+  out.push("END $guard$;");
+  out.push("");
+
+  let rows = 0;
+  for (const m of survey.matched) {
+    const f = byTarget.get(m.target_path);
+    if (!f) continue;
+    rows++;
+
+    const c = lit(clinic);
+    const hn = lit(f.hn);
+    const taken = `${lit(f.taken_at)}::timestamptz`;
+    const size = String(m.bytes);
+
+    out.push(`-- hn ${f.hn} · ${f.source_url}`);
+    out.push(
+      `INSERT INTO photos (clinic_code, hn, visit_id, area_tag, kind, file_path, thumb_path,
+                    file_size, consent_given, note, doctor_code, created_by, taken_at,
+                    annotations, created_at, updated_at)
+SELECT ${c}, ${hn}, NULL, ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, 'note',
+       ${lit(f.target_path)}, NULL,
+       ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
+       '[]'::jsonb, now(), now()
+WHERE NOT EXISTS (
+    SELECT 1 FROM photos
+     WHERE clinic_code = ${c} AND hn = ${hn}
+       AND taken_at = ${taken} AND file_size = ${size}
+);`,
+    );
+    out.push("");
+  }
+
+  out.push("COMMIT;");
+  out.push("");
+  return { sql: out.join("\n"), rows };
+}
+
+/** cleanup removes a temp tree, ignoring a tree that is already gone. */
+export async function cleanup(...dirs: string[]): Promise<void> {
+  for (const d of dirs) {
+    if (d) await rm(d, { recursive: true, force: true });
+  }
+}
+
+/** readManifest loads and shape-checks the CLI's photos_<clinic>.json. */
+export async function readManifest(path: string, clinic: string): Promise<Manifest> {
+  const raw = await readFile(path, "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`อ่าน manifest ที่ CLI สร้างไม่ได้: ${(e as Error).message}`);
+  }
+  const m = parsed as Manifest;
+  if (!m || typeof m !== "object" || !Array.isArray(m.files)) {
+    throw new Error("manifest ที่ CLI สร้างมีรูปแบบไม่ถูกต้อง");
+  }
+  // The clinic in the manifest must be the clinic the caller asked for, or the paths
+  // being written belong to a different tenant.
+  if (m.clinic_code !== clinic) {
+    throw new Error(
+      `manifest เป็นของคลินิก ${m.clinic_code} แต่คำขอนี้เป็นของ ${clinic} — สร้างใหม่ก่อน`,
+    );
+  }
+  if (!m.uploads_subdir.startsWith(`${clinic}/`)) {
+    throw new Error(`manifest ชี้โฟลเดอร์ ${m.uploads_subdir} ที่ไม่ใช่ของคลินิก ${clinic}`);
+  }
+  for (const f of m.files) {
+    if (!f.target_path.startsWith(`${clinic}/`) || f.target_path.includes("..")) {
+      throw new Error(`manifest มี target_path ที่ออกนอกโฟลเดอร์คลินิก: ${f.target_path}`);
+    }
+  }
+  return m;
+}

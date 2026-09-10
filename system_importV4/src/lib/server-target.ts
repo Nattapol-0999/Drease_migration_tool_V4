@@ -217,6 +217,55 @@ export function runSSH(args: string[], stdin: string): Promise<SSHResult> {
   });
 }
 
+/**
+ * runSSHFromFile is runSSH with the script streamed from disk instead of held as a string.
+ *
+ * A generated script for a real clinic can be hundreds of megabytes. Reading it into a
+ * string to pass as stdin would put all of it in this process's memory — twice, since a
+ * JS string of UTF-8 text is not the file's bytes — on a box with 908 MB of RAM. Piping
+ * the file handle keeps memory flat no matter how large the script is.
+ */
+export function runSSHFromFile(args: string[], sqlPath: string): Promise<SSHResult> {
+  const { spawn } = require("node:child_process") as typeof import("node:child_process");
+  const { createReadStream } = require("node:fs") as typeof import("node:fs");
+
+  return new Promise((resolve) => {
+    const child = spawn("ssh", args, { windowsHide: true });
+
+    let stdout = "";
+    let stderr = "";
+    const cap = 2 * 1024 * 1024; // bounded so a runaway remote cannot fill memory
+    child.stdout.on("data", (d) => {
+      if (stdout.length < cap) stdout += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      if (stderr.length < cap) stderr += String(d);
+    });
+
+    child.on("error", (err) => {
+      resolve({ code: -1, stdout, stderr: `${stderr}\nรัน ssh ไม่ได้: ${err.message}`.trim() });
+    });
+    child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+
+    child.stdin.on("error", () => {
+      /* remote closed early (psql aborted); exit code and stderr carry the reason */
+    });
+
+    const file = createReadStream(sqlPath);
+    file.on("error", (err) => {
+      // Reported rather than silently truncating the script — a partial import that looks
+      // successful is the worst outcome available here.
+      resolve({
+        code: -1,
+        stdout,
+        stderr: `${stderr}\nอ่านไฟล์สคริปต์ไม่ได้: ${err.message}`.trim(),
+      });
+      child.kill();
+    });
+    file.pipe(child.stdin);
+  });
+}
+
 /** hint turns common ssh/psql failures into the thing the operator actually has to fix. */
 export function hint(r: SSHResult): string {
   const text = `${r.stderr}\n${r.stdout}`;
