@@ -21,29 +21,25 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		return "", rep, err
 	}
 
-	// Trim to the requested groups AFTER building, so the report still counts what the
-	// export actually contains — an operator importing one part should still see what
-	// they chose to leave out.
-	var excluded []string
+	// BuildAll no longer builds what was not selected, so there is nothing left to trim
+	// here. What remains is telling the operator what they chose, and which groups the
+	// choice leaves them depending on the target to already have.
+	//
+	// The unselected groups are named from the GROUP list rather than from leftover SQL:
+	// there is no leftover SQL any more, and naming the groups is the more useful sentence
+	// anyway — "money was not imported" reads better than five table names.
 	if len(in.Groups) > 0 {
-		want, gerr := entitiesForGroups(in.Groups)
-		if gerr != nil {
-			return "", rep, gerr
-		}
-		for _, name := range order {
-			if sqlText, ok := batches[name]; ok && strings.TrimSpace(sqlText) != "" && !want[name] {
-				excluded = append(excluded, name)
-				delete(batches, name)
+		rep.notef("นำเข้าเฉพาะกลุ่ม: %s", strings.Join(in.Groups, ", "))
+
+		var skipped []string
+		for _, g := range GroupNames() {
+			if !groupSelected(in.Groups, g) {
+				skipped = append(skipped, g)
 			}
 		}
-		// A photo manifest counts as output even though it contributes no SQL, so
-		// `-only photos` is a valid request rather than an empty one.
-		if len(batches) == 0 && rep.Photos == nil {
-			return "", rep, fmt.Errorf("กลุ่มที่เลือก (%s) ไม่มีข้อมูลในไฟล์ที่แนบมา", strings.Join(in.Groups, ", "))
-		}
-		rep.notef("นำเข้าเฉพาะกลุ่ม: %s", strings.Join(in.Groups, ", "))
-		if len(excluded) > 0 {
-			rep.warnf("ไม่นำเข้า (ตามที่เลือก): %s — ข้อมูลส่วนนี้อยู่ในไฟล์แต่ถูกข้าม", strings.Join(excluded, ", "))
+		if len(skipped) > 0 {
+			rep.notef("ไม่นำเข้ารอบนี้ (ตามที่เลือก): %s — ไม่ได้อ่านไฟล์ส่วนนั้นเลย ฉะนั้นข้อผิดพลาดในข้อมูลของกลุ่มเหล่านี้จะไม่ทำให้รอบนี้ล้ม",
+				strings.Join(skipped, ", "))
 		}
 		for _, g := range in.Groups {
 			for _, dep := range groupDependsOn[strings.ToLower(strings.TrimSpace(g))] {
@@ -133,7 +129,11 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	b.WriteString(fmt.Sprintf("SET LOCAL app.clinic_code = %s;\n\n", lit(in.ClinicCode)))
 
 	b.WriteString(buildClinicExistsGuard(in.ClinicCode))
-	if len(userRows) > 0 {
+	// Gated on accounts actually being WRITTEN, not merely parsed. Since BuildAll started
+	// filtering by group, userRows can be full while no user is imported — appointments
+	// parse the users table only to learn which doctor_code V4 will accept. Emitting the
+	// collision guard then would refuse the run over ids nothing is going to insert.
+	if _, importingUsers := batches[EntUsers]; importingUsers && len(userRows) > 0 {
 		keys := []string{RoleKeyOwner, RoleKeyStaff}
 		if _, importingDoctors := batches[EntDoctor]; importingDoctors {
 			keys = append(keys, RoleKeyDoctor)

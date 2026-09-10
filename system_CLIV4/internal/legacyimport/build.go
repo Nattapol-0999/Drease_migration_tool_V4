@@ -100,18 +100,74 @@ type Input struct {
 	PageDump []byte
 }
 
-// BuildAll parses the supplied files and renders the SQL for each entity, without
-// touching a database. The returned map is keyed by the Ent* constants; userRows is
-// handed back so the caller can emit the cross-clinic collision guard from the same
-// parse instead of reading the dump twice.
+// BuildAll parses the supplied files and renders the SQL for the entities the caller asked
+// for, without touching a database. The returned map is keyed by the Ent* constants;
+// userRows is handed back so the caller can emit the cross-clinic collision guard from the
+// same parse instead of reading the dump twice.
+//
+// # WHY THE GROUP FILTER IS APPLIED HERE AND NOT AFTERWARDS
+//
+// It used to build everything and let BuildScript drop what was not selected, so the report
+// could still say what the export contained. That cost more than it was worth: a mapping
+// that REFUSES is how this tool protects a clinic, and a refusal about an unselected group
+// stopped the whole run.
+//
+// Found on a real export: its `users` table has eight rows whose email column holds a
+// person's name, and those names collide. users.email is UNIQUE across the whole table in
+// V4, so buildUsers refuses — correctly. But because everything was built first, that
+// refusal also blocked `-only catalog,stock`, which does not write a single user. The
+// operator was told to fix eight email addresses before they could import a price list,
+// and only after a 79-second parse of a 719 MB dump.
+//
+// So: a group that was not asked for is not built, and cannot fail the run. The tradeoff is
+// that the report no longer counts rows for tables nobody selected, which is the smaller
+// loss — the operator already knows what they chose to leave out.
+//
+// PARSING IS SEPARATE FROM BUILDING, and has to be. Several selections need rows from a
+// table they do not write:
+//
+//	appointment  needs users + doctor to know which doctor_code V4 will accept
+//	             (buildBookableDoctors); without them every appointment silently loses
+//	             its doctor, which looks like imported data and is not
+//	appointment   needs patient to know each HN's branch (branchByHN)
+//	entitlements needs the money plan to point at the invoice lines it sells
 func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []legacydump.Row, money moneyBatches, err error) {
 	if strings.TrimSpace(in.ClinicCode) == "" {
 		return nil, nil, money, fmt.Errorf("clinic_code is required")
 	}
 
+	// An empty selection means everything, which is what an operator who passes no -only
+	// expects. Unknown group names are rejected here rather than silently importing less.
+	want := map[string]bool{}
+	all := len(in.Groups) == 0
+	if !all {
+		if want, err = entitiesForGroups(in.Groups); err != nil {
+			return nil, nil, money, err
+		}
+	}
+	wants := func(names ...string) bool {
+		if all {
+			return true
+		}
+		for _, n := range names {
+			if want[n] {
+				return true
+			}
+		}
+		return false
+	}
+
 	out := map[string]string{}
 
-	if len(in.UsersDump) > 0 {
+	// ── parse ───────────────────────────────────────────────────────────────────
+	//
+	// Read only what something selected actually needs. Parsing a 719 MB dump nobody asked
+	// about is minutes of an operator's afternoon and, on the deployed box, most of its RAM.
+
+	needUsers := wants(EntUsers, EntClinicUser, EntClinicStaff, EntAppointment)
+	needDoctor := wants(EntDoctor, EntClinicStaff, EntAppointment)
+
+	if len(in.UsersDump) > 0 && needUsers {
 		_, userRows, err = legacydump.Parse(string(in.UsersDump), "users")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("users dump: %w", err)
@@ -119,18 +175,22 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	}
 
 	var doctorRows []legacydump.Row
-	if len(in.DoctorDump) > 0 {
+	if len(in.DoctorDump) > 0 && needDoctor {
 		_, doctorRows, err = legacydump.Parse(string(in.DoctorDump), "doctor")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("doctor dump: %w", err)
 		}
 	}
 
-	if len(userRows) > 0 {
+	// ── people ──────────────────────────────────────────────────────────────────
+
+	if len(userRows) > 0 && wants(EntUsers, EntClinicUser, EntClinicStaff) {
 		// Exactly one account becomes the owner; the caller names it and it must be
-		// present, or the clinic would have nobody who can administer it.
+		// present, or the clinic would have nobody who can administer it. Only asked for
+		// when accounts are actually being written — importing a price list does not need
+		// to know who owns the clinic.
 		if strings.TrimSpace(in.OwnerUsername) == "" {
-			return nil, nil, money, fmt.Errorf("owner_username is required when a users dump is provided")
+			return nil, nil, money, fmt.Errorf("owner_username is required when importing the people group")
 		}
 		if !hasOwner(userRows, in.OwnerUsername) {
 			return nil, nil, money, fmt.Errorf("owner_username %q not found among the %d account(s) in the users dump",
@@ -148,13 +208,15 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			return nil, nil, money, err
 		}
 	}
-	if len(doctorRows) > 0 {
+	if len(doctorRows) > 0 && wants(EntDoctor) {
 		if out[EntDoctor], err = buildDoctor(doctorRows, in, rep); err != nil {
 			return nil, nil, money, err
 		}
 	}
 
-	if len(in.RoomDump) > 0 {
+	// ── rooms ───────────────────────────────────────────────────────────────────
+
+	if len(in.RoomDump) > 0 && wants(EntRoom) {
 		// The legacy room master lives in a table called `clinic`.
 		_, roomRows, err := legacydump.Parse(string(in.RoomDump), "clinic")
 		if err != nil {
@@ -165,22 +227,27 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 	}
 
-	// Kept beyond the patient block: appointments derive their branch from the patient's,
-	// because the legacy appointment rows do not carry a usable one.
+	// ── patients ────────────────────────────────────────────────────────────────
+	//
+	// Parsed when appointments are selected even if patients are not: an appointment takes
+	// its branch from the patient's, and guessing it instead would file the booking at a
+	// branch the patient has never been to.
 	var branchByPatient map[string]string
 
-	if len(in.PatientDump) > 0 {
+	if len(in.PatientDump) > 0 && wants(EntPatient, EntAppointment) {
 		_, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("patient dump: %w", err)
 		}
 		branchByPatient = branchByHN(patientRows)
-		if out[EntPatient], err = buildPatient(patientRows, in, rep); err != nil {
-			return nil, nil, money, err
+		if wants(EntPatient) {
+			if out[EntPatient], err = buildPatient(patientRows, in, rep); err != nil {
+				return nil, nil, money, err
+			}
 		}
 	}
 
-	if len(in.AddressDump) > 0 {
+	if len(in.AddressDump) > 0 && wants(EntPatientAddress, EntPatientAddressFill) {
 		_, addrRows, err := legacydump.Parse(string(in.AddressDump), "patient_address")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("patient_address dump: %w", err)
@@ -193,7 +260,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		out[EntPatientAddressFill] = fillSQL
 	}
 
-	if len(in.AppointmentDump) > 0 {
+	if len(in.AppointmentDump) > 0 && wants(EntAppointment) {
 		_, apptRows, err := legacydump.Parse(string(in.AppointmentDump), "appointment")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("appointment dump: %w", err)
@@ -204,51 +271,78 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 	}
 
-	// The Mongo half: catalog, then the money that references it.
-	if len(in.MongoDump) > 0 {
+	// ── the Mongo half: catalog, then the money that references it ──────────────
+
+	needCatalog := wants(EntCatalogCategory, EntCatalogService, EntItems, EntCatalogDrug,
+		EntCatalogCourse, EntCatalogCourseLine)
+	needStock := wants(EntSlotStock)
+	needMoney := wants(EntInvoice, EntInvoiceItem, EntReceipt, EntReceiptPayment, EntInvoiceSettle)
+	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems)
+
+	if len(in.MongoDump) > 0 && (needCatalog || needStock || needMoney || needEntitlements) {
 		mc, err := parseMongoCatalog(in.MongoDump)
 		if err != nil {
 			return nil, nil, money, err
 		}
-		out[EntCatalogCategory] = buildCatalogCategory(mc, in, rep)
-		if out[EntCatalogService], err = buildCatalogServices(mc, in, rep); err != nil {
-			return nil, nil, money, err
+		if needCatalog {
+			out[EntCatalogCategory] = buildCatalogCategory(mc, in, rep)
+			if out[EntCatalogService], err = buildCatalogServices(mc, in, rep); err != nil {
+				return nil, nil, money, err
+			}
+			if out[EntCatalogCourse], out[EntCatalogCourseLine], err = buildCourses(mc, in, rep); err != nil {
+				return nil, nil, money, err
+			}
 		}
-		itemsSQL, drugSQL, slotSQL, err := buildItems(mc, in, rep)
-		if err != nil {
-			return nil, nil, money, err
-		}
-		out[EntItems], out[EntCatalogDrug], out[EntSlotStock] = itemsSQL, drugSQL, slotSQL
-		if out[EntCatalogCourse], out[EntCatalogCourseLine], err = buildCourses(mc, in, rep); err != nil {
-			return nil, nil, money, err
+		// items, catalog_item(drug) and slot_stock come out of ONE pass over the items
+		// collection, so catalog and stock cannot be built independently of each other.
+		// Whichever was asked for is kept; the other is dropped rather than re-parsed.
+		if needCatalog || needStock {
+			itemsSQL, drugSQL, slotSQL, ierr := buildItems(mc, in, rep)
+			if ierr != nil {
+				return nil, nil, money, ierr
+			}
+			if needCatalog {
+				out[EntItems], out[EntCatalogDrug] = itemsSQL, drugSQL
+			}
+			if needStock {
+				out[EntSlotStock] = slotSQL
+			}
 		}
 
 		// The money half of the same file. It runs last because invoice_item resolves
 		// catalog_item_id by code, so the catalog statements above must be in the
 		// script before it — the SQL is applied top-down in one transaction.
-		if money, err = buildMoney(mc, in, rep); err != nil {
-			return nil, nil, money, err
+		//
+		// Built for entitlements too even when money itself was not selected: an
+		// entitlement points at the invoice line that sold it, and that reference comes
+		// out of this plan. Only the SQL is withheld.
+		if needMoney || needEntitlements {
+			if money, err = buildMoney(mc, in, rep); err != nil {
+				return nil, nil, money, err
+			}
+			if needMoney {
+				out[EntInvoice] = money.invoice
+				out[EntInvoiceItem] = money.invoiceItem
+				out[EntReceipt] = money.receipt
+				out[EntReceiptPayment] = money.receiptPayment
+				out[EntInvoiceSettle] = money.settle
+			}
 		}
-		out[EntInvoice] = money.invoice
-		out[EntInvoiceItem] = money.invoiceItem
-		out[EntReceipt] = money.receipt
-		out[EntReceiptPayment] = money.receiptPayment
-		out[EntInvoiceSettle] = money.settle
 
-		// Course entitlements last: they point at the invoice lines the money block just
-		// wrote, and at the course codes the catalog block minted.
-		purge, bought, boughtItems, cerr := buildCourseBought(mc, money, in, rep)
-		if cerr != nil {
-			return nil, nil, money, cerr
+		if needEntitlements {
+			purge, bought, boughtItems, cerr := buildCourseBought(mc, money, in, rep)
+			if cerr != nil {
+				return nil, nil, money, cerr
+			}
+			out[EntCourseBoughtPurge] = purge
+			out[EntCourseBought] = bought
+			out[EntCourseBoughtItems] = boughtItems
 		}
-		out[EntCourseBoughtPurge] = purge
-		out[EntCourseBought] = bought
-		out[EntCourseBoughtItems] = boughtItems
 	}
 
 	// Patient page images. This one hangs off the report rather than `out`: it produces
 	// no SQL, because photos.file_size is only knowable from the image files themselves.
-	if len(in.PageDump) > 0 {
+	if len(in.PageDump) > 0 && wants(EntPhoto) {
 		man, perr := buildPhotos(in.PageDump, in, rep)
 		if perr != nil {
 			return nil, nil, money, perr
@@ -257,6 +351,13 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	}
 
 	if len(out) == 0 && rep.Photos == nil {
+		// Two different mistakes, and telling them apart is the difference between
+		// "attach a file" and "you picked groups this file has nothing for".
+		if !all {
+			return nil, nil, money, fmt.Errorf(
+				"ไฟล์ที่แนบมาไม่มีข้อมูลของกลุ่มที่เลือก (%s) — ตรวจว่าเลือกกลุ่มถูก หรือแนบไฟล์ที่มีตารางของกลุ่มนั้น",
+				strings.Join(in.Groups, ", "))
+		}
 		return nil, nil, money, fmt.Errorf("no input files: supply at least one of users, doctor, room, patient, address, appointment, mongo, page")
 	}
 	return out, userRows, money, nil

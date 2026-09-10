@@ -159,18 +159,24 @@ export async function POST(req: Request): Promise<Response> {
   if (staged.length === 0) {
     return fail("ยังไม่มีไฟล์ dump ในการอัปโหลดนี้");
   }
-  // The combined SQL dump carries the users table, so an owner has to be named: a
-  // clinic imported without one has nobody who can administer it.
-  if (staged.some((s) => s.field === "sql") && !owner) {
-    return fail(
-      "ไฟล์ SQL มีตาราง users → ต้องระบุ owner_username (legacy users.code ของบัญชีที่จะเป็น owner)",
-    );
-  }
 
   const only = String(body.only ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter((s) => /^[a-z_]+$/.test(s));
+
+  // An owner is needed only when accounts are actually being imported. It used to be
+  // demanded for any SQL attachment, which meant an operator importing a price list had to
+  // name the clinic's owner for no reason — and the CLI would have refused the run anyway
+  // over rows in a table that selection does not touch. The CLI now filters by group before
+  // it parses; this check matches it so the two cannot disagree.
+  const importingPeople = only.length === 0 || only.includes("people");
+  if (staged.some((s) => s.field === "sql") && importingPeople && !owner) {
+    return fail(
+      "กลุ่ม people ต้องระบุ owner_username (legacy users.code ของบัญชีที่จะเป็น owner) — " +
+        "หรือติ๊กกลุ่ม people ออกถ้ารอบนี้ยังไม่นำเข้าบุคลากร",
+    );
+  }
 
   const jobId = await startJob(
     "generate",
