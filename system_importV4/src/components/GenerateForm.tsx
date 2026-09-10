@@ -169,20 +169,52 @@ function human(bytes: number): string {
 }
 
 /**
- * The subscription tiers, with the branch ceiling each one allows.
+ * The subscription plans, as the backend defines them.
  *
- * This is here because the ceiling is enforced by the BACKEND and refuses the whole
- * provision when it is exceeded — a nine-branch tenant on the default plan fails, and
- * without this control the operator has no way to fix it from this page. The numbers
- * mirror the server's plan table; the server remains the authority, this only stops the
- * request that is already known to be refused.
+ * WHAT THIS CONTROL ACTUALLY DECIDES
+ * A tier is a PAID SUBSCRIPTION — a monthly price and a set of unlocked features — that
+ * provisioning writes as a real subscription row. The branch ceiling is a consequence of
+ * the plan, not the point of it. An earlier version of this control was labelled by that
+ * consequence ("controls how many branches can be created"), which read as a second
+ * question about branches after the branch table had already answered the first one.
+ *
+ * WHY IT IS NOT CHOSEN AUTOMATICALLY
+ * The branch count IS known — it was read out of the legacy `branch` table — so the tool
+ * could pick the cheapest plan that fits. It deliberately does not. Reading nine branches
+ * and silently selecting elite would commit the clinic to ฿10,900 a month and switch on
+ * rehab and serialManagement, which is a commercial decision nobody asked this tool to
+ * make. What it does instead is show the price, show which plans cannot hold the branches
+ * that were found, and leave the choice visible.
+ *
+ * Mirrors internal/plan/catalog.go. The server stays the authority and enforces the cap
+ * itself; this only avoids sending a request already known to be refused.
  */
 const TIERS = [
-  { tier: "", label: "ค่าเริ่มต้นของระบบ (standard)", maxBranches: 3 },
-  { tier: "starter", label: "starter — 1 สาขา", maxBranches: 1 },
-  { tier: "standard", label: "standard — 3 สาขา", maxBranches: 3 },
-  { tier: "elite", label: "elite — 20 สาขา", maxBranches: 20 },
+  {
+    tier: "",
+    label: "ค่าเริ่มต้นของระบบ — standard",
+    priceThb: 5900,
+    maxBranches: 3,
+    features: "coupon · edcPayment · dental",
+  },
+  { tier: "starter", label: "starter", priceThb: 2590, maxBranches: 1, features: "coupon" },
+  {
+    tier: "standard",
+    label: "standard",
+    priceThb: 5900,
+    maxBranches: 3,
+    features: "coupon · edcPayment · dental",
+  },
+  {
+    tier: "elite",
+    label: "elite",
+    priceThb: 10900,
+    maxBranches: 20,
+    features: "coupon · edcPayment · dental · rehab · serialManagement",
+  },
 ] as const;
+
+const baht = (n: number) => `฿${n.toLocaleString("en-US")}`;
 
 /**
  * howMuchDataNamesThisBranch is the number that tells an operator a branch is real.
@@ -354,8 +386,14 @@ export default function GenerateForm() {
     created?.branches?.find((b) => b.is_main)?.branch_code ??
     created?.branches?.find((b) => (b.source_code ?? "") === mainCode)?.branch_code ??
     "";
-  const tierCap = TIERS.find((t) => t.tier === tier)?.maxBranches ?? 3;
+  const chosenTier = TIERS.find((t) => t.tier === tier) ?? TIERS[0];
+  const tierCap = chosenTier.maxBranches;
   const overTierCap = pickedRows.length > tierCap;
+  /** The cheapest plan that could hold the branches found, named but NOT selected. */
+  const tierThatWouldFit = TIERS.filter((t) => t.tier !== "")
+    .slice()
+    .sort((a, b) => a.priceThb - b.priceThb)
+    .find((t) => t.maxBranches >= pickedRows.length);
 
   /**
    * A swapped or cleared file makes the upload on the server, and every answer derived
@@ -1142,28 +1180,60 @@ export default function GenerateForm() {
               placeholder="เช่น คลินิกตัวอย่าง"
             />
 
-            {/* Here because the plan decides how many branches the clinic may have, and a
-                multi-branch import routinely needs more than the default allows. The backend
-                refuses the whole provision when the list exceeds the cap. */}
-            <label htmlFor="new-tier">แพ็กเกจ (คุมจำนวนสาขาที่สร้างได้)</label>
+            {/* A PAID subscription, not a branch setting. The branch ceiling comes with the
+                plan, which is why the branch count found in the dump is shown here as a
+                constraint rather than being used to pick a plan automatically. */}
+            <label htmlFor="new-tier">แพ็กเกจ subscription ของคลินิกนี้</label>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+              นี่คือ<b>ค่าบริการรายเดือน</b>ที่จะผูกกับคลินิก ไม่ใช่การตั้งจำนวนสาขา — จำนวนสาขาอ่านจากตาราง{" "}
+              <code>branch</code> ในกล่อง 2 แล้ว · แพ็กเกจเป็นตัวกำหนดว่า<b>เพดาน</b>สาขาเท่าไรและได้ฟีเจอร์อะไร
+            </div>
             <select
               id="new-tier"
               value={tier}
               onChange={(e) => setTier(e.target.value)}
               style={{ width: "100%" }}
             >
-              {TIERS.map((t) => (
-                <option key={t.tier || "default"} value={t.tier}>
-                  {t.label}
-                </option>
-              ))}
+              {TIERS.map((t) => {
+                // Disabled rather than hidden: an operator who sees that starter cannot hold
+                // seven branches learns something. A missing option just looks broken.
+                const tooSmall = pickedRows.length > t.maxBranches;
+                return (
+                  <option key={t.tier || "default"} value={t.tier} disabled={tooSmall}>
+                    {t.label} — {baht(t.priceThb)}/เดือน · {t.maxBranches} สาขา
+                    {tooSmall ? ` (ไม่พอสำหรับ ${pickedRows.length} สาขา)` : ""}
+                  </option>
+                );
+              })}
             </select>
-            {pickedRows.length > 0 && (
-              <div className={overTierCap ? "msg error" : "muted"} style={{ fontSize: 12, marginTop: 4 }}>
-                กล่อง 2 ติ๊กไว้ {pickedRows.length} สาขา · แพ็กเกจนี้ให้ได้ {tierCap} สาขา
-                {overTierCap && <> — เกินเพดาน backend จะปฏิเสธทั้งคำขอและไม่สร้างอะไรเลย</>}
-              </div>
-            )}
+
+            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              ที่เลือกอยู่: <b>{chosenTier.label}</b> · <b>{baht(chosenTier.priceThb)}/เดือน</b> ·
+              เพดาน {chosenTier.maxBranches} สาขา · ฟีเจอร์: <code>{chosenTier.features}</code>
+            </div>
+
+            {pickedRows.length > 0 &&
+              (overTierCap ? (
+                <div className="msg error">
+                  กล่อง 2 อ่านมาได้ <b>{pickedRows.length} สาขา</b> แต่แพ็กเกจที่เลือก (
+                  {chosenTier.label}) มีเพดาน <b>{tierCap} สาขา</b> — backend จะปฏิเสธทั้งคำขอและ
+                  <b>ไม่สร้างอะไรเลย</b>
+                  {tierThatWouldFit && (
+                    <>
+                      <br />
+                      แพ็กเกจที่ถูกที่สุดที่พอคือ <b>{tierThatWouldFit.label}</b> ({baht(tierThatWouldFit.priceThb)}
+                      /เดือน · {tierThatWouldFit.maxBranches} สาขา) —{" "}
+                      <b>เครื่องมือนี้ไม่เลือกให้เอง</b> เพราะเป็นการผูกค่าบริการรายเดือน ต้องเลือกเอง
+                    </>
+                  )}
+                  <br />
+                  หรือติ๊กสาขาให้น้อยลงในกล่อง 2 แล้วนำเข้าที่เหลือเป็นคลินิกแยกอีกรอบ
+                </div>
+              ) : (
+                <div className="muted" style={{ fontSize: 12 }}>
+                  กล่อง 2 อ่านมาได้ {pickedRows.length} สาขา · แพ็กเกจนี้รับได้ {tierCap} สาขา — พอ
+                </div>
+              ))}
 
             <h3 style={{ marginTop: 14 }}>บัญชี owner (ไม่ใส่ก็ได้)</h3>
             <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
@@ -1197,12 +1267,17 @@ export default function GenerateForm() {
             </div>
 
             <div className="row" style={{ marginTop: 10 }}>
-              <button type="button" onClick={createClinic} disabled={creating}>
+              {/* Blocked when the branch list cannot fit the chosen plan: the backend refuses
+                  the whole provision in that case, so sending it only costs a round trip and
+                  an error the operator has already been shown. */}
+              <button type="button" onClick={createClinic} disabled={creating || overTierCap}>
                 {creating
                   ? "กำลังสร้าง…"
-                  : clinic.trim()
-                    ? `สร้าง ${clinic.trim()}`
-                    : "สร้าง (สุ่มรหัสให้)"}
+                  : overTierCap
+                    ? "เลือกแพ็กเกจที่รับสาขาได้ก่อน"
+                    : clinic.trim()
+                      ? `สร้าง ${clinic.trim()}`
+                      : "สร้าง (สุ่มรหัสให้)"}
               </button>
               <button
                 type="button"
