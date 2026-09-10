@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"system_cliv4/internal/mongodump"
@@ -362,6 +363,8 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 // collection is folded: the first document defines the SKU (items + catalog_item) and
 // EVERY document becomes a slot_stock lot keyed by its Mongo _id.
 func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, slotSQL string, err error) {
+	br := newBranchResolver(in)
+	defer br.report(rep, "slot_stock")
 	if len(mc.items) == 0 {
 		return "", "", "", nil
 	}
@@ -434,12 +437,18 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 		// One lot per document. branch_code comes from the stock the lot sits in;
 		// slot_stock CHECKs it is non-empty, so a lot with no resolvable stock is
 		// reported instead of written with a blank branch.
-		branch := mc.stockBranch[docObjectID(d, "stock")]
-		if branch == "" {
+		//
+		// The stock's value is the LEGACY branch code, so it is translated — a lot filed
+		// under "01" would point at a branch V4 does not have. Resolved only after the
+		// blank check, because "no stock at all" and "stock in an unmapped branch" are
+		// different problems and only the first one drops the lot.
+		legacyBranch := mc.stockBranch[docObjectID(d, "stock")]
+		if legacyBranch == "" {
 			noBranch++
 			eSlot.skip("ไม่รู้ว่าอยู่คลังไหน (stock ไม่ resolve)")
 			continue
 		}
+		branch := br.resolve(legacyBranch)
 
 		doc, derr := slotDoc(d, mongoID)
 		if derr != nil {
@@ -510,6 +519,7 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 	var sCourse, sLine sqlBuilder
 	unresolved := map[string]int{}
 	skippedMed := 0
+	zeroQty := 0
 
 	// Service codes are off-limits when minting course codes.
 	taken := map[string]bool{}
@@ -586,7 +596,25 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 					eLine.skip("heal_id ไม่ตรงกับ listheals ใด")
 					continue
 				}
+				// V4 refuses a course line with no quantity:
+				// catalog_course_line_qty_chk CHECK (qty > 0). The source is not always
+				// positive — 115 of one tenant's 1,010 course lines carry
+				// number_of_time = 0 — and a single 0 aborts the ENTIRE import on that
+				// constraint, taking every other table down with it.
+				//
+				// A line that says "0 of this service" describes nothing the customer can
+				// redeem, so it is dropped and counted. Writing 1 instead was considered
+				// and rejected by the clinic owner: it would hand everyone who bought that
+				// course a session the clinic never sold.
+				//
+				// An ABSENT or unparseable value still means 1 (intLitDefault's job) —
+				// "the source did not say" and "the source said none" are different facts.
 				qty := intLitDefault(line.Text("number_of_time"), 1)
+				if n, cerr := strconv.Atoi(qty); cerr != nil || n <= 0 {
+					zeroQty++
+					eLine.skip("จำนวนในคอร์สเป็น 0 หรือน้อยกว่า — V4 บังคับ qty > 0")
+					continue
+				}
 				sLine.comment("%s → %s ×%s", code, childCode, qty)
 				sLine.addf(`INSERT INTO catalog_course_line
     (clinic_code, course_catalog_item_id, child_catalog_item_id, line_kind,
@@ -636,6 +664,13 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 	if skippedMed > 0 {
 		rep.warnf("catalog_course_line: %d รายการยาในคอร์ส (list_medicien) ไม่ถูก import — V4 บังคับว่ายาในคอร์สต้องระบุว่าอยู่ใต้บริการใด (parent_service) ซึ่งต้นทางไม่ได้บอก",
 			skippedMed)
+	}
+	// Loud, because this changes what a course CONTAINS. The alternative was to write 1,
+	// which the clinic owner rejected: it would give every buyer of that course a session
+	// nobody sold them.
+	if zeroQty > 0 {
+		rep.warnf("catalog_course_line: %d บรรทัดในคอร์สระบุจำนวน 0 ครั้ง (number_of_time = 0) — ไม่ import บรรทัดนั้น เพราะ V4 บังคับ qty > 0 และ '0 ครั้ง' คือไม่มีอะไรให้ตัดสิทธิ์ · ถ้าปล่อยผ่านจะล้มทั้งไฟล์ที่ constraint catalog_course_line_qty_chk · ถ้าคลินิกยืนยันว่าบรรทัดไหนควรเป็น 1 ต้องแก้ที่ต้นทางแล้ว import ใหม่ — เครื่องมือนี้ไม่เดาจำนวนสิทธิ์ให้",
+			zeroQty)
 	}
 	return sCourse.String(), sLine.String(), nil
 }

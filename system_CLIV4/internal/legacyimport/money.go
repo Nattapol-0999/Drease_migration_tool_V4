@@ -198,6 +198,10 @@ type channelPlan struct {
 // buildMoney renders the whole money block. It returns empty batches when the export
 // carries no bills, so a catalog-only import is unaffected.
 func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
+	// One resolver for the whole money block: bills and receipts must agree on which V4
+	// branch a legacy code means, and the counts are reported once for both.
+	br := newBranchResolver(in)
+	defer br.report(rep, "invoice/receipt")
 	var out moneyBatches
 	if len(mc.bills) == 0 {
 		return out, nil
@@ -211,7 +215,7 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 	eRec.SourceRows = len(mc.payments)
 
 	// ── pass 1: which bills are in, and do their own numbers add up ───────────
-	plans, err := planBills(mc, rep, eInv, eItem)
+	plans, err := planBills(mc, br, rep, eInv, eItem)
 	if err != nil {
 		return out, err
 	}
@@ -226,7 +230,7 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 	}
 
 	// ── pass 2: the receipts, attached to the bills that survived pass 1 ──────
-	receipts, err := planReceipts(mc, byBillID, rep, eRec, ePay)
+	receipts, err := planReceipts(mc, byBillID, br, rep, eRec, ePay)
 	if err != nil {
 		return out, err
 	}
@@ -291,7 +295,7 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 }
 
 // planBills validates and maps every bill, dropping the ones policy excludes.
-func planBills(mc *mongoCatalog, rep *Report, eInv, eItem *EntityResult) ([]billPlan, error) {
+func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *EntityResult) ([]billPlan, error) {
 	var plans []billPlan
 	seenNo := map[string]string{} // invoice no → bill _id, to catch in-file duplicates
 	unknownTypes := map[string]int{}
@@ -330,7 +334,10 @@ func planBills(mc *mongoCatalog, rep *Report, eInv, eItem *EntityResult) ([]bill
 			continue
 		}
 
-		branch := firstNonEmpty(d.Text("branch_code"), BranchCode)
+		// Translated through the branch map: the bill names the LEGACY branch and V4 owns
+		// its own codes, so writing the source value straight through would file the
+		// invoice at a branch that does not exist.
+		branch := br.resolve(d.Text("branch_code"))
 		name, _ := clip(d.Text("patient_name"), 255)
 
 		bp := billPlan{
@@ -495,8 +502,8 @@ func planBillLines(d mongodump.Doc, mongoID, no string, rep *Report, eItem *Enti
 // planReceipts maps payment_summary onto receipt + receipt_payment, attached to the
 // bills that survived. A receipt whose bill was skipped is skipped too: money filed
 // against a document that does not exist is money nobody can find again.
-func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, rep *Report,
-	eRec, ePay *EntityResult) ([]receiptPlan, error) {
+func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchResolver,
+	rep *Report, eRec, ePay *EntityResult) ([]receiptPlan, error) {
 
 	// Group by bill first so installment numbers can be checked for collisions:
 	// receipt has a UNIQUE (clinic_code, invoice_id, installment_no).
@@ -594,13 +601,16 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, rep *Report,
 				legacyOrder:   legacyOrder,
 				hn:            p.bp.hn,
 				patientName:   p.bp.patientName,
-				branchCode:    firstNonEmpty(d.Text("paid_branch.branch_code"), p.bp.branchCode, BranchCode),
-				doctorCode:    strings.TrimSpace(d.Text("doctor")),
-				remark:        strings.TrimSpace(d.Text("payment_remark")),
-				payDate:       mongoDateLit(d, "created_at", "NULL"),
-				createdAt:     mongoTSLit(d, "created_at", "now()"),
-				pointApply:    moneyLit(firstNonEmpty(d.Text("use_point"), "0")),
-				fClosed:       moneyFloat(d.Text("payment_type.price_total")),
+				// The branch that TOOK the money, which can differ from the one that
+				// issued the bill. p.bp.branchCode is already a resolved V4 code, so it
+				// is used as the fallback rather than resolved twice.
+				branchCode: resolveOrKeep(br, d.Text("paid_branch.branch_code"), p.bp.branchCode),
+				doctorCode: strings.TrimSpace(d.Text("doctor")),
+				remark:     strings.TrimSpace(d.Text("payment_remark")),
+				payDate:    mongoDateLit(d, "created_at", "NULL"),
+				createdAt:  mongoTSLit(d, "created_at", "now()"),
+				pointApply: moneyLit(firstNonEmpty(d.Text("use_point"), "0")),
+				fClosed:    moneyFloat(d.Text("payment_type.price_total")),
 			}
 			if insurer := strings.TrimSpace(d.Text("insurance.insurance_name")); insurer != "" && insurer != "0" {
 				rp.insurer, _ = clip(insurer, 255)

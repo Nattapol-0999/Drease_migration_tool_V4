@@ -74,9 +74,10 @@ var patientMapping = []patientCol{
 	{`"Braces_ID_int"`, "Braces_ID_int", pInt, 0},
 	{`old_hn`, "old_hn", pText, 64},
 	{`old_hn_int`, "old_hn_int", pInt, 0},
-	// branch_code is NOT set from the source: migration 0320 made patient.branch_code
-	// NOT NULL with a non-blank CHECK, and the legacy data carries one branch per
-	// clinic (BranchCode). It is written as a fixed column in buildPatient instead.
+	// branch_code is not in this table-driven list because it needs translating rather
+	// than copying: the source value is the LEGACY branch code and V4 owns its own.
+	// buildPatient resolves it through Input.BranchMap and writes it as a fixed column.
+	// (migration 0320 made patient.branch_code NOT NULL with a non-blank CHECK.)
 	{`alert_right_treatment`, "alert_right_treatment", pText, 0},
 	{`hospital`, "hospital", pText, 255},
 	{`detail_other`, "detail_other", pText, 0},
@@ -112,6 +113,8 @@ func buildPatient(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	e := rep.entity(EntPatient)
 	e.SourceRows = len(rows)
 	tr := truncations{}
+	br := newBranchResolver(in)
+	defer br.report(rep, "patient")
 
 	cols := make([]string, 0, len(patientMapping)+4)
 	cols = append(cols, "clinic_code", "migrate_source_ref", "branch_code")
@@ -139,7 +142,7 @@ func buildPatient(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 		seen[hn] = true
 
 		vals := make([]string, 0, len(cols))
-		vals = append(vals, lit(in.ClinicCode), lit(hn), lit(BranchCode))
+		vals = append(vals, lit(in.ClinicCode), lit(hn), lit(br.resolve(r.Get("branch_code"))))
 		for _, c := range patientMapping {
 			v, ok := patientValue(c, r, tr)
 			if !ok {

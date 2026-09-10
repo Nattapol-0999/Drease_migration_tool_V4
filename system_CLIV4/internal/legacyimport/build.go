@@ -71,6 +71,33 @@ type Input struct {
 	AddressDump []byte
 
 	AppointmentDump []byte // legacy `appointment`
+	// BranchDump is the legacy `branch` table — the tenant's branch registry, with the
+	// legal entity and tax id of each one. Nothing is imported from it: V4 keeps branches
+	// as rows in `clinic`. It is read by SurveyBranches so an operator can see the real
+	// branch layout (and whether the branches belong to different companies) before
+	// choosing how to map it.
+	BranchDump []byte
+
+	// BranchMap turns a legacy branch code ("01".."08") into the V4 branch_code that
+	// POST /v3/import/clinics allocated for it ("BR00001"…). Empty keeps the original
+	// single-branch behaviour: every row is stamped with BranchCode, which is what the
+	// first tenants needed and what every existing import produced.
+	//
+	// It exists because V4 owns branch identity — branch_code comes from a sequence and
+	// carries the branch_no every HN at that branch keeps for life — so the legacy code
+	// cannot be written through.
+	BranchMap map[string]string
+	// DefaultBranch is used for rows with no branch, and for a legacy code that is not
+	// in BranchMap (the export has a few typos). Empty picks the first entry of
+	// BranchMap, or BranchCode when there is no map. Never blank in the output, because
+	// branch_code is NOT NULL on patient, invoice, receipt, room, doctor and slot_stock.
+	DefaultBranch string
+
+	// PageDump is the mongo export of `mris.page` — the patient record pages and the
+	// images attached to them. It is a SEPARATE flag from MongoDump because it is a
+	// different database (mris, not the catalog one) and because it is the only input
+	// whose output is a copy manifest rather than SQL (see page.go).
+	PageDump []byte
 }
 
 // BuildAll parses the supplied files and renders the SQL for each entity, without
@@ -138,11 +165,16 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 	}
 
+	// Kept beyond the patient block: appointments derive their branch from the patient's,
+	// because the legacy appointment rows do not carry a usable one.
+	var branchByPatient map[string]string
+
 	if len(in.PatientDump) > 0 {
 		_, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("patient dump: %w", err)
 		}
+		branchByPatient = branchByHN(patientRows)
 		if out[EntPatient], err = buildPatient(patientRows, in, rep); err != nil {
 			return nil, nil, money, err
 		}
@@ -167,7 +199,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			return nil, nil, money, fmt.Errorf("appointment dump: %w", err)
 		}
 		bookable := buildBookableDoctors(doctorRows, userRows)
-		if out[EntAppointment], err = buildAppointment(apptRows, bookable, in, rep); err != nil {
+		if out[EntAppointment], err = buildAppointment(apptRows, bookable, branchByPatient, in, rep); err != nil {
 			return nil, nil, money, err
 		}
 	}
@@ -214,8 +246,18 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		out[EntCourseBoughtItems] = boughtItems
 	}
 
-	if len(out) == 0 {
-		return nil, nil, money, fmt.Errorf("no input files: supply at least one of users, doctor, room, patient, address, appointment, mongo")
+	// Patient page images. This one hangs off the report rather than `out`: it produces
+	// no SQL, because photos.file_size is only knowable from the image files themselves.
+	if len(in.PageDump) > 0 {
+		man, perr := buildPhotos(in.PageDump, in, rep)
+		if perr != nil {
+			return nil, nil, money, perr
+		}
+		rep.Photos = man
+	}
+
+	if len(out) == 0 && rep.Photos == nil {
+		return nil, nil, money, fmt.Errorf("no input files: supply at least one of users, doctor, room, patient, address, appointment, mongo, page")
 	}
 	return out, userRows, money, nil
 }

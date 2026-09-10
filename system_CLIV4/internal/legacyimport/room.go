@@ -28,6 +28,8 @@ func buildRoom(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 	e := rep.entity(EntRoom)
 	e.SourceRows = len(rows)
 	tr := truncations{}
+	br := newBranchResolver(in)
+	defer br.report(rep, "room")
 
 	uniform := map[string]map[string]bool{}
 	for _, c := range []string{"type", "room_type", "df_type", "send_notification", "hide_in_home"} {
@@ -40,10 +42,9 @@ func buildRoom(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 		if code == "" {
 			return "", fmt.Errorf("room row %d: empty code (it is the room_id appointments reference)", n+1)
 		}
-		branch := r.Get("branch_code")
-		if branch == "" {
-			branch = BranchCode
-		}
+		// Translated, not copied: the source value is the legacy branch code and V4 owns
+		// its own (see branchResolver).
+		branch := br.resolve(r.Get("branch_code"))
 		name := r.Get("tha_name")
 		if name == "" {
 			name = r.Get("eng_name")

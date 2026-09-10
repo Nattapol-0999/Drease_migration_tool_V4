@@ -31,11 +31,14 @@ const (
 // looking up the catalog code.
 // The entitlement block is after money because it points at the invoice lines the money
 // block writes.
-var order = append(append(append(append([]string{
+// photoOrder is last and carries NO SQL: the photos entity renders a copy manifest
+// instead (see page.go). It is in this list only so the report prints it alongside the
+// rest; script.go skips any entity with no statements.
+var order = append(append(append(append(append([]string{
 	EntUsers, EntClinicUser, EntClinicStaff,
 	EntDoctor, EntRoom, EntPatient,
 }, addressOrder...), []string{EntAppointment}...),
-	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...)
+	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), photoOrder...)
 
 // EntityOrder returns a copy of the order, for callers that render entities without
 // holding a Report. A copy, not the slice: the order is policy, and a caller must not
@@ -74,6 +77,10 @@ var entityGroups = map[string][]string{
 	"entitlements": {
 		EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
 	},
+	// photos produces no SQL, so selecting it changes nothing in the .sql artifact — it
+	// is here so `-only photos` is not rejected as an unknown group when an operator
+	// wants the image manifest and nothing else.
+	"photos": {EntPhoto},
 }
 
 // groupDependsOn records which group must already be present at the TARGET for another
@@ -143,6 +150,11 @@ type Report struct {
 	Order    []string `json:"order"`
 	Warnings []string `json:"warnings,omitempty"`
 	Notes    []string `json:"notes,omitempty"`
+
+	// Photos is the image copy plan, present only when a -page dump was supplied. It is
+	// NOT part of the .sql artifact: photos.file_size can only be read off the image
+	// files themselves, which arrive separately (see page.go).
+	Photos *PhotoManifest `json:"photos,omitempty"`
 }
 
 // NewReport starts a report for one clinic.

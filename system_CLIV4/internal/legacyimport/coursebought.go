@@ -128,7 +128,10 @@ func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Repo
 	eItems := rep.entity(EntCourseBoughtItems)
 	eBought.SourceRows = len(mc.courseBills)
 
-	plans, err := planEntitlements(mc, money, rep, eBought, eItems)
+	br := newBranchResolver(in)
+	defer br.report(rep, "course_bought")
+
+	plans, err := planEntitlements(mc, money, br, rep, eBought, eItems)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -146,7 +149,7 @@ func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Repo
 }
 
 // planEntitlements resolves and filters the entitlements.
-func planEntitlements(mc *mongoCatalog, money moneyBatches, rep *Report,
+func planEntitlements(mc *mongoCatalog, money moneyBatches, br *branchResolver, rep *Report,
 	eBought, eItems *EntityResult) ([]entitlementPlan, error) {
 
 	var plans []entitlementPlan
@@ -241,7 +244,7 @@ func planEntitlements(mc *mongoCatalog, money moneyBatches, rep *Report,
 			sourceRef:     ref,
 			hn:            hn,
 			patientName:   patientName,
-			branchCode:    firstNonEmpty(d.Text("create_by_branch"), BranchCode),
+			branchCode:    br.resolve(d.Text("create_by_branch")),
 			courseCode:    code,
 			catalogName:   mc.courseName[courseItemID],
 			name:          saleName,

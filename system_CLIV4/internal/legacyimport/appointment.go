@@ -46,11 +46,29 @@ var apptDocFields = []string{
 // bookable is the set of doctor_codes V4 will actually accept on an appointment (see
 // buildBookableDoctors). It is passed in rather than recomputed so the rule lives in
 // one place.
-func buildAppointment(rows []legacydump.Row, bookable map[string]bool, in Input, rep *Report) (string, error) {
+// branchByPatient maps HN → legacy branch code, used because the legacy appointment rows
+// do not carry a usable branch of their own (see branchByHN).
+func buildAppointment(
+	rows []legacydump.Row,
+	bookable map[string]bool,
+	branchByPatient map[string]string,
+	in Input,
+	rep *Report,
+) (string, error) {
 	e := rep.entity(EntAppointment)
 	e.SourceRows = len(rows)
 	tr := truncations{}
 	unbookable := map[string]int{}
+	br := newBranchResolver(in)
+	defer br.report(rep, "appointment")
+	// Appointments whose HN is not in the patient dump have nothing to derive a branch
+	// from; they fall back to the default and are counted so the number is visible.
+	noPatientBranch := 0
+	defer func() {
+		if noPatientBranch > 0 {
+			rep.notef("appointment: %d แถวหาสาขาจากคนไข้ไม่ได้ (ไม่พบ HN ในไฟล์คนไข้) — ใช้สาขาเริ่มต้น", noPatientBranch)
+		}
+	}()
 
 	cols := []string{
 		"clinic_code", "migrate_source_ref", "hn", "patient_name", "tel", "doctor_code",
@@ -143,6 +161,21 @@ func buildAppointment(rows []legacydump.Row, bookable map[string]bool, in Input,
 		receipt, cut := clip(r.Get("transfer_receipt"), 255)
 		tr.note("transfer_receipt", cut)
 
+		// The branch comes from the PATIENT, not from this row: the legacy
+		// appointment.branch_code is blank in every row of the exports seen, while
+		// patient.branch_code is filled for every patient and no HN appears under two
+		// branches (see branchByHN). Falling back to the row's own value first keeps a
+		// dump that does fill it working.
+		legacyBranch := r.Get("branch_code")
+		if strings.TrimSpace(legacyBranch) == "" {
+			if b, ok := branchByPatient[hn]; ok {
+				legacyBranch = b
+			} else if hn != "" {
+				noPatientBranch++
+			}
+		}
+		branchLit := br.resolve(legacyBranch)
+
 		s.comment("legacy id %s · HN %s · room %s · %s %s", ref, orDash(hn), orDash(room),
 			r.Get("appointment_date"), r.Get("appointment_time_start"))
 		// Insert-only: a re-run skips appointments already imported for this clinic
@@ -158,7 +191,7 @@ DO NOTHING;
 
 `, joinCols(cols),
 			lit(in.ClinicCode), lit(ref), nullLit(hnLit), nullLit(nameLit), nullLit(telLit), nullLit(docCode),
-			nullLit(roomLit), lit(BranchCode), startLit, endLit,
+			nullLit(roomLit), lit(branchLit), startLit, endLit,
 			nullLit(r.Get("remark")), lit(status), lit(confirmStatus), nullLit(receipt), lit(doc),
 			tsLit(r.Get("datetime_stamp"), "now()"))
 	}
