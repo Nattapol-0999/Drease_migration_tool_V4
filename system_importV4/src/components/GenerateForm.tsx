@@ -168,32 +168,27 @@ function human(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/**
- * The subscription plans this tool may ask for, and the branch ceiling each one carries.
+/*
+ * THERE IS NO SUBSCRIPTION PLAN PICKER HERE, AND THAT IS THE POINT.
  *
- * WHAT THIS CONTROL DECIDES
- * A tier is a PAID SUBSCRIPTION that provisioning writes as a real subscription row. The
- * branch ceiling is a consequence of the plan, not the point of it. An earlier version of
- * this control was labelled by that consequence ("controls how many branches can be
- * created"), which read as a second question about branches after the branch table had
- * already answered the first one.
+ * One briefly existed. It was not added because anyone wanted this screen to sell anything —
+ * it was added to get past a refusal. Provisioning read its branch ceiling from the plan
+ * named in the request, defaulting to standard's three, so a seven-branch import came back
+ * 422 branch_cap_exceeded. A dropdown was the shortest way to make the request pass, and it
+ * turned a data-migration screen into the place where a monthly charge got chosen, by
+ * whoever happened to be running the import.
  *
- * NO PRICES OR FEATURE LISTS HERE, DELIBERATELY
- * They were briefly copied in from internal/plan/catalog.go to show alongside each option.
- * That was wrong: the catalog is marked "draft — tune prices/features here", so a copy in a
- * second repository drifts the moment someone tunes it, and the thing that goes stale is a
- * price shown to whoever is provisioning a clinic. The backend owns commercial figures. This
- * list carries only the ceiling, which is what the decision on this page actually turns on.
+ * The branch count was never a question this screen needed to ask. It is read out of the
+ * legacy `branch` table in step 2 and it is a fact about the clinic, not a request for
+ * entitlement. The fix belonged in the backend, and that is where it went: when a caller
+ * names no plan, provisioning takes the branch count as given and bounds it only by the two
+ * digits branch_no can hold (admin/provision.go, ensureBranches). The plan cap still applies
+ * in full to callers that DO name one, and Settings still enforces it on everything the
+ * clinic does itself.
  *
- * The server remains the authority and enforces the cap itself; this only avoids sending a
- * request already known to be refused.
+ * So this form sends no tier. The clinic gets the same default subscription it always got,
+ * and whoever sells the plan sets it afterwards.
  */
-const TIERS = [
-  { tier: "", label: "ค่าเริ่มต้นของระบบ (standard)", maxBranches: 3 },
-  { tier: "starter", label: "starter", maxBranches: 1 },
-  { tier: "standard", label: "standard", maxBranches: 3 },
-  { tier: "elite", label: "elite", maxBranches: 20 },
-] as const;
 
 /**
  * howMuchDataNamesThisBranch is the number that tells an operator a branch is real.
@@ -285,11 +280,6 @@ export default function GenerateForm() {
   const [newThaName, setNewThaName] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [ownerEmail, setOwnerEmail] = useState("");
-  // Empty means "whatever the backend defaults to". It matters here only because the plan
-  // caps how many branches a clinic may have, and this tool routinely needs more than the
-  // default allows.
-  const [tier, setTier] = useState("");
-
   // ── สาขา ────────────────────────────────────────────────────────────────────
   //
   // The upload now happens BEFORE the clinic is created, because the branch list has to be
@@ -365,19 +355,6 @@ export default function GenerateForm() {
     created?.branches?.find((b) => b.is_main)?.branch_code ??
     created?.branches?.find((b) => (b.source_code ?? "") === mainCode)?.branch_code ??
     "";
-  const chosenTier = TIERS.find((t) => t.tier === tier) ?? TIERS[0];
-  const tierCap = chosenTier.maxBranches;
-  const overTierCap = pickedRows.length > tierCap;
-  /**
-   * The smallest plan that could hold the branches found — named so the operator knows
-   * where to look, NOT selected. Ordered by ceiling rather than by price, because this file
-   * deliberately does not carry prices.
-   */
-  const tierThatWouldFit = TIERS.filter((t) => t.tier !== "")
-    .slice()
-    .sort((a, b) => a.maxBranches - b.maxBranches)
-    .find((t) => t.maxBranches >= pickedRows.length);
-
   /**
    * A swapped or cleared file makes the upload on the server, and every answer derived
    * from it, describe a file that is no longer attached. Both are dropped rather than
@@ -620,7 +597,9 @@ export default function GenerateForm() {
           thaName: newThaName.trim(),
           ownerName: ownerName.trim(),
           ownerEmail: ownerEmail.trim(),
-          tier: tier.trim(),
+          // No tier: naming a plan here would make this screen choose a monthly charge, and
+          // the branch count it would be chosen to accommodate is already a fact read out of
+          // the legacy branch table. See the note at the top of this file.
           // Sent only when the branch table was actually read and branches chosen. An empty
           // list is omitted entirely so the backend keeps its own "one branch named after
           // the clinic" default instead of interpreting a blank.
@@ -1163,58 +1142,12 @@ export default function GenerateForm() {
               placeholder="เช่น คลินิกตัวอย่าง"
             />
 
-            {/* A PAID subscription, not a branch setting. The branch ceiling comes with the
-                plan, which is why the branch count found in the dump is shown here as a
-                constraint rather than being used to pick a plan automatically. */}
-            <label htmlFor="new-tier">แพ็กเกจ subscription ของคลินิกนี้</label>
-            <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
-              นี่คือ<b>แพ็กเกจที่คิดค่าบริการ</b>ที่จะผูกกับคลินิก ไม่ใช่การตั้งจำนวนสาขา — จำนวนสาขาอ่านจากตาราง{" "}
-              <code>branch</code> ในกล่อง 2 แล้ว · แพ็กเกจเป็นตัวกำหนดว่า<b>เพดาน</b>สาขาได้เท่าไร
-              <br />
-              ราคาและฟีเจอร์ของแต่ละแพ็กเกจ <b>ไม่แสดงที่นี่</b> — ดูจากระบบ V4 ที่เป็นเจ้าของข้อมูลนั้น
-              ตัวเลขที่ก๊อปมาไว้สองที่มีแต่จะไม่ตรงกันวันใดวันหนึ่ง
-            </div>
-            <select
-              id="new-tier"
-              value={tier}
-              onChange={(e) => setTier(e.target.value)}
-              style={{ width: "100%" }}
-            >
-              {TIERS.map((t) => {
-                // Disabled rather than hidden: an operator who sees that starter cannot hold
-                // seven branches learns something. A missing option just looks broken.
-                const tooSmall = pickedRows.length > t.maxBranches;
-                return (
-                  <option key={t.tier || "default"} value={t.tier} disabled={tooSmall}>
-                    {t.label} · เพดาน {t.maxBranches} สาขา
-                    {tooSmall ? ` (ไม่พอสำหรับ ${pickedRows.length} สาขา)` : ""}
-                  </option>
-                );
-              })}
-            </select>
-
-            {pickedRows.length > 0 &&
-              (overTierCap ? (
-                <div className="msg error">
-                  กล่อง 2 อ่านมาได้ <b>{pickedRows.length} สาขา</b> แต่แพ็กเกจที่เลือก (
-                  {chosenTier.label}) มีเพดาน <b>{tierCap} สาขา</b> — backend จะปฏิเสธทั้งคำขอและ
-                  <b>ไม่สร้างอะไรเลย</b>
-                  {tierThatWouldFit && (
-                    <>
-                      <br />
-                      แพ็กเกจที่เล็กที่สุดที่พอคือ <b>{tierThatWouldFit.label}</b> (เพดาน{" "}
-                      {tierThatWouldFit.maxBranches} สาขา) — <b>เครื่องมือนี้ไม่เลือกให้เอง</b>{" "}
-                      เพราะเป็นการผูกแพ็กเกจที่คิดค่าบริการ ต้องเลือกเอง
-                    </>
-                  )}
-                  <br />
-                  หรือติ๊กสาขาให้น้อยลงในกล่อง 2 แล้วนำเข้าที่เหลือเป็นคลินิกแยกอีกรอบ
-                </div>
-              ) : (
-                <div className="muted" style={{ fontSize: 12 }}>
-                  กล่อง 2 อ่านมาได้ {pickedRows.length} สาขา · แพ็กเกจนี้รับได้ {tierCap} สาขา — พอ
-                </div>
-              ))}
+            {pickedRows.length > 0 && (
+              <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                จะสร้าง <b>{pickedRows.length} สาขา</b> ตามที่อ่านได้จากตาราง <code>branch</code>{" "}
+                ในกล่อง 2 · แพ็กเกจ subscription ไม่ถูกตั้งจากหน้านี้
+              </div>
+            )}
 
             <h3 style={{ marginTop: 14 }}>บัญชี owner (ไม่ใส่ก็ได้)</h3>
             <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
@@ -1248,17 +1181,12 @@ export default function GenerateForm() {
             </div>
 
             <div className="row" style={{ marginTop: 10 }}>
-              {/* Blocked when the branch list cannot fit the chosen plan: the backend refuses
-                  the whole provision in that case, so sending it only costs a round trip and
-                  an error the operator has already been shown. */}
-              <button type="button" onClick={createClinic} disabled={creating || overTierCap}>
+              <button type="button" onClick={createClinic} disabled={creating}>
                 {creating
                   ? "กำลังสร้าง…"
-                  : overTierCap
-                    ? "เลือกแพ็กเกจที่รับสาขาได้ก่อน"
-                    : clinic.trim()
-                      ? `สร้าง ${clinic.trim()}`
-                      : "สร้าง (สุ่มรหัสให้)"}
+                  : clinic.trim()
+                    ? `สร้าง ${clinic.trim()}`
+                    : "สร้าง (สุ่มรหัสให้)"}
               </button>
               <button
                 type="button"
@@ -2018,15 +1946,6 @@ export default function GenerateForm() {
               </div>
             );
           })()}
-
-          {overTierCap && (
-            <div className="msg error">
-              ติ๊กไว้ {pickedRows.length} สาขา แต่แพ็กเกจที่เลือกในกล่อง 3 (
-              <b>{TIERS.find((t) => t.tier === tier)?.label}</b>) ให้ได้{" "}
-              <b>{tierCap} สาขา</b> — backend จะปฏิเสธทั้งคำขอและไม่สร้างอะไรเลย ·
-              เปลี่ยนแพ็กเกจในกล่อง 3 หรือติ๊กสาขาให้น้อยลง
-            </div>
-          )}
 
           {strayCodes.length > 0 && (
             <div className="msg warn">
