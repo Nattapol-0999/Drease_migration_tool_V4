@@ -169,52 +169,31 @@ function human(bytes: number): string {
 }
 
 /**
- * The subscription plans, as the backend defines them.
+ * The subscription plans this tool may ask for, and the branch ceiling each one carries.
  *
- * WHAT THIS CONTROL ACTUALLY DECIDES
- * A tier is a PAID SUBSCRIPTION — a monthly price and a set of unlocked features — that
- * provisioning writes as a real subscription row. The branch ceiling is a consequence of
- * the plan, not the point of it. An earlier version of this control was labelled by that
- * consequence ("controls how many branches can be created"), which read as a second
- * question about branches after the branch table had already answered the first one.
+ * WHAT THIS CONTROL DECIDES
+ * A tier is a PAID SUBSCRIPTION that provisioning writes as a real subscription row. The
+ * branch ceiling is a consequence of the plan, not the point of it. An earlier version of
+ * this control was labelled by that consequence ("controls how many branches can be
+ * created"), which read as a second question about branches after the branch table had
+ * already answered the first one.
  *
- * WHY IT IS NOT CHOSEN AUTOMATICALLY
- * The branch count IS known — it was read out of the legacy `branch` table — so the tool
- * could pick the cheapest plan that fits. It deliberately does not. Reading nine branches
- * and silently selecting elite would commit the clinic to ฿10,900 a month and switch on
- * rehab and serialManagement, which is a commercial decision nobody asked this tool to
- * make. What it does instead is show the price, show which plans cannot hold the branches
- * that were found, and leave the choice visible.
+ * NO PRICES OR FEATURE LISTS HERE, DELIBERATELY
+ * They were briefly copied in from internal/plan/catalog.go to show alongside each option.
+ * That was wrong: the catalog is marked "draft — tune prices/features here", so a copy in a
+ * second repository drifts the moment someone tunes it, and the thing that goes stale is a
+ * price shown to whoever is provisioning a clinic. The backend owns commercial figures. This
+ * list carries only the ceiling, which is what the decision on this page actually turns on.
  *
- * Mirrors internal/plan/catalog.go. The server stays the authority and enforces the cap
- * itself; this only avoids sending a request already known to be refused.
+ * The server remains the authority and enforces the cap itself; this only avoids sending a
+ * request already known to be refused.
  */
 const TIERS = [
-  {
-    tier: "",
-    label: "ค่าเริ่มต้นของระบบ — standard",
-    priceThb: 5900,
-    maxBranches: 3,
-    features: "coupon · edcPayment · dental",
-  },
-  { tier: "starter", label: "starter", priceThb: 2590, maxBranches: 1, features: "coupon" },
-  {
-    tier: "standard",
-    label: "standard",
-    priceThb: 5900,
-    maxBranches: 3,
-    features: "coupon · edcPayment · dental",
-  },
-  {
-    tier: "elite",
-    label: "elite",
-    priceThb: 10900,
-    maxBranches: 20,
-    features: "coupon · edcPayment · dental · rehab · serialManagement",
-  },
+  { tier: "", label: "ค่าเริ่มต้นของระบบ (standard)", maxBranches: 3 },
+  { tier: "starter", label: "starter", maxBranches: 1 },
+  { tier: "standard", label: "standard", maxBranches: 3 },
+  { tier: "elite", label: "elite", maxBranches: 20 },
 ] as const;
-
-const baht = (n: number) => `฿${n.toLocaleString("en-US")}`;
 
 /**
  * howMuchDataNamesThisBranch is the number that tells an operator a branch is real.
@@ -389,10 +368,14 @@ export default function GenerateForm() {
   const chosenTier = TIERS.find((t) => t.tier === tier) ?? TIERS[0];
   const tierCap = chosenTier.maxBranches;
   const overTierCap = pickedRows.length > tierCap;
-  /** The cheapest plan that could hold the branches found, named but NOT selected. */
+  /**
+   * The smallest plan that could hold the branches found — named so the operator knows
+   * where to look, NOT selected. Ordered by ceiling rather than by price, because this file
+   * deliberately does not carry prices.
+   */
   const tierThatWouldFit = TIERS.filter((t) => t.tier !== "")
     .slice()
-    .sort((a, b) => a.priceThb - b.priceThb)
+    .sort((a, b) => a.maxBranches - b.maxBranches)
     .find((t) => t.maxBranches >= pickedRows.length);
 
   /**
@@ -1185,8 +1168,11 @@ export default function GenerateForm() {
                 constraint rather than being used to pick a plan automatically. */}
             <label htmlFor="new-tier">แพ็กเกจ subscription ของคลินิกนี้</label>
             <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
-              นี่คือ<b>ค่าบริการรายเดือน</b>ที่จะผูกกับคลินิก ไม่ใช่การตั้งจำนวนสาขา — จำนวนสาขาอ่านจากตาราง{" "}
-              <code>branch</code> ในกล่อง 2 แล้ว · แพ็กเกจเป็นตัวกำหนดว่า<b>เพดาน</b>สาขาเท่าไรและได้ฟีเจอร์อะไร
+              นี่คือ<b>แพ็กเกจที่คิดค่าบริการ</b>ที่จะผูกกับคลินิก ไม่ใช่การตั้งจำนวนสาขา — จำนวนสาขาอ่านจากตาราง{" "}
+              <code>branch</code> ในกล่อง 2 แล้ว · แพ็กเกจเป็นตัวกำหนดว่า<b>เพดาน</b>สาขาได้เท่าไร
+              <br />
+              ราคาและฟีเจอร์ของแต่ละแพ็กเกจ <b>ไม่แสดงที่นี่</b> — ดูจากระบบ V4 ที่เป็นเจ้าของข้อมูลนั้น
+              ตัวเลขที่ก๊อปมาไว้สองที่มีแต่จะไม่ตรงกันวันใดวันหนึ่ง
             </div>
             <select
               id="new-tier"
@@ -1200,17 +1186,12 @@ export default function GenerateForm() {
                 const tooSmall = pickedRows.length > t.maxBranches;
                 return (
                   <option key={t.tier || "default"} value={t.tier} disabled={tooSmall}>
-                    {t.label} — {baht(t.priceThb)}/เดือน · {t.maxBranches} สาขา
+                    {t.label} · เพดาน {t.maxBranches} สาขา
                     {tooSmall ? ` (ไม่พอสำหรับ ${pickedRows.length} สาขา)` : ""}
                   </option>
                 );
               })}
             </select>
-
-            <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              ที่เลือกอยู่: <b>{chosenTier.label}</b> · <b>{baht(chosenTier.priceThb)}/เดือน</b> ·
-              เพดาน {chosenTier.maxBranches} สาขา · ฟีเจอร์: <code>{chosenTier.features}</code>
-            </div>
 
             {pickedRows.length > 0 &&
               (overTierCap ? (
@@ -1221,9 +1202,9 @@ export default function GenerateForm() {
                   {tierThatWouldFit && (
                     <>
                       <br />
-                      แพ็กเกจที่ถูกที่สุดที่พอคือ <b>{tierThatWouldFit.label}</b> ({baht(tierThatWouldFit.priceThb)}
-                      /เดือน · {tierThatWouldFit.maxBranches} สาขา) —{" "}
-                      <b>เครื่องมือนี้ไม่เลือกให้เอง</b> เพราะเป็นการผูกค่าบริการรายเดือน ต้องเลือกเอง
+                      แพ็กเกจที่เล็กที่สุดที่พอคือ <b>{tierThatWouldFit.label}</b> (เพดาน{" "}
+                      {tierThatWouldFit.maxBranches} สาขา) — <b>เครื่องมือนี้ไม่เลือกให้เอง</b>{" "}
+                      เพราะเป็นการผูกแพ็กเกจที่คิดค่าบริการ ต้องเลือกเอง
                     </>
                   )}
                   <br />
