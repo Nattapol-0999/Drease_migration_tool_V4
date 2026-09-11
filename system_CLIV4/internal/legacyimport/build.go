@@ -193,8 +193,12 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			return nil, nil, money, fmt.Errorf("owner_username is required when importing the people group")
 		}
 		if !hasOwner(userRows, in.OwnerUsername) {
-			return nil, nil, money, fmt.Errorf("owner_username %q not found among the %d account(s) in the users dump",
-				in.OwnerUsername, len(userRows))
+			// The candidates are named because the operator's only other route to them is
+			// grepping a multi-megabyte dump for a column whose name is not guessable:
+			// owner_username matches legacy `users`.`code`, not a name or an email.
+			return nil, nil, money, fmt.Errorf(
+				"owner_username %q ไม่มีในไฟล์ users (มี %d บัญชี) — owner_username คือคอลัมน์ `code` ของตาราง users ในระบบเดิม ไม่ใช่ชื่อหรืออีเมล · %s",
+				in.OwnerUsername, len(userRows), describeOwnerCandidates(userRows))
 		}
 		if out[EntUsers], err = buildUsers(userRows, in, rep); err != nil {
 			return nil, nil, money, err

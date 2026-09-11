@@ -1,6 +1,9 @@
 package legacyimport
 
 import (
+	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"system_cliv4/internal/legacydump"
@@ -32,6 +35,66 @@ func hasOwner(rows []legacydump.Row, ownerUsername string) bool {
 		}
 	}
 	return false
+}
+
+/**
+ * ownerCandidates lists the codes that WOULD be accepted as owner_username.
+ *
+ * The refusal it feeds used to say only how many accounts the dump held: "owner_username
+ * \"1096\" not found among the 112 account(s)". True, and useless — the operator's next move
+ * was to open a 10 MB dump and search it by hand for a column whose name is not obvious
+ * (owner_username matches legacy `users`.`code`, not a name, a username or an email).
+ *
+ * Filtered exactly like hasOwner, rows with no id skipped, so every code printed is one that
+ * would actually have worked. Listing codes the caller would then be refused for would be
+ * worse than listing none.
+ *
+ * Sorted so two runs over one file suggest the same thing, and numerically where the codes are
+ * numbers — these are staff numbers in every export seen, and 1002 belongs before 1010.
+ */
+func ownerCandidates(rows []legacydump.Row) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Get("id") == "" {
+			continue
+		}
+		code := strings.TrimSpace(r.Get("code"))
+		if code == "" || seen[code] {
+			continue
+		}
+		seen[code] = true
+		out = append(out, code)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, aErr := strconv.Atoi(out[i])
+		b, bErr := strconv.Atoi(out[j])
+		if aErr == nil && bErr == nil {
+			return a < b
+		}
+		return out[i] < out[j]
+	})
+	return out
+}
+
+// maxOwnerCandidatesShown bounds the refusal message. Enough to recognise the numbering scheme
+// and pick one; not so many that the real sentence scrolls off the top of a job log.
+const maxOwnerCandidatesShown = 20
+
+// describeOwnerCandidates renders the list for the error, saying how many were withheld rather
+// than trailing off — "…" alone leaves the reader unsure whether theirs was in the part cut.
+func describeOwnerCandidates(rows []legacydump.Row) string {
+	codes := ownerCandidates(rows)
+	if len(codes) == 0 {
+		return "ไฟล์นี้ไม่มีบัญชีที่ใช้เป็น owner ได้เลย (ทุกแถวไม่มี id หรือไม่มี code)"
+	}
+	shown := codes
+	suffix := ""
+	if len(shown) > maxOwnerCandidatesShown {
+		shown = shown[:maxOwnerCandidatesShown]
+		suffix = fmt.Sprintf(" … และอีก %d รหัส", len(codes)-maxOwnerCandidatesShown)
+	}
+	return fmt.Sprintf("code ที่ใช้ได้ในไฟล์นี้: %s%s", strings.Join(shown, ", "), suffix)
 }
 
 // buildClinicUser writes the clinic_user memberships. This is the row auth needs:
