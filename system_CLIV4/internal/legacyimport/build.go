@@ -164,7 +164,13 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	// Read only what something selected actually needs. Parsing a 719 MB dump nobody asked
 	// about is minutes of an operator's afternoon and, on the deployed box, most of its RAM.
 
-	needUsers := wants(EntUsers, EntClinicUser, EntClinicStaff, EntAppointment)
+	// EntPatient is in this list because patient.user_insert is a legacy users.id and is now
+	// translated through import_user_map — so a patients-only run needs the users dump PARSED
+	// (to build the map) even though it writes no accounts. Leaving it out produced a script
+	// with thousands of lookups into a table that was never created, which psql only rejects
+	// after the whole file has been uploaded and started. BuildScript re-checks that
+	// invariant on the assembled text, so forgetting -users is refused rather than emitted.
+	needUsers := wants(EntUsers, EntClinicUser, EntClinicStaff, EntAppointment, EntPatient)
 	needDoctor := wants(EntDoctor, EntClinicStaff, EntAppointment)
 
 	if len(in.UsersDump) > 0 && needUsers {

@@ -200,7 +200,44 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	// advances by itself. See the note where usersSequenceFix used to live.
 
 	b.WriteString("COMMIT;\n")
-	return b.String(), rep, nil
+	script = b.String()
+
+	// STRUCTURAL INVARIANT: never hand out a script that reads a table it did not create.
+	//
+	// Six places translate a person through import_user_map, and the map is only emitted
+	// when a users dump was PARSED. Run `-only patients` without `-users` and the patient
+	// rows still carry 4,425 lookups into a table that never exists -- psql then fails on a
+	// missing relation after the whole file has been uploaded and started.
+	//
+	// Checked on the assembled text rather than per entity on purpose: it holds for doctor,
+	// clinic_user and clinic_staff too, and for whatever resolves a person next.
+	if err := checkUserMapIsCreatedBeforeUse(script); err != nil {
+		return "", rep, err
+	}
+	return script, rep, nil
+}
+
+// checkUserMapIsCreatedBeforeUse fails when the script resolves a person through
+// import_user_map without the CREATE that makes it exist, which is what forgetting the
+// users dump produces.
+func checkUserMapIsCreatedBeforeUse(script string) error {
+	uses := strings.Count(script, "FROM import_user_map")
+	if uses == 0 {
+		return nil
+	}
+	created := strings.Index(script, "CREATE TEMP TABLE import_user_map")
+	if created < 0 {
+		return fmt.Errorf("ต้องส่งไฟล์ dump ของตาราง users มาด้วย (-users) — %d จุดในสคริปต์นี้ต้องแปลเลขคน "+
+			"(เช่น patient.user_insert, doctor.user_id) จาก id เดิมเป็น id ที่ V4 ออกให้ ซึ่งต้องอ่านจากไฟล์ users "+
+			"ถ้าไม่ส่งมา สคริปต์จะอ้างตารางที่ไม่มีอยู่แล้วล้มทั้งไฟล์ตอนรัน psql", uses)
+	}
+	// The CREATE also has to come FIRST. A later one would be a silent no-op: every lookup
+	// above it would already have failed.
+	if first := strings.Index(script, "FROM import_user_map"); first < created {
+		return fmt.Errorf("สคริปต์อ้าง import_user_map ก่อนที่จะสร้างตาราง — ลำดับผิด (ใช้ที่ตำแหน่ง %d, สร้างที่ %d)",
+			first, created)
+	}
+	return nil
 }
 
 // analyzeTargets names, per entity, the table that entity FILLS and that a LATER phase
