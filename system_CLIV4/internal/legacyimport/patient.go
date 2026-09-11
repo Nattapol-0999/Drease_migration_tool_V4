@@ -14,6 +14,10 @@ const (
 	pDate                    // legacy "DD/MM/YYYY" -> date
 	pTS                      // legacy "YYYY-MM-DD HH:MM:SS" (UTC) -> timestamptz
 	pNum                     // legacy double -> varchar, 0 -> NULL
+	// pUserRef is a legacy users.id. It is NOT copied: V4 issues its own ids, so the value
+	// is translated through import_user_map. Copying it would point the column at whichever
+	// clinic reached that number first — on the shared test database, 36 of 112 accounts.
+	pUserRef
 )
 
 // patientCol is one target column fed from one source column. "Created_at" feeds two
@@ -89,7 +93,7 @@ var patientMapping = []patientCol{
 	{`message_group`, "message_group", pText, 64},
 	{`note`, "note", pText, 0},
 	{`patient_medicine_always`, "patient_medicine_always", pText, 0},
-	{`user_insert`, "user_insert", pInt, 0},
+	{`user_insert`, "user_insert", pUserRef, 0},
 	{`rank_id`, "rank_id", pText, 64},
 	{`profile_picture`, "profile_picture", pText, 500},
 	{`active`, "active", pText, 8},
@@ -202,6 +206,16 @@ func patientValue(c patientCol, r legacydump.Row, tr truncations) (string, bool)
 		return intLit(s)
 	case pNum:
 		return numLit(s)
+	case pUserRef:
+		// A non-numeric or zero link is no link. NULL rather than a guess: user_insert says
+		// who registered the patient, and naming the wrong person is worse than naming none.
+		legacyID, ok := intLit(s)
+		if !ok || legacyID == "NULL" || legacyID == "0" {
+			// ok is passed through so a non-numeric value is still counted as unparseable,
+			// while a plain 0 is not — it is a legitimate "nobody recorded".
+			return "NULL", ok
+		}
+		return userIDByLegacy(legacyID), true
 	default:
 		v, cut := clip(s, c.maxLen)
 		tr.note(c.target, cut)

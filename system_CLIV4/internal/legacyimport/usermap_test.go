@@ -1,0 +1,192 @@
+package legacyimport
+
+import (
+	"strings"
+	"testing"
+)
+
+// Translating a person from the legacy dump to the account V4 issues.
+//
+// This is the change with the worst failure mode in the whole importer. users.id is a PRIMARY
+// KEY across the platform, not per clinic, so the numbers in a tenant's dump belong to
+// whoever reached them first — measured on the shared test database, 36 of one export's 112
+// accounts. Writing them through meant either overwriting another clinic's login or, under
+// ON CONFLICT DO NOTHING, skipping the account while patient.user_insert, clinic_user,
+// clinic_staff and doctor all attached to the stranger who owned that number. None of that
+// raises an error. It just records the wrong person as having registered a patient.
+//
+// So the assertions below are about what the SQL says, not about whether it runs.
+
+func usersFixture() []byte {
+	return []byte("INSERT INTO `users` (`id`, `code`, `name`, `email`, `password`, `active`) VALUES\n" +
+		"(1,   'admin',  'ผู้ดูแล',  'admin',            '$2y$hash1', 1),\n" +
+		"(356, 'beer',   'บีร์',    'beer',             '$2y$hash2', 1),\n" +
+		"(391, 'sorawit','สรวิศ',   'sorawit',          '$2y$hash3', 1),\n" +
+		"(634, 'nurse',  'พยาบาล',  'nurse@clinic.com', '$2y$hash4', 1);\n")
+}
+
+func buildUsersSQL(t *testing.T, in Input) (mapSQL, usersSQL string, rep *Report) {
+	t.Helper()
+	rows := parseUsers(t, in.UsersDump)
+	rep = NewReport(in.ClinicCode)
+	var err error
+	if mapSQL, err = buildUserMap(rows, in, rep); err != nil {
+		t.Fatalf("buildUserMap: %v", err)
+	}
+	if usersSQL, err = buildUsers(rows, in, rep); err != nil {
+		t.Fatalf("buildUsers: %v", err)
+	}
+	return mapSQL, usersSQL, rep
+}
+
+func TestUsersInsertDoesNotCarryTheLegacyID(t *testing.T) {
+	_, usersSQL, _ := buildUsersSQL(t, Input{ClinicCode: "MBU1", UsersDump: usersFixture()})
+
+	// OVERRIDING SYSTEM VALUE is the tell: it only exists to force a value into an IDENTITY
+	// column. Its presence means the legacy number is being written.
+	if strings.Contains(usersSQL, "OVERRIDING SYSTEM VALUE") {
+		t.Error("the users insert still forces the legacy id into the identity column")
+	}
+	if strings.Contains(usersSQL, "INSERT INTO users (id,") {
+		t.Error("the users insert still names the id column")
+	}
+	// A re-run has to be a no-op, and email is the only unique key left to hang that on.
+	if !strings.Contains(usersSQL, "ON CONFLICT (email) DO NOTHING") {
+		t.Errorf("expected the re-run guard on email:\n%s", usersSQL)
+	}
+}
+
+func TestUserMapKeepsAFreeLoginNameExactlyAsItWas(t *testing.T) {
+	mapSQL, _, _ := buildUsersSQL(t, Input{ClinicCode: "MBU1", UsersDump: usersFixture()})
+
+	// The decision is made in SQL because whether a name is taken is only knowable against
+	// the target. Both outcomes must be present for every row: the original when it is free,
+	// the suffixed form when it is not.
+	for _, want := range []string{
+		"CREATE TEMP TABLE import_user_map",
+		"ON COMMIT DROP",
+		"'admin'",                    // kept when free
+		"'admin_MBU1@gmail.com'",     // used when taken
+		"'nurse@clinic.com'",         // a real address is left alone when free
+		"'nurse_MBU1@gmail.com'",     // and still gets the same treatment when taken
+	} {
+		if !strings.Contains(mapSQL, want) {
+			t.Errorf("map is missing %q:\n%s", want, mapSQL)
+		}
+	}
+	// The CASE must compare against OTHER clinics only, or a re-run of this clinic would see
+	// its own row and start suffixing names that were already fine.
+	if !strings.Contains(mapSQL, "COALESCE(u.clinic_code, '') <> 'MBU1'") {
+		t.Errorf("the collision test is not scoped to other clinics:\n%s", mapSQL)
+	}
+}
+
+func TestSuffixedEmailShape(t *testing.T) {
+	// The shape the clinic owner chose on 11 Sep 2026: <name>_<CLINIC>@gmail.com.
+	for _, c := range []struct{ in, clinic, want string }{
+		{"admin", "C8B173E", "admin_C8B173E@gmail.com"},
+		{"beer", "C8B173E", "beer_C8B173E@gmail.com"},
+		// An address keeps its local part and loses its domain: if the original had been
+		// usable, it would not have collided in a way worth preserving.
+		{"a@b.com", "MBU1", "a_MBU1@gmail.com"},
+	} {
+		if got := suffixedEmail(c.in, c.clinic); got != c.want {
+			t.Errorf("suffixedEmail(%q, %q) = %q, want %q", c.in, c.clinic, got, c.want)
+		}
+	}
+}
+
+func TestEveryReferenceResolvesThroughTheMapRatherThanTheLegacyNumber(t *testing.T) {
+	// One build, every table checked: a rule that got clinic_user right by getting patient
+	// wrong would pass a narrower test.
+	in := Input{
+		ClinicCode:    "MBU1",
+		OwnerUsername: "admin",
+		UsersDump:     usersFixture(),
+		PatientDump: []byte("INSERT INTO `patient` (`HN`, `Firstname`, `branch_code`, `user_insert`) VALUES\n" +
+			"('0169001', 'ก', '01', 391),\n" +
+			"('0169002', 'ข', '01', 0),\n" +
+			"('0169003', 'ค', '01', 'x');\n"),
+		DoctorDump: []byte("INSERT INTO `doctor` (`doctor_code`, `doctor_name`, `doctor_user_id`, `doctor_active`) VALUES\n" +
+			"('D1', 'หมอหนึ่ง', 634, '1');\n"),
+	}
+	batches, _, _, err := BuildAll(in, NewReport(in.ClinicCode))
+	if err != nil {
+		t.Fatalf("BuildAll: %v", err)
+	}
+
+	resolve := "SELECT m.new_id FROM import_user_map m WHERE m.legacy_id ="
+	for _, c := range []struct{ ent, name string }{
+		{EntClinicUser, "clinic_user.user_id"},
+		{EntClinicStaff, "clinic_staff.user_id"},
+		{EntPatient, "patient.user_insert"},
+		{EntDoctor, "doctor.user_id / staff_id"},
+	} {
+		sqlText := batches[c.ent]
+		if sqlText == "" {
+			t.Fatalf("%s produced no SQL", c.ent)
+		}
+		if !strings.Contains(sqlText, resolve) {
+			t.Errorf("%s does not resolve the person through the map:\n%s", c.name, head(sqlText, 700))
+		}
+	}
+
+	// patient row 2 links to user 0 and row 3 to 'x'. Neither is a person, and guessing one
+	// would put a name against a registration nobody made.
+	patients := batches[EntPatient]
+	if strings.Contains(patients, "legacy_id = 0") {
+		t.Error("a user_insert of 0 was treated as a link")
+	}
+
+	// The fill has to sit between the accounts and anything reading them.
+	users := batches[EntUsers]
+	if !strings.Contains(users, "UPDATE import_user_map") {
+		t.Errorf("the users batch does not record the ids V4 issued:\n%s", head(users, 400))
+	}
+	if strings.Index(users, "INSERT INTO users") > strings.Index(users, "UPDATE import_user_map") {
+		t.Error("the fill runs before the accounts are written")
+	}
+}
+
+func TestUnresolvedAccountRefusesTheScriptWhenThisRunWroteThem(t *testing.T) {
+	// An account that failed to insert leaves new_id NULL. Every reference to that person
+	// would then be NULL — or, if the row was skipped because a stranger holds the email,
+	// resolve to the stranger. Refusing is the only safe outcome, and only when this run was
+	// supposed to have written them.
+	strict := buildUserMapFill("MBU1", true)
+	if !strings.Contains(strict, "RAISE EXCEPTION") {
+		t.Errorf("a run that writes accounts must refuse on an unresolved one:\n%s", strict)
+	}
+	loose := buildUserMapFill("MBU1", false)
+	if strings.Contains(loose, "RAISE EXCEPTION") {
+		t.Errorf("a patients-only run must not be blocked over staff it never imported:\n%s", loose)
+	}
+	for _, s := range []string{strict, loose} {
+		if !strings.Contains(s, "COALESCE(u.clinic_code, '') = 'MBU1'") {
+			t.Errorf("the fill is not scoped to this clinic, so another tenant's row could win the join:\n%s", s)
+		}
+	}
+}
+
+func TestCollisionGuardChecksBothEmailFormsAndNotTheID(t *testing.T) {
+	rows := parseUsers(t, usersFixture())
+	g := buildUsersCollisionGuard(rows, "MBU1")
+
+	for _, want := range []string{"'admin'", "'admin_mbu1@gmail.com'"} {
+		if !strings.Contains(strings.ToLower(g), want) {
+			t.Errorf("guard does not check %s — either form could be the one that collides:\n%s", want, g)
+		}
+	}
+	// Checking the legacy id would refuse most runs against a shared database over numbers
+	// nothing is going to write.
+	if strings.Contains(g, "u.id") {
+		t.Errorf("guard still checks the legacy id, which is no longer written:\n%s", g)
+	}
+}
+
+func head(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + " …"
+}

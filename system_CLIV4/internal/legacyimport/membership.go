@@ -130,7 +130,7 @@ func buildClinicUser(rows []legacydump.Row, in Input, rep *Report) (string, erro
 VALUES (%s, %s, %s, true, '{}')
 ON CONFLICT (user_id, clinic_code) DO NOTHING;
 
-`, id, lit(in.ClinicCode), rolePresetIDByKey(roleKey))
+`, userIDByLegacy(id), lit(in.ClinicCode), rolePresetIDByKey(roleKey))
 	}
 	e.Statements = s.stmts
 	rep.notef("clinic_user: owner=%q, %d other account(s) as %s", in.OwnerUsername, others, RoleKeyStaff)
@@ -200,18 +200,22 @@ func buildClinicStaff(rows []legacydump.Row, tel map[string]string, doctorUsers 
 
 		nameLit, _ := clip(name, 255)
 		userLit, _ := clip(username, 255)
-		mailLit, _ := clip(email, 255)
 		telLit, _ := clip(phone, 64)
 
+		// email here is the DIRECTORY copy shown in Settings › ผู้ใช้งาน, so it is read from
+		// the map instead of from this row: it has to be the value the account ENDED UP with,
+		// or a staff row would show `admin` beside a login of `admin_C8B173E@gmail.com` and
+		// send somebody to the wrong field. That is also why the local `email` above is only
+		// used as a name fallback — the map already applied clip() and the collision rule.
 		s.comment("%s / %s → %s", username, oneLine(name), roleKey)
 		s.addf(`INSERT INTO clinic_staff (clinic_code, name, username, email, tel, role_id, has_login, active, status, user_id, created_at, updated_at)
-SELECT %s, %s, %s, %s, %s, %s, true, true, 1, %s, now(), now()
+SELECT %s, %s, %s, (SELECT m.email FROM import_user_map m WHERE m.legacy_id = %s), %s, %s, true, true, 1, %s, now(), now()
 WHERE NOT EXISTS (
     SELECT 1 FROM clinic_staff cs WHERE cs.clinic_code = %s AND cs.user_id = %s
 );
 
-`, lit(in.ClinicCode), lit(nameLit), lit(userLit), lit(mailLit), lit(telLit),
-			rolePresetIDByKey(roleKey), id, lit(in.ClinicCode), id)
+`, lit(in.ClinicCode), lit(nameLit), lit(userLit), id, lit(telLit),
+			rolePresetIDByKey(roleKey), userIDByLegacy(id), lit(in.ClinicCode), userIDByLegacy(id))
 	}
 	// A doctor whose account already belongs to another doctor gets a staff record of
 	// its own, so both stay bookable (uniq_doctor_clinic_staff allows one doctor per
@@ -234,7 +238,7 @@ WHERE NOT EXISTS (
 );
 
 `, lit(in.ClinicCode), lit(nameLit), lit(userLit), lit(telLit),
-			rolePresetIDByKey(RoleKeyDoctor), x.UserID, lit(in.ClinicCode), lit(userLit))
+			rolePresetIDByKey(RoleKeyDoctor), userIDByLegacy(x.UserID), lit(in.ClinicCode), lit(userLit))
 	}
 
 	e.Statements = s.stmts

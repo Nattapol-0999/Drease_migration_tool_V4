@@ -62,11 +62,22 @@ const (
 	// false — the whole run is refused, matching the rule used for duplicate HNs.
 	RecodeDuplicateServiceCodes = true
 
-	// KeepLegacyUserIDs preserves users.id from the dump via OVERRIDING SYSTEM VALUE.
-	// patient.user_insert already points at those numbers, so fresh ids would
-	// silently re-attribute every imported patient. The identity sequence is advanced
-	// afterwards or the next app-created user collides.
-	KeepLegacyUserIDs = true
+	// There is no KeepLegacyUserIDs any more, and the reason it existed is worth keeping.
+	//
+	// It preserved users.id from the dump via OVERRIDING SYSTEM VALUE, because
+	// patient.user_insert points at those numbers and fresh ids would have silently
+	// re-attributed every imported patient. That was true, and it is exactly why the id was
+	// hard to give up.
+	//
+	// What made it untenable: users.id is a primary key across the WHOLE platform, not per
+	// clinic. Measured on the shared test database, 36 of one export's 112 accounts landed on
+	// ids other tenants had already taken — 19 of them a clinic with real data since 2016.
+	// Preserving the number meant either overwriting somebody else's login or skipping the
+	// account and letting everything that referenced it attach to a stranger.
+	//
+	// V4 issues the ids now and import_user_map translates, so patient.user_insert (and
+	// clinic_user, clinic_staff, doctor.user_id, doctor.staff_id) resolve the person instead
+	// of trusting a number. See buildUserMap.
 
 	// SkipLegacyAgeColumn drops the legacy patient."Age": the values are strings cut
 	// mid-character ('36 ปี 11 เด') and derived anyway — V4 computes age from

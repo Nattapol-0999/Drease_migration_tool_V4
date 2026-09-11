@@ -69,9 +69,13 @@ func buildDoctor(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 		tr.note("color", cut)
 		active, cut := clip(r.Get("doctor_active"), 8)
 		tr.note("doctor_active", cut)
-		userID, ok := intLit(r.Get("doctor_user_id"))
-		if !ok {
+		// doctor.user_id points at a V4 account, so the legacy number is translated rather
+		// than copied. NULL when the source has no link, or has one that is not a number.
+		userID := "NULL"
+		if raw, ok := intLit(r.Get("doctor_user_id")); !ok {
 			rep.warnf("doctor %s: doctor_user_id %q is not a number — imported as NULL", code, r.Get("doctor_user_id"))
+		} else if raw != "NULL" && raw != "0" {
+			userID = userIDByLegacy(raw)
 		}
 		if r.Get("doctor_user_id") == "" {
 			e.skip("no user link")
@@ -106,9 +110,13 @@ func buildDoctor(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 			staffTaken[uid] = true
 			// has_login = true pins this to the row built from the users dump, so it can
 			// never accidentally resolve to one of the doctor-only rows above.
+			//
+			// cs.user_id holds the id V4 issued, not the legacy number, so the legacy value
+			// is translated through the map first — comparing it raw would match whichever
+			// clinic happens to own that id.
 			staffID = fmt.Sprintf(
 				"(SELECT cs.id FROM clinic_staff cs WHERE cs.clinic_code = %s AND cs.user_id = %s AND cs.has_login LIMIT 1)",
-				lit(in.ClinicCode), uid)
+				lit(in.ClinicCode), userIDByLegacy(uid))
 		}
 
 		s.comment("%s / %s", code, oneLine(pick(tha, eng)))

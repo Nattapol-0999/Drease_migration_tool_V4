@@ -8,17 +8,159 @@ import (
 	"system_cliv4/internal/legacydump"
 )
 
+// buildUserMap emits the TEMP table that every later reference to a person goes through.
+//
+// WHY A MAP AND NOT THE LEGACY id
+// users.id is a PRIMARY KEY across the WHOLE platform, not per clinic, so the numbers in a
+// tenant's dump belong to whoever reached them first. Measured on the shared test database:
+// of 112 accounts in one export, 36 landed on ids already held by other clinics — 19 by a
+// tenant with real data since 2016. Writing them through would have needed
+// OVERRIDING SYSTEM VALUE and either overwritten another clinic's login or, under
+// ON CONFLICT DO NOTHING, skipped the account while everything pointing at it silently
+// attached to the stranger who owned that number.
+//
+// So V4 issues the ids and this map translates. legacy_id is what the dump's other tables
+// carry; new_id is filled once the accounts exist. Every reference resolves through it, which
+// keeps the translation in ONE place rather than repeating a join at six call sites.
+//
+// WHY THE EMAIL IS DECIDED IN SQL
+// users.email is UNIQUE platform-wide too, and these legacy values are not addresses — they
+// are login names ('admin', 'beer', 'wanaka'). Two of them were already taken by another
+// clinic. Whether a given name collides is only knowable against the target, so the CASE
+// runs at load time: a name that is free is kept exactly as it was, and only a colliding one
+// gets the clinic code folded in. Nobody's login changes unless it had to.
+//
+// The suffixed form was chosen by the clinic owner on 11 Sep 2026 (see DECISIONS.md, which
+// also records the risk accepted: gmail.com is not a domain we own, and password reset does
+// not require a verified address).
+func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) {
+	var s sqlBuilder
+	s.comment("legacy users.id → the id V4 issues · and the email each account ends up with")
+	s.addf(`CREATE TEMP TABLE import_user_map (
+    legacy_id bigint PRIMARY KEY,
+    email     text NOT NULL,
+    new_id    bigint
+) ON COMMIT DROP;
+
+`)
+
+	renamed := 0
+	tr := truncations{}
+	values := make([]string, 0, len(rows))
+	for _, r := range rows {
+		id := r.Get("id")
+		email := r.Get("email")
+		if id == "" || email == "" {
+			continue // buildUsers refuses these; the map simply has nothing to say about them
+		}
+		// users.email is varchar(255). Clipped HERE because this is the only place the value
+		// that reaches the column is decided — clipping it in buildUsers would report a
+		// truncation that never happened and let the untruncated form into the map.
+		email, cut := clip(email, 255)
+		tr.note("email", cut)
+		suffixed, cut := clip(suffixedEmail(email, in.ClinicCode), 255)
+		tr.note("email (รูปที่เติมรหัสคลินิก)", cut)
+		if suffixed != email {
+			renamed++
+		}
+		// Free name → keep it. Taken name → the suffixed form. Decided per row, at load time.
+		values = append(values, fmt.Sprintf(
+			"    (%s, CASE WHEN EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = lower(%s)\n"+
+				"                             AND COALESCE(u.clinic_code, '') <> %s)\n"+
+				"              THEN %s ELSE %s END)",
+			id, lit(email), lit(in.ClinicCode), lit(suffixed), lit(email)))
+	}
+	if len(values) == 0 {
+		return "", nil
+	}
+	s.addf("INSERT INTO import_user_map (legacy_id, email) VALUES\n%s;\n\n", strings.Join(values, ",\n"))
+
+	if sum := tr.summary(); sum != "" {
+		rep.warnf("users: truncated %s", sum)
+	}
+	if renamed > 0 {
+		rep.notef("users: %d บัญชีมีชื่อล็อกอินซ้ำกับคลินิกอื่น จะถูกเติมรหัสคลินิกต่อท้ายเฉพาะตัวที่ซ้ำจริงตอนโหลด "+
+			"(รูปแบบ <ชื่อ>_%s@gmail.com) — คนเหล่านั้นต้องใช้ค่าใหม่ตอนเข้าระบบ", renamed, in.ClinicCode)
+	}
+	return s.String(), nil
+}
+
+// buildUserMapFill records the ids V4 actually issued, so later tables can resolve a person.
+//
+// Scoped to this clinic: two tenants can hold the same email only if one of them was
+// suffixed, and matching without the clinic_code would let a stranger's row win the join.
+//
+// strict is on when THIS run writes the accounts. Then every mapped row must resolve, and one
+// that does not is a refusal: it means the account was not written, and every table pointing
+// at that person would land NULL or on somebody else. When the run only reads the users dump
+// (a patients-only import resolving against accounts a previous run created), an unresolved
+// row is left alone — a clinic whose staff were never migrated is a legitimate state, and
+// refusing would block the import over people nobody asked for.
+func buildUserMapFill(clinic string, strict bool) string {
+	fill := fmt.Sprintf(`-- the ids V4 issued, so every reference below can resolve a person
+UPDATE import_user_map m
+   SET new_id = u.id
+  FROM users u
+ WHERE lower(u.email) = lower(m.email)
+   AND COALESCE(u.clinic_code, '') = %s;
+
+`, lit(clinic))
+	if !strict {
+		return fill + `-- Not every account has to resolve here: this run does not write users, so a legacy
+-- reference to somebody who was never imported simply stays NULL.
+
+`
+	}
+	return fill + `-- GUARD: every mapped account must have resolved, because this run wrote them all.
+-- An unresolved row means the insert was skipped — normally because its email belongs to
+-- another clinic — and anything pointing at that person would land NULL or on a stranger.
+DO $guard$
+DECLARE
+    orphans text;
+BEGIN
+    SELECT string_agg(format('legacy_id=%s email=%s', m.legacy_id, m.email), '; ')
+      INTO orphans
+      FROM import_user_map m WHERE m.new_id IS NULL;
+    IF orphans IS NOT NULL THEN
+        RAISE EXCEPTION 'users: มีบัญชีที่หา id ใหม่ไม่ได้หลังนำเข้า — ปฏิเสธทั้งสคริปต์: %', orphans;
+    END IF;
+END $guard$;
+
+`
+}
+
+// userIDByLegacy is the expression every table uses instead of the legacy number.
+//
+// A subquery rather than a join so it drops into a VALUES list unchanged. import_user_map is
+// keyed on legacy_id, so this is an index lookup, and the guard above has already proved
+// new_id is not NULL for every row in it.
+func userIDByLegacy(legacyID string) string {
+	return fmt.Sprintf("(SELECT m.new_id FROM import_user_map m WHERE m.legacy_id = %s)", legacyID)
+}
+
+// suffixedEmail folds the clinic code into a login name so it can coexist with another
+// tenant's identical one.
+//
+// `admin` → `admin_C8B173E@gmail.com`. A value that already looks like an address keeps its
+// local part and gains the code the same way, so `a@b.com` → `a_C8B173E@gmail.com` — the
+// domain is replaced deliberately: if the original address were usable it would not have
+// collided in a way anyone wanted to keep.
+func suffixedEmail(email, clinic string) string {
+	local := email
+	if at := strings.IndexByte(email, '@'); at > 0 {
+		local = email[:at]
+	}
+	return fmt.Sprintf("%s_%s@gmail.com", local, clinic)
+}
+
 // buildUsers maps the legacy `users` table onto V4 `public.users`.
 //
-// The legacy id is preserved (KeepLegacyUserIDs): patient.user_insert already points
-// at those numbers. users.id is GENERATED ALWAYS AS IDENTITY, so every insert needs
-// OVERRIDING SYSTEM VALUE and the identity sequence must be advanced afterwards —
-// buildUsersSequenceFix does that and the importer runs it last.
+// The id is NOT carried over — see buildUserMap. Rows take the email the map decided, so a
+// login name that was free stays exactly as it was and only a colliding one is rewritten.
 //
-// email is carried over verbatim even though the legacy values are usernames
-// ('admin', 'wanaka'): they are what people log in with. users_email_key is UNIQUE
-// across the WHOLE table, not per clinic, so a collision with an existing row aborts
-// the transaction — which is the safe outcome.
+// ON CONFLICT (email) DO NOTHING makes a re-run of the same clinic a no-op. It cannot hide a
+// cross-tenant collision: the map suffixes those before they reach here, and the fill guard
+// refuses the script if any account failed to resolve afterwards.
 //
 // locale / is_platform_admin / must_change_password keep their table defaults ('th',
 // false, false): the legacy schema has nothing to fill them with. The legacy password
@@ -67,25 +209,22 @@ func buildUsers(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 		if name == "" {
 			e.skip("empty name (imported as '')")
 		}
-		emailLit, cut := clip(email, 255)
-		tr.note("email", cut)
 		pass, cut := clip(r.Get("password"), 255)
 		tr.note("password", cut)
 		token, cut := clip(r.Get("remember_token"), 100)
 		tr.note("remember_token", cut)
 
-		// Insert-only (ON CONFLICT DO NOTHING): a re-run of the same clinic skips ids
-		// that already landed. A cross-tenant id/email collision never reaches here —
-		// Run's preflight rejects the whole run first, because DO NOTHING would
-		// otherwise silently drop an account whose id belongs to another clinic.
-		s.addf(`INSERT INTO users (id, name, email, password, remember_token, created_at, updated_at, clinic_code)
-OVERRIDING SYSTEM VALUE
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-ON CONFLICT (id) DO NOTHING;
+		// The email comes from the map, not from this row: the map is where the collision
+		// rule lives, and reading it in one place keeps the two from ever disagreeing.
+		// buildUserMap is also where the 255-character limit is applied, for the same reason.
+		s.addf(`INSERT INTO users (name, email, password, remember_token, created_at, updated_at, clinic_code)
+SELECT %s, m.email, %s, %s, %s, %s, %s
+  FROM import_user_map m WHERE m.legacy_id = %s
+ON CONFLICT (email) DO NOTHING;
 
-`, id, lit(name), lit(emailLit), lit(pass), nullLit(token),
+`, lit(name), lit(pass), nullLit(token),
 			tsLit(r.Get("created_at"), "NULL"), tsLit(r.Get("updated_at"), "NULL"),
-			lit(in.ClinicCode))
+			lit(in.ClinicCode), id)
 	}
 
 	e.Statements = s.stmts
@@ -93,15 +232,16 @@ ON CONFLICT (id) DO NOTHING;
 		rep.warnf("users: truncated %s", sum)
 	}
 	if minID > 0 {
-		rep.notef("users: legacy ids %d..%d preserved (identity sequence advanced after the load)", minID, maxID)
+		rep.notef("users: ids เดิม %d..%d ไม่ถูกนำมาใช้ — V4 ออกเลขให้เอง แล้วแปลผ่าน import_user_map "+
+			"(ids เดิมเป็น primary key ระดับแพลตฟอร์ม จึงเป็นของคลินิกที่ไปถึงเลขนั้นก่อน)", minID, maxID)
 	}
 	return s.String(), nil
 }
 
-// buildUsersSequenceFix advances users' identity sequence past the imported ids.
-// WITHOUT this the next user created through the app gets a low id and collides on the
-// primary key.
-func buildUsersSequenceFix() string {
-	return "-- advance the identity sequence past the preserved ids\n" +
-		"SELECT setval(pg_get_serial_sequence('users', 'id'), (SELECT max(id) FROM users));\n\n"
-}
+// No buildUsersSequenceFix any more.
+//
+// It existed to setval() the identity sequence past ids written with OVERRIDING SYSTEM VALUE,
+// or the next account created through the app would collide on the primary key. Nothing
+// overrides the sequence now, so advancing it would only skip a block of numbers for no
+// reason — and doing it on a shared database would move a counter other tenants also draw
+// from.

@@ -136,8 +136,16 @@ func TestPageMapsEveryColumn(t *testing.T) {
 	if f.DoctorCode != "4764" {
 		t.Errorf("doctor_code = %q, want page.doctor kept as-is (doctor.go preserves legacy codes)", f.DoctorCode)
 	}
-	if f.CreatedBy != "634" {
-		t.Errorf("created_by = %q, want rev.user (users.id is preserved by the users import)", f.CreatedBy)
+	// created_by is deliberately NOT carried, even though rev.user holds 634 in this fixture.
+	//
+	// It used to be, and it was correct while the users import preserved the legacy users.id.
+	// V4 issues its own ids now, so 634 identifies whichever account reached that number, in
+	// whichever clinic — and the photo import is a separate run from the SQL one, so it cannot
+	// read import_user_map to translate. A blank "who uploaded this" is a gap; a number
+	// pointing at a stranger is a false record.
+	if f.CreatedBy != "" {
+		t.Errorf("created_by = %q, want empty: a legacy users.id no longer identifies anyone at the target",
+			f.CreatedBy)
 	}
 	// The note carries what photos has no columns for.
 	for _, want := range []string{"หน้า 001", "docgroup 1", "วันตรวจ 2026-07-29"} {

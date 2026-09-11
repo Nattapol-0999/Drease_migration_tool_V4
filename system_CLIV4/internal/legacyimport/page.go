@@ -160,6 +160,9 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	e := rep.entity(EntPhoto)
 	e.SourceRows = len(docs)
 	tr := truncations{}
+	// Counted so the loss is stated once with a number, rather than either hidden or repeated
+	// as a warning per photo.
+	droppedCreatedBy := 0
 
 	man := &PhotoManifest{
 		ClinicCode:    in.ClinicCode,
@@ -247,14 +250,17 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 			doctorCode, cut := clip(strings.TrimSpace(pd.Text("doctor")), 32)
 			tr.note("doctor_code", cut)
 
+			// created_by is no longer carried. rev.user is a legacy users.id, and since V4
+			// issues its own ids that number identifies nobody at the target — it would name
+			// whichever account happened to reach it, in whichever clinic. The photo import
+			// is a separate run from the SQL one, so it cannot read import_user_map either
+			// (a TEMP table living inside the import transaction).
+			//
+			// Left empty rather than filled with a number that no longer means anything: a
+			// blank "who uploaded this" is a gap, a wrong one is a false record.
 			createdBy := ""
 			if u := strings.TrimSpace(latest.Text("user")); u != "" {
-				if _, ok := intLit(u); ok && u != "" {
-					createdBy = u
-				} else {
-					rep.warnf("photos: hn %s หน้า %s — rev.user %q ไม่ใช่ตัวเลข จึงไม่บันทึก created_by",
-						hn, pd.Text("page"), u)
-				}
+				droppedCreatedBy++
 			}
 
 			man.Files = append(man.Files, PhotoFile{
@@ -284,6 +290,11 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	e.Statements = len(man.Files)
 	if sum := tr.summary(); sum != "" {
 		rep.warnf("photos: truncated %s", sum)
+	}
+	if droppedCreatedBy > 0 {
+		rep.notef("photos: %d รูปมี rev.user ในต้นทางแต่ไม่บันทึก created_by — เลขนั้นคือ users.id ของระบบเดิม "+
+			"ซึ่ง V4 ไม่ได้ใช้อีกแล้ว (V4 ออก id เอง) จึงไม่ชี้ตัวใครที่ปลายทาง · ปล่อยว่างดีกว่าใส่เลขที่ชี้คนผิด",
+			droppedCreatedBy)
 	}
 
 	rep.notef("photos: %d hn · %d หน้า · %d rev ในไฟล์ → นำเข้า %d รูป (rev ล่าสุดของแต่ละหน้า)",

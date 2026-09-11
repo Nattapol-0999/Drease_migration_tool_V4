@@ -133,13 +133,40 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	// filtering by group, userRows can be full while no user is imported — appointments
 	// parse the users table only to learn which doctor_code V4 will accept. Emitting the
 	// collision guard then would refuse the run over ids nothing is going to insert.
-	if _, importingUsers := batches[EntUsers]; importingUsers && len(userRows) > 0 {
+	_, importingUsers := batches[EntUsers]
+	if importingUsers && len(userRows) > 0 {
 		keys := []string{RoleKeyOwner, RoleKeyStaff}
 		if _, importingDoctors := batches[EntDoctor]; importingDoctors {
 			keys = append(keys, RoleKeyDoctor)
 		}
 		b.WriteString(buildRolePresetsGuard(keys...))
 		b.WriteString(buildUsersCollisionGuard(userRows, in.ClinicCode))
+	}
+
+	// The legacy-id → V4-id map, before anything that resolves a person through it.
+	//
+	// Emitted whenever the users dump was PARSED, not only when accounts are written: a
+	// patients-only run still has to fill patient.user_insert, and it resolves against
+	// accounts a previous run created. Without the table those subqueries would fail on a
+	// missing relation instead of quietly returning NULL, which is the right failure but a
+	// confusing one.
+	if len(userRows) > 0 {
+		mapSQL, mapErr := buildUserMap(userRows, in, rep)
+		if mapErr != nil {
+			return "", rep, mapErr
+		}
+		if mapSQL != "" {
+			b.WriteString("-- ── แผนที่บัญชี: id เดิม → id ที่ V4 ออกให้ ──────────────────────────\n")
+			b.WriteString(mapSQL)
+			// When this run writes the accounts, the fill goes after them — BuildAll appends
+			// it to the users batch. When it does not, nothing later will insert a user, so
+			// resolving against what is already there belongs here, and an account nobody
+			// ever imported is left unresolved rather than refused: a patients-only run into
+			// a clinic whose staff were never migrated is a legitimate thing to do.
+			if !importingUsers {
+				b.WriteString(buildUserMapFill(in.ClinicCode, false))
+			}
+		}
 	}
 
 	// The money block is only guarded when it is actually part of this run: -only
@@ -169,12 +196,8 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		b.WriteString(buildMoneyVerifyGuards(in.ClinicCode, keySet(money.invoiceHN), keySet(money.receiptHN)))
 	}
 
-	// After the rows land, or the next user the app creates collides with a preserved
-	// id. Skipped when users were not part of this run.
-	if _, ok := batches[EntUsers]; ok && KeepLegacyUserIDs {
-		b.WriteString("-- ── users identity sequence ───────────────────────────────────────\n")
-		b.WriteString(usersSequenceFix())
-	}
+	// Nothing to do to the identity sequence any more: V4 issues every users.id, so it
+	// advances by itself. See the note where usersSequenceFix used to live.
 
 	b.WriteString("COMMIT;\n")
 	return b.String(), rep, nil

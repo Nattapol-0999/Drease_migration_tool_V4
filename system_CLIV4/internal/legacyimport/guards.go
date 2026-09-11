@@ -35,54 +35,62 @@ END $guard$;
 `, lit(clinic), lit(clinic))
 }
 
-// buildUsersCollisionGuard refuses the whole import when a legacy user id or email
-// already belongs to a DIFFERENT clinic.
+// buildUsersCollisionGuard refuses the import when a login name this run would write still
+// belongs to a DIFFERENT clinic after the collision rule has been applied.
 //
-// users is a GLOBAL identity table: `id` is the primary key across the whole platform
-// and `email` is UNIQUE across the whole table (not per clinic). Importing over such a
-// row would overwrite another tenant's login; skipping it would drop an account that
-// patient.user_insert still points at. Neither is acceptable, so the run is refused and
-// a human decides.
+// WHAT IT NO LONGER CHECKS
+// The legacy `id` is not checked any more, because it is not written any more — V4 issues
+// every users.id and import_user_map translates. That check used to refuse most runs against
+// a shared database for no real reason: 36 of one export's 112 accounts landed on ids other
+// clinics happened to reach first, none of which said anything about the accounts themselves.
 //
-// A collision with the SAME clinic is a re-run and is left to the insert-only
-// statements to skip.
+// WHAT IT STILL CHECKS, AND WHY IT HAS TO
+// email is UNIQUE across the whole table. buildUserMap already folds the clinic code into any
+// name another tenant holds, so the values reaching here are the SUFFIXED ones — and if even
+// those are taken, ON CONFLICT (email) DO NOTHING would skip the account while the fill guard
+// resolved it to the stranger who owns that address. Refusing is the only safe outcome.
+//
+// A collision with the SAME clinic is a re-run and is left to the insert-only statements.
 func buildUsersCollisionGuard(rows []legacydump.Row, clinic string) string {
-	ids := map[string]bool{}
 	emails := map[string]bool{}
 	for _, r := range rows {
-		if id := r.Get("id"); id != "" {
-			ids[id] = true
-		}
-		if e := strings.ToLower(r.Get("email")); e != "" {
+		// Both forms, because which one a row ends up with is decided at load time: the bare
+		// name when it is free, the suffixed one when it is not. Either could be the value
+		// that finally collides, so both are offered to the check.
+		if e := strings.ToLower(strings.TrimSpace(r.Get("email"))); e != "" {
 			emails[e] = true
+			emails[strings.ToLower(suffixedEmail(e, clinic))] = true
 		}
 	}
-	if len(ids) == 0 && len(emails) == 0 {
+	if len(emails) == 0 {
 		return ""
 	}
 
-	return fmt.Sprintf(`-- GUARD: no legacy account may collide with ANOTHER clinic's user.
--- users.id is a platform-wide primary key and users.email is UNIQUE across the whole
--- table. A collision with a different clinic would overwrite that tenant's login, so
--- the import refuses instead. A collision with THIS clinic is a re-run and is skipped
--- by the ON CONFLICT DO NOTHING statements below.
+	return fmt.Sprintf(`-- GUARD: no login name this run writes may still belong to ANOTHER clinic.
+-- users.email is UNIQUE across the whole table, not per clinic. The map has already folded
+-- the clinic code into any name another tenant holds, so what is checked here is BOTH forms:
+-- if even the suffixed one is taken, ON CONFLICT (email) DO NOTHING would skip the account
+-- and the fill would then resolve it to the stranger who owns that address.
+-- users.id is deliberately NOT checked: V4 issues every id now, so a legacy number colliding
+-- says nothing about the account.
+-- A collision with THIS clinic is a re-run and is skipped by the insert-only statements.
 DO $guard$
 DECLARE
     clash text;
 BEGIN
-    SELECT string_agg(format('id=%%s email=%%s → clinic %%s', u.id, u.email,
+    SELECT string_agg(format('email=%%s → clinic %%s', u.email,
                              COALESCE(NULLIF(u.clinic_code, ''), '(ไม่มี clinic_code)')), '; ')
       INTO clash
       FROM users u
-     WHERE (u.id::text = ANY (ARRAY[%s]) OR lower(u.email) = ANY (ARRAY[%s]))
+     WHERE lower(u.email) = ANY (ARRAY[%s])
        AND COALESCE(u.clinic_code, '') <> %s;
 
     IF clash IS NOT NULL THEN
-        RAISE EXCEPTION 'users: มี id/email ที่เป็นของคลินิกอื่นอยู่แล้ว — ปฏิเสธทั้งสคริปต์: %%', clash;
+        RAISE EXCEPTION 'users: ชื่อล็อกอินเป็นของคลินิกอื่นอยู่แล้วแม้เติมรหัสคลินิกต่อท้ายแล้ว — ปฏิเสธทั้งสคริปต์: %%', clash;
     END IF;
 END $guard$;
 
-`, sqlTextArray(ids), sqlTextArray(emails), lit(clinic))
+`, sqlTextArray(emails), lit(clinic))
 }
 
 // buildRolePresetsGuard refuses to run when the built-in role presets this import

@@ -203,6 +203,10 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		if out[EntUsers], err = buildUsers(userRows, in, rep); err != nil {
 			return nil, nil, money, err
 		}
+		// The fill belongs immediately after the accounts land and before anything resolves
+		// a person, so it rides on the end of the users batch rather than relying on where a
+		// separate entity would be ordered.
+		out[EntUsers] += buildUserMapFill(in.ClinicCode, true)
 		if out[EntClinicUser], err = buildClinicUser(userRows, in, rep); err != nil {
 			return nil, nil, money, err
 		}
@@ -367,10 +371,9 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	return out, userRows, money, nil
 }
 
-// usersSequenceFix advances users' identity sequence past the imported ids. WITHOUT
-// this the next user created through the app gets a low id and collides on the
-// primary key.
-func usersSequenceFix() string {
-	return "-- advance the identity sequence past the preserved ids\n" +
-		"SELECT setval(pg_get_serial_sequence('users', 'id'), (SELECT max(id) FROM users));\n\n"
-}
+// The identity-sequence fix is gone.
+//
+// It advanced users' sequence past ids written with OVERRIDING SYSTEM VALUE, or the next
+// account the app created collided on the primary key. Nothing overrides the sequence now —
+// V4 issues every id — so advancing it would skip a block of numbers for no reason, and on a
+// shared database it would move a counter other tenants also draw from.
