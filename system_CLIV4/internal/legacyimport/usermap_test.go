@@ -1,6 +1,7 @@
 package legacyimport
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -65,10 +66,11 @@ func TestUserMapKeepsAFreeLoginNameExactlyAsItWas(t *testing.T) {
 	for _, want := range []string{
 		"CREATE TEMP TABLE import_user_map",
 		"ON COMMIT DROP",
-		"'admin'",                    // kept when free
-		"'admin_MBU1@gmail.com'",     // used when taken
-		"'nurse@clinic.com'",         // a real address is left alone when free
-		"'nurse_MBU1@gmail.com'",     // and still gets the same treatment when taken
+		"legacy_email",           // kept so the renames can be counted after the database decides
+		"'admin'",                // kept when free
+		"'admin_MBU1@gmail.com'", // used when taken
+		"'nurse@clinic.com'",     // a real address is left alone when free
+		"'nurse_MBU1@gmail.com'", // and still gets the same treatment when taken
 	} {
 		if !strings.Contains(mapSQL, want) {
 			t.Errorf("map is missing %q:\n%s", want, mapSQL)
@@ -148,6 +150,33 @@ func TestEveryReferenceResolvesThroughTheMapRatherThanTheLegacyNumber(t *testing
 	}
 }
 
+func TestTheRenameCountComesFromTheDatabaseNotFromGo(t *testing.T) {
+	// A number computed in Go here would always equal the row count: every account HAS a
+	// suffixed form, so comparing the two forms says nothing about whether the name is taken.
+	// An earlier version reported "112 accounts collide" for an export where 2 did.
+	in := Input{ClinicCode: "MBU1", UsersDump: usersFixture()}
+	_, _, rep := buildUsersSQL(t, in)
+	counted := regexp.MustCompile(`\d+ (บัญชี|account)`)
+	for _, note := range rep.Notes {
+		if strings.Contains(note, "gmail.com") && counted.MatchString(note) {
+			t.Errorf("the generator is putting a number on collisions it cannot know: %q", note)
+		}
+	}
+
+	// The script asks the database instead, and says so either way — silence would leave an
+	// operator unable to explain why somebody's login stopped working.
+	fill := buildUserMapFill("MBU1", true)
+	for _, want := range []string{
+		"m.email <> m.legacy_email",
+		"RAISE NOTICE",
+		"ไม่มีชื่อล็อกอินที่ต้องเปลี่ยน",
+	} {
+		if !strings.Contains(fill, want) {
+			t.Errorf("the fill does not report the renames (%q missing):\n%s", want, fill)
+		}
+	}
+}
+
 func TestUnresolvedAccountRefusesTheScriptWhenThisRunWroteThem(t *testing.T) {
 	// An account that failed to insert leaves new_id NULL. Every reference to that person
 	// would then be NULL — or, if the row was skipped because a stranger holds the email,
@@ -168,15 +197,31 @@ func TestUnresolvedAccountRefusesTheScriptWhenThisRunWroteThem(t *testing.T) {
 	}
 }
 
-func TestCollisionGuardChecksBothEmailFormsAndNotTheID(t *testing.T) {
+func TestCollisionGuardOnlyRefusesWhenBothEmailFormsAreTaken(t *testing.T) {
 	rows := parseUsers(t, usersFixture())
 	g := buildUsersCollisionGuard(rows, "MBU1")
 
-	for _, want := range []string{"'admin'", "'admin_mbu1@gmail.com'"} {
-		if !strings.Contains(strings.ToLower(g), want) {
-			t.Errorf("guard does not check %s — either form could be the one that collides:\n%s", want, g)
-		}
+	// Both forms have to appear, PAIRED: the guard's question is "is the fallback also gone",
+	// which needs to know which fallback belongs to which name.
+	if !strings.Contains(strings.ToLower(g), "('admin', 'admin_mbu1@gmail.com')") {
+		t.Errorf("the two forms are not paired, so the guard cannot ask about the fallback:\n%s", g)
 	}
+
+	// THE REGRESSION THIS TEST EXISTS FOR. Listing both forms and refusing if either was taken
+	// rejected the whole 112-account import against the real database, because `admin` and
+	// `beer` belong to another clinic -- which is precisely why the fallback exists. The bare
+	// name being taken must only SELECT the row for checking, never condemn it.
+	if strings.Contains(g, "= ANY (ARRAY[") {
+		t.Errorf("guard is back to refusing on either form, which blocks every run the "+
+			"fallback was added to allow:\n%s", g)
+	}
+	if !strings.Contains(g, "lower(u.email) = w.bare") || !strings.Contains(g, "lower(u.email) = w.suffixed") {
+		t.Errorf("guard does not test the bare name and its fallback separately:\n%s", g)
+	}
+	if !strings.Contains(g, "w.taken_by IS NOT NULL") {
+		t.Errorf("guard does not require the fallback to ALSO be taken before refusing:\n%s", g)
+	}
+
 	// Checking the legacy id would refuse most runs against a shared database over numbers
 	// nothing is going to write.
 	if strings.Contains(g, "u.id") {

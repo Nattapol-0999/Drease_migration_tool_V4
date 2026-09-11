@@ -36,15 +36,19 @@ import (
 func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 	var s sqlBuilder
 	s.comment("legacy users.id → the id V4 issues · and the email each account ends up with")
+	// legacy_email is kept beside the decided one so the RENAMES CAN BE REPORTED. Go cannot
+	// count them: whether a name is taken is a fact about the target, known only once the
+	// CASE has run. Comparing the two columns after the load gives the real number instead of
+	// a guess, and it is also what an operator needs when a staff member cannot log in.
 	s.addf(`CREATE TEMP TABLE import_user_map (
-    legacy_id bigint PRIMARY KEY,
-    email     text NOT NULL,
-    new_id    bigint
+    legacy_id    bigint PRIMARY KEY,
+    legacy_email text NOT NULL,
+    email        text NOT NULL,
+    new_id       bigint
 ) ON COMMIT DROP;
 
 `)
 
-	renamed := 0
 	tr := truncations{}
 	values := make([]string, 0, len(rows))
 	for _, r := range rows {
@@ -60,28 +64,28 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 		tr.note("email", cut)
 		suffixed, cut := clip(suffixedEmail(email, in.ClinicCode), 255)
 		tr.note("email (รูปที่เติมรหัสคลินิก)", cut)
-		if suffixed != email {
-			renamed++
-		}
 		// Free name → keep it. Taken name → the suffixed form. Decided per row, at load time.
 		values = append(values, fmt.Sprintf(
-			"    (%s, CASE WHEN EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = lower(%s)\n"+
-				"                             AND COALESCE(u.clinic_code, '') <> %s)\n"+
-				"              THEN %s ELSE %s END)",
-			id, lit(email), lit(in.ClinicCode), lit(suffixed), lit(email)))
+			"    (%s, %s, CASE WHEN EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = lower(%s)\n"+
+				"                                 AND COALESCE(u.clinic_code, '') <> %s)\n"+
+				"                  THEN %s ELSE %s END)",
+			id, lit(email), lit(email), lit(in.ClinicCode), lit(suffixed), lit(email)))
 	}
 	if len(values) == 0 {
 		return "", nil
 	}
-	s.addf("INSERT INTO import_user_map (legacy_id, email) VALUES\n%s;\n\n", strings.Join(values, ",\n"))
+	s.addf("INSERT INTO import_user_map (legacy_id, legacy_email, email) VALUES\n%s;\n\n",
+		strings.Join(values, ",\n"))
 
 	if sum := tr.summary(); sum != "" {
 		rep.warnf("users: truncated %s", sum)
 	}
-	if renamed > 0 {
-		rep.notef("users: %d บัญชีมีชื่อล็อกอินซ้ำกับคลินิกอื่น จะถูกเติมรหัสคลินิกต่อท้ายเฉพาะตัวที่ซ้ำจริงตอนโหลด "+
-			"(รูปแบบ <ชื่อ>_%s@gmail.com) — คนเหล่านั้นต้องใช้ค่าใหม่ตอนเข้าระบบ", renamed, in.ClinicCode)
-	}
+	// Stated as a RULE with no count. An earlier version reported a number here and it was
+	// always the row count — every account has a suffixed form available, so comparing the two
+	// forms in Go said nothing about collisions. The real list is raised as a NOTICE by the
+	// script, after the database has decided.
+	rep.notef("users: ชื่อล็อกอินที่ซ้ำกับคลินิกอื่นจะถูกเปลี่ยนเป็น <ชื่อ>_%s@gmail.com เฉพาะตัวที่ซ้ำจริง "+
+		"— ตัวที่ไม่ซ้ำใช้ค่าเดิมทุกตัว · รายชื่อที่ถูกเปลี่ยนจริงจะขึ้นเป็น NOTICE ตอนรันสคริปต์", in.ClinicCode)
 	return s.String(), nil
 }
 
@@ -103,6 +107,24 @@ UPDATE import_user_map m
   FROM users u
  WHERE lower(u.email) = lower(m.email)
    AND COALESCE(u.clinic_code, '') = %s;
+
+-- Which logins actually had to change. Raised here and not reported by the generator
+-- because the collision is a fact about the target: the CASE above has just decided it.
+-- The operator needs this list — these are the people whose old login stops working.
+DO $renamed$
+DECLARE
+    changed text;
+    n       int;
+BEGIN
+    SELECT count(*), string_agg(format('%%s → %%s', m.legacy_email, m.email), ', ' ORDER BY m.legacy_email)
+      INTO n, changed
+      FROM import_user_map m WHERE m.email <> m.legacy_email;
+    IF n > 0 THEN
+        RAISE NOTICE 'users: เปลี่ยนชื่อล็อกอิน %% บัญชี เพราะชื่อเดิมเป็นของคลินิกอื่น: %%', n, changed;
+    ELSE
+        RAISE NOTICE 'users: ไม่มีชื่อล็อกอินที่ต้องเปลี่ยน — ทุกบัญชีใช้ค่าเดิม';
+    END IF;
+END $renamed$;
 
 `, lit(clinic))
 	if !strict {
