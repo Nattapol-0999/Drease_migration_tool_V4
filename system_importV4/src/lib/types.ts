@@ -112,7 +112,7 @@ export type ImportGroup = (typeof IMPORT_GROUPS)[number]["group"];
  */
 export interface JobView {
   id: string;
-  kind: "generate" | "import";
+  kind: "generate" | "import" | "survey";
   state: "running" | "done" | "failed";
   /** What the server is doing right now, in words. */
   phase: string;
@@ -130,6 +130,13 @@ export interface JobView {
   target?: string;
   isProduction?: boolean;
   psqlLog?: string;
+  /**
+   * survey: the branch survey itself, carried in the job rather than written to a file.
+   * It is a few kilobytes and the browser needs all of it, unlike a generated script.
+   */
+  survey?: BranchSurvey;
+  sqlBytesIn?: number;
+  mongoBytesIn?: number;
 }
 
 export interface JobStartResponse {

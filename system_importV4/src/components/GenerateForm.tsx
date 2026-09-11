@@ -481,30 +481,60 @@ export default function GenerateForm() {
           : s,
       );
 
-      const res = await fetch("/api/survey-branches", {
+      // A job, not an inline answer. With the Mongo half attached this reads a 921 MB export
+      // and took 8m01s on the deployed box, well past the 100 seconds a proxied request may
+      // stay open. The reason to pay that: the counts that say whether a branch is real —
+      // its lots, bills, receipts, courses — are all in the Mongo file, and it was not being
+      // passed at all, so they read 0 on screen with nothing to show they were never looked
+      // up. A branch with 531 lots looked like a branch holding nothing.
+      const startRes = await fetch("/api/survey-branches", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sessionId: sid }),
       });
-      const text = await res.text();
-      let json: SurveyBranchesResponse;
+      const startText = await startRes.text();
+      let start: { ok?: boolean; jobId?: string; error?: string };
       try {
-        json = JSON.parse(text) as SurveyBranchesResponse;
+        start = JSON.parse(startText) as typeof start;
       } catch {
         setSurveyErr(
-          `เซิร์ฟเวอร์ตอบไม่ใช่ JSON (HTTP ${res.status}) — ${
-            text.trim().slice(0, 300) || "ไม่มีเนื้อหา"
+          `เซิร์ฟเวอร์ตอบไม่ใช่ JSON (HTTP ${startRes.status}) — ${
+            startText.trim().slice(0, 300) || "ไม่มีเนื้อหา"
           }`,
         );
         return;
       }
-      if (!json.ok) {
-        setSurveyErr(json.error);
+      if (!start.ok || !start.jobId) {
+        setSurveyErr(start.error ?? `เริ่มงานสำรวจไม่สำเร็จ (HTTP ${startRes.status})`);
         return;
       }
 
+      const done = await waitForJob(start.jobId, (job) =>
+        setBusyState((s) =>
+          s
+            ? {
+                ...s,
+                phase: job.phase,
+                percent: null,
+                detail: `${job.seconds} วินาที`,
+                note: "อ่านอย่างเดียว ไม่เขียนอะไรทั้งที่นี่และที่ปลายทาง",
+              }
+            : s,
+        ),
+      );
+      if (done.state !== "done") {
+        setSurveyErr(done.error || "อ่านสาขาไม่สำเร็จ");
+        return;
+      }
+      const surveyed = done.survey;
+      if (!surveyed || !Array.isArray(surveyed.branches)) {
+        setSurveyErr("งานสำรวจเสร็จแล้วแต่ไม่มีผลกลับมา — ดู log ของเซิร์ฟเวอร์");
+        return;
+      }
+      const json = { survey: surveyed };
+
       setSurvey(json.survey);
-      setSurveySeconds(json.seconds);
+      setSurveySeconds(done.seconds);
 
       // EVERY branch the registry lists is ticked. The tenant's branches are a fact about
       // the tenant, and a branch left out has its patients, rooms and bills land on some

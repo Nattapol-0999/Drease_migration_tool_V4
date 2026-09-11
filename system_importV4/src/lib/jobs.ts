@@ -22,7 +22,7 @@ import { stagingRoot } from "./upload-staging";
  * child process died with it.
  */
 
-export type JobKind = "generate" | "import";
+export type JobKind = "generate" | "import" | "survey";
 export type JobState = "running" | "done" | "failed";
 
 interface Job {
@@ -52,6 +52,21 @@ interface Job {
   target?: string;
   isProduction?: boolean;
   psqlLog?: string;
+
+  // survey
+  //
+  // Kept as the parsed object rather than a path: it is a few kilobytes, the browser needs
+  // all of it, and unlike a generated script there is no reason to keep it off the wire.
+  //
+  // The survey became a job when it started reading the Mongo half. On the branch table
+  // alone it answers in a second, which is why it used to run inline — but the counts that
+  // decide whether a branch is real (its lots, bills, receipts, courses) all live in Mongo,
+  // and parsing a 921 MB export took 8m01s here. Inline that is a 524 from the proxy at 100
+  // seconds, and before this it simply was not passed at all: every Mongo-derived number on
+  // screen read 0, which looks exactly like a branch holding nothing.
+  survey?: unknown;
+  sqlBytesIn?: number;
+  mongoBytesIn?: number;
 }
 
 /** What the browser is allowed to see. Never carries the script itself. */
@@ -71,6 +86,9 @@ export interface JobView {
   target?: string;
   isProduction?: boolean;
   psqlLog?: string;
+  survey?: unknown;
+  sqlBytesIn?: number;
+  mongoBytesIn?: number;
 }
 
 /** Finished jobs (and their artifacts) are kept this long, then swept. */
@@ -103,6 +121,9 @@ export function jobView(j: Job): JobView {
     target: j.target,
     isProduction: j.isProduction,
     psqlLog: j.psqlLog,
+    survey: j.survey,
+    sqlBytesIn: j.sqlBytesIn,
+    mongoBytesIn: j.mongoBytesIn,
   };
 }
 
@@ -131,6 +152,8 @@ export interface JobHandle {
   }): void;
   /** import only. */
   setImportResult(r: { target: string; isProduction: boolean; psqlLog: string }): void;
+  /** survey only: the parsed branch survey plus the sizes it was read from. */
+  setSurveyResult(r: { survey: unknown; sqlBytes: number; mongoBytes: number }): void;
 }
 
 /**
@@ -182,6 +205,11 @@ export async function startJob(
       job.target = r.target;
       job.isProduction = r.isProduction;
       job.psqlLog = r.psqlLog;
+    },
+    setSurveyResult: (r) => {
+      job.survey = r.survey;
+      job.sqlBytesIn = r.sqlBytes;
+      job.mongoBytesIn = r.mongoBytes;
     },
   };
 
