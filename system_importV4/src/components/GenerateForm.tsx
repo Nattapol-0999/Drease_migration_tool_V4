@@ -1724,7 +1724,58 @@ export default function GenerateForm() {
                             )}
                           </li>
                         ) : null}
+                        {/* Not a warning: these ARE imported. It is here so nobody has to
+                            work out later why a photo they can see is one they could not
+                            upload today. */}
+                        {photoSurvey.wouldRejectCount ? (
+                          <li>
+                            นำเข้าอยู่ แต่ปุ่มอัปโหลดในแอปวันนี้จะปฏิเสธ{" "}
+                            {photoSurvey.wouldRejectCount} ไฟล์ (เกิน 3 MB{" "}
+                            {photoSurvey.oversizeCount} · ไม่ใช่ JPG/PNG{" "}
+                            {photoSurvey.unsupportedCount}) —{" "}
+                            <span className="muted">
+                              รูปที่หมอแนบไปแล้วยังอยู่ในเวชระเบียนและเปิดดูได้ปกติ
+                            </span>
+                          </li>
+                        ) : null}
+                        {photoSurvey.extMismatchCount ? (
+                          <li>
+                            นามสกุลไม่ตรงกับไบต์จริง {photoSurvey.extMismatchCount} ไฟล์ —{" "}
+                            <span className="muted">
+                              Content-Type ที่ส่งจะผิด แต่เบราว์เซอร์ตรวจเองจึงยังแสดงได้
+                            </span>
+                          </li>
+                        ) : null}
                       </ul>
+                      {photoSurvey.wouldReject && photoSurvey.wouldReject.length > 0 && (
+                        <details>
+                          <summary className="muted" style={{ cursor: "pointer", fontSize: 12 }}>
+                            ดูรายการที่อัปโหลดใหม่ไม่ได้ ({photoSurvey.wouldRejectCount} ไฟล์)
+                          </summary>
+                          <pre
+                            style={{
+                              background: "var(--panel-2)",
+                              border: "1px solid var(--border)",
+                              borderRadius: 6,
+                              padding: 10,
+                              marginTop: 6,
+                              overflowX: "auto",
+                              fontSize: 11,
+                              whiteSpace: "pre-wrap",
+                              maxHeight: 200,
+                            }}
+                          >
+                            {photoSurvey.wouldReject
+                              .map((w) => `hn ${w.hn}  ${w.reason}`)
+                              .join("\n")}
+                            {/* The count is optional on the failure branch of the response
+                                type, so it is defaulted rather than asserted. */}
+                            {(photoSurvey.wouldRejectCount ?? 0) > photoSurvey.wouldReject.length
+                              ? `\n… อีก ${(photoSurvey.wouldRejectCount ?? 0) - photoSurvey.wouldReject.length} รายการ`
+                              : ""}
+                          </pre>
+                        </details>
+                      )}
                       {photoSurvey.missing && photoSurvey.missing.length > 0 && (
                         <>
                           <b>

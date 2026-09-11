@@ -159,6 +159,14 @@ export async function POST(req: Request): Promise<Response> {
       extraCount: survey.extraCount,
       extraSample: survey.extraSample,
       totalBytes: survey.totalBytes,
+      // Imported anyway, but reported: these are the images today's upload endpoint would
+      // turn away (3 MB / JPG-PNG only). Capped in the response because the list is for
+      // recognising a pattern, not for reading end to end.
+      wouldReject: survey.wouldReject.slice(0, 50),
+      wouldRejectCount: survey.wouldReject.length,
+      oversizeCount: survey.oversizeCount,
+      unsupportedCount: survey.unsupportedCount,
+      extMismatchCount: survey.extMismatch.length,
       rows,
       report,
     };

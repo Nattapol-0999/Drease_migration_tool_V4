@@ -22,7 +22,7 @@ import "server-only";
 // would drift, and the one that drifts silently is the one writing medical records.
 
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, copyFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, rm, stat, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -107,11 +107,63 @@ export { TARGET_IDS };
 
 // ── the survey ───────────────────────────────────────────────────────────────
 
+/**
+ * What the LIVE upload endpoint would refuse.
+ *
+ * POST /v3/opd-record/:hn/photo enforces two things a legacy image never had to satisfy:
+ * 3 MB (maxPhotoBytes) and JPEG-or-PNG only (opdPhotoExt — narrower than the rest of the
+ * app because a clinical photo has to yield a thumbnail, and MakeThumbnail decodes those
+ * two formats only).
+ *
+ * These are REPORTED, not enforced. The clinic owner's call: an image a doctor already
+ * attached belongs in the record, and the read path agrees — ServePhoto streams bytes and
+ * never consults the allow-list, so a legacy .gif keeps rendering. Refusing it here would
+ * delete history to satisfy a rule that only governs new uploads.
+ *
+ * Worth surfacing anyway, because it answers "why can I see this photo but not re-upload
+ * one like it", which is otherwise a mystery.
+ */
+const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
+
+/** sniffImage names the format from the file's own first bytes, like http.DetectContentType. */
+async function sniffImage(abs: string): Promise<string> {
+  // 12 bytes covers every signature below, including WebP's "RIFF....WEBP".
+  const fh = await open(abs, "r");
+  try {
+    const buf = Buffer.alloc(12);
+    const { bytesRead } = await fh.read(buf, 0, 12, 0);
+    const b = buf.subarray(0, bytesRead);
+    if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+    if (b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
+      return "image/png";
+    if (b.length >= 4 && b.subarray(0, 4).toString("latin1") === "GIF8") return "image/gif";
+    if (b.length >= 12 && b.subarray(0, 4).toString("latin1") === "RIFF" &&
+        b.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+    if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4d) return "image/bmp";
+    if (b.length >= 4 && (b.subarray(0, 4).toString("hex") === "49492a00" ||
+                          b.subarray(0, 4).toString("hex") === "4d4d002a")) return "image/tiff";
+    return "unknown";
+  } finally {
+    await fh.close();
+  }
+}
+
 export interface SurveyFile {
   hn: string;
   source_url: string;
   target_path: string;
   bytes: number;
+  /** Sniffed from the file's own bytes, never from its name. */
+  mime: string;
+}
+
+/** One image the live upload endpoint would turn away, with the reason. */
+export interface WouldRejectFile {
+  hn: string;
+  target_path: string;
+  bytes: number;
+  mime: string;
+  reason: string;
 }
 
 export interface Survey {
@@ -123,6 +175,19 @@ export interface Survey {
   extraCount: number;
   extraSample: string[];
   totalBytes: number;
+  /**
+   * Imported anyway. See MAX_PHOTO_BYTES: these are the images the upload endpoint would
+   * reject today, listed so nobody has to guess why later.
+   */
+  wouldReject: WouldRejectFile[];
+  oversizeCount: number;
+  unsupportedCount: number;
+  /**
+   * file_path ends .jpg but the bytes are a PNG, or the reverse. ServePhoto picks the
+   * Content-Type from the extension, so the header would be wrong — browsers sniff and
+   * still render it, which is why this is a note and not a failure.
+   */
+  extMismatch: { target_path: string; mime: string }[];
 }
 
 /**
@@ -135,20 +200,58 @@ export interface Survey {
 export async function surveyArchive(manifest: Manifest, root: string): Promise<Survey> {
   const matched: SurveyFile[] = [];
   const missing: Survey["missing"] = [];
+  const wouldReject: WouldRejectFile[] = [];
+  const extMismatch: Survey["extMismatch"] = [];
   let totalBytes = 0;
+  let oversizeCount = 0;
+  let unsupportedCount = 0;
 
   for (const f of manifest.files) {
     const abs = join(root, f.source_path);
     try {
       const st = await stat(abs);
       if (!st.isFile()) throw new Error("not a file");
+      const mime = await sniffImage(abs);
       matched.push({
         hn: f.hn,
         source_url: f.source_url,
         target_path: f.target_path,
         bytes: st.size,
+        mime,
       });
       totalBytes += st.size;
+
+      // Reported, never enforced. Both counted separately because they are different
+      // problems: one is a photo too big to re-upload, the other a format the new
+      // thumbnailer cannot read.
+      const supported = mime === "image/jpeg" || mime === "image/png";
+      if (!supported) {
+        unsupportedCount++;
+        wouldReject.push({
+          hn: f.hn,
+          target_path: f.target_path,
+          bytes: st.size,
+          mime,
+          reason: `ชนิดไฟล์ ${mime} — endpoint อัปโหลดรับเฉพาะ JPG/PNG`,
+        });
+      } else if (st.size > MAX_PHOTO_BYTES) {
+        oversizeCount++;
+        wouldReject.push({
+          hn: f.hn,
+          target_path: f.target_path,
+          bytes: st.size,
+          mime,
+          reason: `${(st.size / 1024 / 1024).toFixed(1)} MB — endpoint อัปโหลดจำกัด 3 MB`,
+        });
+      }
+
+      // The extension came from the legacy `url`; the bytes are what they are.
+      const lower = f.target_path.toLowerCase();
+      const claimsPng = lower.endsWith(".png");
+      const claimsJpg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+      if ((claimsPng && mime === "image/jpeg") || (claimsJpg && mime === "image/png")) {
+        extMismatch.push({ target_path: f.target_path, mime });
+      }
     } catch {
       missing.push({ hn: f.hn, source_url: f.source_url, expected_path: f.source_path });
     }
@@ -165,6 +268,10 @@ export async function surveyArchive(manifest: Manifest, root: string): Promise<S
     extraCount: extras.length,
     extraSample: extras.slice(0, 10),
     totalBytes,
+    wouldReject,
+    oversizeCount,
+    unsupportedCount,
+    extMismatch,
   };
 }
 
@@ -364,6 +471,18 @@ function intOrNull(s: string | undefined): string {
  *   - visit_id NULL. See page.go: SaveMedia hard-deletes a visit's rows before rewriting
  *     them, so a row bound to a visit would be destroyed the first time a doctor saved
  *     media there.
+ *   - branch_code read from the patient, in SQL, at insert time. The legacy page export
+ *     does not say which branch a scan belongs to, but the patient it belongs to does, and
+ *     that is the same answer: a scan is filed at the branch that holds the record. Doing
+ *     it as a subquery keeps the CLI and the manifest out of it, and it is exact rather
+ *     than a guess because uq_patient_clinic_hn is UNIQUE on (clinic_code, "HN") — the
+ *     lookup can match one row or none.
+ *     NULL when the patient is not there yet (photos have no FK to patient, and a
+ *     photos-only run into a clinic whose patients come later is allowed).
+ *     NOTE ON WIDTH: patient.branch_code is varchar(20), photos.branch_code varchar(16).
+ *     Real codes are BR00001-shaped (7 chars) so this does not bite, and it is left to
+ *     fail loudly rather than truncated — a silently shortened code points at no branch or
+ *     the wrong one, which is worse than a refused transaction.
  *   - consent_given true, by the clinic owner's decision.
  *   - One transaction, with a guard that the clinic exists first. `photos` has no foreign
  *     key to `clinic`, so a wrong clinic_code would insert rows that no tenant can ever
@@ -382,6 +501,21 @@ export function buildInsertSQL(
   out.push(`-- clinic_code : ${clinic}`);
   out.push(`-- รูป         : ${survey.matched.length} ไฟล์ (rev ล่าสุดของแต่ละหน้า)`);
   out.push("--");
+  if (survey.wouldReject.length > 0) {
+    out.push(
+      `-- นำเข้าอยู่ แต่ endpoint อัปโหลดวันนี้จะปฏิเสธ ${survey.wouldReject.length} ไฟล์ ` +
+        `(เกิน 3 MB: ${survey.oversizeCount} · ไม่ใช่ JPG/PNG: ${survey.unsupportedCount}) —`,
+    );
+    out.push("-- รูปที่หมอแนบไปแล้วยังควรอยู่ในเวชระเบียน และ ServePhoto ส่งไบต์ตรง ๆ ไม่ดูรายการชนิดไฟล์");
+    out.push("--");
+  }
+  if (survey.extMismatch.length > 0) {
+    out.push(
+      `-- นามสกุลไม่ตรงกับไบต์จริง ${survey.extMismatch.length} ไฟล์ — Content-Type ที่ส่งจะผิด ` +
+        "แต่เบราว์เซอร์ sniff เองจึงยังแสดงได้",
+    );
+    out.push("--");
+  }
   out.push("-- ไบต์ของรูปถูกคัดลอกขึ้นเครื่องปลายทางก่อนสคริปต์นี้จะรัน — แถวที่ไม่มีไฟล์คู่กัน");
   out.push("-- คือรูปเสียในเวชระเบียน จึงไม่มีแถวใดถูกเขียนก่อนไฟล์ถึงที่");
   out.push("--");
@@ -418,10 +552,12 @@ export function buildInsertSQL(
 
     out.push(`-- hn ${f.hn} · ${f.source_url}`);
     out.push(
-      `INSERT INTO photos (clinic_code, hn, visit_id, area_tag, kind, file_path, thumb_path,
-                    file_size, consent_given, note, doctor_code, created_by, taken_at,
-                    annotations, created_at, updated_at)
-SELECT ${c}, ${hn}, NULL, ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, 'note',
+      `INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
+                    thumb_path, file_size, consent_given, note, doctor_code, created_by,
+                    taken_at, annotations, created_at, updated_at)
+SELECT ${c}, ${hn},
+       (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
+       NULL, ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, 'note',
        ${lit(f.target_path)}, NULL,
        ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
        '[]'::jsonb, now(), now()
@@ -434,6 +570,29 @@ WHERE NOT EXISTS (
     out.push("");
   }
 
+  // How many rows ended up with no branch. Raised rather than left to be noticed later: a
+  // photos-only run into a clinic whose patients have not been imported yet resolves NOTHING,
+  // and every row would silently sit outside every branch filter. The count is the only way
+  // to tell that apart from a normal run.
+  out.push("-- สาขาที่ผูกได้จริง (อ่านจาก patient ของ HN นั้น ตอน insert)");
+  out.push("DO $branch$");
+  out.push("DECLARE");
+  out.push("    n     bigint;");
+  out.push("    total bigint;");
+  out.push("BEGIN");
+  out.push("    SELECT count(*) FILTER (WHERE branch_code IS NULL), count(*)");
+  out.push("      INTO n, total");
+  out.push(`      FROM photos WHERE clinic_code = ${lit(clinic)};`);
+  out.push("    IF n > 0 THEN");
+  out.push(
+    "        RAISE NOTICE 'photos: % จาก % แถวยังไม่มี branch_code เพราะหา patient ของ HN นั้นไม่เจอ" +
+      " — นำเข้ากลุ่ม patients ก่อนแล้วรูปรอบถัดไปจะผูกสาขาได้', n, total;",
+  );
+  out.push("    ELSE");
+  out.push("        RAISE NOTICE 'photos: ผูกสาขาได้ครบทั้ง % แถว', total;");
+  out.push("    END IF;");
+  out.push("END $branch$;");
+  out.push("");
   out.push("COMMIT;");
   out.push("");
   return { sql: out.join("\n"), rows };

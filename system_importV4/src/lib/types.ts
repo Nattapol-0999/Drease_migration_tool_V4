@@ -500,10 +500,32 @@ interface PhotoImportBase {
   extraCount: number;
   extraSample: string[];
   totalBytes: number;
+  /**
+   * Images that ARE imported but that POST /v3/opd-record/:hn/photo would refuse today:
+   * over 3 MB, or a format other than JPEG/PNG. Reported because an image a doctor already
+   * attached belongs in the record and the read path serves it regardless — but somebody
+   * will eventually ask why they cannot re-upload one like it.
+   */
+  wouldReject: PhotoWouldReject[];
+  wouldRejectCount: number;
+  oversizeCount: number;
+  unsupportedCount: number;
+  /** file_path ends .jpg while the bytes are PNG, or the reverse. Renders; header is wrong. */
+  extMismatchCount: number;
   /** How many INSERT statements the script holds (one per matched image). */
   rows: number;
   /** The CLI's own stdout: counts, skipped revisions, warnings. */
   report: string;
+}
+
+/** One image the live upload endpoint would turn away, with the reason in Thai. */
+export interface PhotoWouldReject {
+  hn: string;
+  target_path: string;
+  bytes: number;
+  /** Sniffed from the file's own first bytes, never from its name. */
+  mime: string;
+  reason: string;
 }
 
 export type PhotoImportResponse =
