@@ -81,8 +81,11 @@ type mongoCatalog struct {
 	kindName     map[string]string // _id → name
 	itemTypeName map[string]string // _id → name
 	itemUnitName map[string]string // _id → name
-	stockBranch  map[string]string // _id → stock_branch ('01', 'center')
-	healCode     map[string]string // listheals _id → code (LHxxx)
+	// No stockBranch index here on purpose. Where a lot lives is decided by
+	// branch.stock_id in the SQL `branch` table (see stockOwners), not by the
+	// stocks.stock_branch string — keeping a second, weaker source of the same answer is
+	// how the two drift.
+	healCode map[string]string // listheals _id → code (LHxxx)
 
 	// The money half of the same file. Parsed here so a 26 MB export is read ONCE;
 	// mapped in money.go, which is where the decisions about it live.
@@ -137,14 +140,14 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 		kindName:     indexNames(byName, "kind", "name"),
 		itemTypeName: indexNames(byName, "item_types", "name"),
 		itemUnitName: indexNames(byName, "item_units", "name"),
-		stockBranch:  indexNames(byName, "stocks", "stock_branch"),
-		healCode:     map[string]string{},
-		bills:        byName["bills"],
-		payments:     byName["payment_summary"],
-		courseBills:  byName["course_bills"],
-		courseCode:   map[string]string{},
-		courseName:   map[string]string{},
-		healName:     map[string]string{},
+
+		healCode:    map[string]string{},
+		bills:       byName["bills"],
+		payments:    byName["payment_summary"],
+		courseBills: byName["course_bills"],
+		courseCode:  map[string]string{},
+		courseName:  map[string]string{},
+		healName:    map[string]string{},
 	}
 	for _, d := range mc.listheals {
 		id := docObjectID(d, "_id")
@@ -374,9 +377,21 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 	eItems.SourceRows = len(mc.items)
 	eSlot.SourceRows = len(mc.items)
 
+	// Which branch owns which stock, from the SQL side (branch.stock_id). Read before the
+	// loop because every lot needs it, and a broken branch table must stop the build rather
+	// than silently make every lot look central.
+	stockOwner, oerr := stockOwners(in)
+	if oerr != nil {
+		return "", "", "", oerr
+	}
+
 	var sItems, sCatalog, sSlot sqlBuilder
 	firstSeen := map[string]bool{}
 	noBranch, draft := 0, 0
+	// mainStockLots counts lots in stocks no branch claims; untickedLots counts, per legacy
+	// branch, the lots dropped because that branch is not part of this clinic.
+	mainStockLots := 0
+	untickedLots := map[string]int{}
 
 	for n, d := range mc.items {
 		code := d.Text("code")
@@ -434,21 +449,43 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 				tsLit(d.Text("createdAt"), "now()")))
 		}
 
-		// One lot per document. branch_code comes from the stock the lot sits in;
-		// slot_stock CHECKs it is non-empty, so a lot with no resolvable stock is
-		// reported instead of written with a blank branch.
+		// One lot per document, and the whole question is which shelf it is on. Stock is
+		// physical: a lot filed at the wrong branch is a box the staff there cannot find,
+		// and slot_stock CHECKs branch_code is non-empty so there is no "unknown" to fall
+		// back on.
 		//
-		// The stock's value is the LEGACY branch code, so it is translated — a lot filed
-		// under "01" would point at a branch V4 does not have. Resolved only after the
-		// blank check, because "no stock at all" and "stock in an unmapped branch" are
-		// different problems and only the first one drops the lot.
-		legacyBranch := mc.stockBranch[docObjectID(d, "stock")]
-		if legacyBranch == "" {
+		// Three outcomes, from the stock the lot points at:
+		//
+		//  1. no stock reference at all → dropped. Nothing says where the box is.
+		//  2. a stock no branch claims  → MAIN_STOCK, V4's central warehouse. Not the
+		//     default branch: putting the warehouse's 566 lots on one branch's shelf both
+		//     misplaces them and inflates that clinic's "รวมทุกสาขา" value, which V4
+		//     deliberately computes without MAIN_STOCK.
+		//  3. a stock owned by a branch → that branch, translated through the map.
+		//     UNLESS the branch was not created in this clinic, in which case the lot is
+		//     dropped and counted rather than parked on the default branch. A branch left
+		//     out of the tick list is being imported as its OWN clinic (different legal
+		//     entity, its own TIN), and its lots arrive there. Keeping a copy here would
+		//     put the same physical boxes in two clinics at once.
+		stockID := docObjectID(d, "stock")
+		if stockID == "" {
 			noBranch++
-			eSlot.skip("ไม่รู้ว่าอยู่คลังไหน (stock ไม่ resolve)")
+			eSlot.skip("ไม่มี stock ในเอกสาร จึงไม่รู้ว่าอยู่คลังไหน")
 			continue
 		}
-		branch := br.resolve(legacyBranch)
+		legacyBranch, ownedByBranch := stockOwner[stockID]
+		var branch string
+		switch {
+		case !ownedByBranch:
+			branch = MainStockBranchCode
+			mainStockLots++
+		case !knowsBranch(in, legacyBranch):
+			untickedLots[legacyBranch]++
+			eSlot.skip("คลังของสาขา " + legacyBranch + " ที่ไม่ได้เลือกนำเข้ารอบนี้")
+			continue
+		default:
+			branch = br.resolve(legacyBranch)
+		}
 
 		doc, derr := slotDoc(d, mongoID)
 		if derr != nil {
@@ -483,10 +520,34 @@ ON CONFLICT (mongo_id) DO NOTHING;
 	if noBranch > 0 {
 		rep.warnf("slot_stock: %d ล็อตไม่รู้คลังต้นทาง จึงไม่ถูก import (slot_stock บังคับ branch_code ต้องไม่ว่าง)", noBranch)
 	}
-	rep.notef("items: %d เอกสาร → %d SKU (ที่เหลือคือล็อตของ code เดิม → slot_stock)", len(mc.items), len(firstSeen))
-	if branches := distinctValues(mc.stockBranch); len(branches) > 0 {
-		rep.notef("slot_stock: branch_code มาจาก stocks.stock_branch ตามต้นทาง (%s)", strings.Join(branches, ", "))
+	if mainStockLots > 0 {
+		rep.notef("slot_stock: %d ล็อตอยู่ในคลังที่ไม่ได้เป็นของสาขาใด → เข้าคลังหลัก %s ตามที่ V4 ใช้ · "+
+			"หน้าสต็อกของ V4 ไม่นับคลังหลักในยอด \"รวมทุกสาขา\" โดยเจตนา ของจึงไม่ไปโป่งอยู่ที่สาขาใดสาขาหนึ่ง",
+			mainStockLots, MainStockBranchCode)
 	}
+	if len(untickedLots) > 0 {
+		codes := make([]string, 0, len(untickedLots))
+		total := 0
+		for c := range untickedLots {
+			codes = append(codes, c)
+		}
+		sort.Strings(codes)
+		parts := make([]string, 0, len(codes))
+		for _, c := range codes {
+			parts = append(parts, fmt.Sprintf("%s (%d ล็อต)", c, untickedLots[c]))
+			total += untickedLots[c]
+		}
+		// A note, not a warning: this is the chosen behaviour, not a problem with the file.
+		// The count is here so the second import can be checked against it — those lots
+		// must appear there, and appear exactly once.
+		rep.notef("slot_stock: ไม่นำเข้า %d ล็อตของสาขาที่ไม่ได้เลือกรอบนี้ — %s · "+
+			"ของอยู่ที่ชั้นวางของสาขานั้นจริง ซึ่งไม่มีในคลินิกนี้ ถ้าเอามาวางที่สาขาหลักจะทั้งบอกตำแหน่งผิด "+
+			"และซ้ำกับตอน import สาขานั้นเป็นคลินิกของตัวเอง",
+			total, strings.Join(parts, ", "))
+	}
+	rep.notef("items: %d เอกสาร → %d SKU (ที่เหลือคือล็อตของ code เดิม → slot_stock)", len(mc.items), len(firstSeen))
+	rep.notef("slot_stock: คลังของแต่ละสาขามาจาก branch.stock_id ในตาราง branch (ไม่ได้อ่านจากสตริง stocks.stock_branch) · "+
+		"พบสาขาที่มีคลังผูกไว้ %d สาขา", len(stockOwner))
 	return sItems.String(), sCatalog.String(), sSlot.String(), nil
 }
 

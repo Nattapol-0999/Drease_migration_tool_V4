@@ -160,3 +160,54 @@ func branchByHN(rows []legacydump.Row) map[string]string {
 	}
 	return out
 }
+
+/**
+ * stockOwners answers "which branch does this stock belong to" from the SQL side.
+ *
+ * The legacy `branch` table carries stock_id, and it holds the Mongo _id of that branch's
+ * document in the `stocks` collection. That reference is the real statement of ownership,
+ * so it is what decides where a lot lives:
+ *
+ *	lot.stock IS in branch.stock_id  → that branch's shelf
+ *	lot.stock is NOT in it           → no branch claims it = the central warehouse
+ *
+ * The alternative was reading stocks.stock_branch, a string holding either a branch code or
+ * 'center'. Both agree on the export this was written against — every branch stock's
+ * stock_branch equals its branch_code, and the single unclaimed stock is exactly the one
+ * saying 'center'. The reference is still the better rule: 'center' is a label this tenant
+ * happened to type, and the next one may not.
+ *
+ * Returns stock_id → legacy branch_code. A missing or unparsable branch table yields an
+ * empty map, which the caller must treat as "cannot tell", NOT as "everything is central".
+ */
+func stockOwners(in Input) (map[string]string, error) {
+	if len(in.BranchDump) == 0 {
+		return map[string]string{}, nil
+	}
+	_, rows, err := legacydump.Parse(string(in.BranchDump), "branch")
+	if err != nil {
+		return nil, fmt.Errorf("อ่านตาราง branch เพื่อหาคลังของแต่ละสาขาไม่ได้: %w", err)
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		stockID := strings.TrimSpace(r.Get("stock_id"))
+		code := strings.TrimSpace(r.Get("branch_code"))
+		if stockID == "" || code == "" {
+			continue
+		}
+		out[stockID] = code
+	}
+	return out, nil
+}
+
+// knowsBranch reports whether the caller created this legacy branch in the target clinic.
+//
+// With no map at all this is the single-branch import that predates branch mapping, and
+// every row goes to the one branch that exists — so it answers true and nothing changes.
+func knowsBranch(in Input, legacy string) bool {
+	if len(in.BranchMap) == 0 {
+		return true
+	}
+	_, ok := in.BranchMap[strings.TrimSpace(legacy)]
+	return ok
+}

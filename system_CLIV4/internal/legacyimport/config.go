@@ -16,6 +16,18 @@ const (
 	// only ever uses '01', so there is one branch per migrated clinic.
 	BranchCode = "01"
 
+	// MainStockBranchCode is where stock that belongs to NO branch goes. It is V4's
+	// reserved inventory location (internal/controller/stock/handler.go), deliberately
+	// absent from the clinic's branch table, which is why it consumes no branch quota and
+	// why the stock page keeps it out of the "รวมทุกสาขา" total.
+	//
+	// The legacy side has the same idea: the SQL `branch` table names each branch's stock
+	// through branch.stock_id, and the one stock no branch claims is the central warehouse
+	// (`stocks.stock_branch = 'center'` in the export this was built from — 566 of 3,350
+	// lots). The link is what decides this, not the string: 'center' is a label one tenant
+	// happened to use, while stock_id is a real reference.
+	MainStockBranchCode = "MAIN_STOCK"
+
 	// RoleKeyOwner / RoleKeyStaff are the built-in role_presets keys assigned during
 	// import. The legacy dump carries no role information, so exactly ONE account —
 	// the one whose legacy `code` equals Input.OwnerUsername — becomes the owner and

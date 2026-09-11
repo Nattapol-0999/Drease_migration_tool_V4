@@ -349,3 +349,163 @@ func TestSurveyIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// ── where a stock lot lives ───────────────────────────────────────────────────────────
+//
+// The SQL `branch` table names each branch's stock through branch.stock_id, which holds the
+// Mongo _id of that branch's document in the `stocks` collection. That reference decides a
+// lot's location:
+//
+//	lot.stock IS in branch.stock_id  → that branch's shelf
+//	lot.stock is NOT in it           → no branch claims it = the central warehouse
+//
+// The earlier rule read the stocks.stock_branch string instead. Both agree on the real
+// export — every branch stock's stock_branch equals its branch_code, and the one unclaimed
+// stock is exactly the one saying 'center' — but the string is a label one tenant happened
+// to type, and reading it filed 566 warehouse lots under unknown_in_data as if 'center' were
+// a mistyped branch code.
+
+// branchRegistryWithStocks is the same nine branches, with the stock_id column populated
+// using the real ObjectIds from the export.
+func branchRegistryWithStocks() []byte {
+	return []byte("INSERT INTO `branch` (`branch_code`, `branch_name`, `branch_name_th`, " +
+		"`branch_tax_identification`, `active`, `stock_id`) VALUES\n" +
+		"('00', 'แผนกการตลาด', '', '', 1, '6951146297539e2d28bc0a22'),\n" +
+		"('01', 'สาขา พระราม 9', 'บริษัท แอนจาลี จำกัด', '0105558054530', 1, '63608c6c7796354dbae69c55'),\n" +
+		"('02', 'สาขา เกษตรนวมินทร์', 'บจก. แอนจาลี', '0105558054530', 1, '63608c99e3553b4da0676c4d'),\n" +
+		"('03', 'สาขา ราชพฤกษ์', 'บริษัท เอเจสองสี่ จำกัด', '0105566027191', 1, '64128720030d9b36ce99cd57'),\n" +
+		"('04', 'สาขา ชิดลม', 'บริษัท แอนจาลี จำกัด', '0105558054530', 1, '660a55b65a0fdc487be92ba2'),\n" +
+		"('06', 'สาขา รังสิต', 'บริษัท เอเจห้าหก จำกัด', '0135568021863', 1, '68c7c642974f3dbb950d44ab');\n")
+}
+
+func TestStockOwnersReadsEachBranchesStockFromTheBranchTable(t *testing.T) {
+	got, err := stockOwners(Input{BranchDump: branchRegistryWithStocks()})
+	if err != nil {
+		t.Fatalf("stockOwners: %v", err)
+	}
+	want := map[string]string{
+		"6951146297539e2d28bc0a22": "00",
+		"63608c6c7796354dbae69c55": "01",
+		"63608c99e3553b4da0676c4d": "02",
+		"64128720030d9b36ce99cd57": "03",
+		"660a55b65a0fdc487be92ba2": "04",
+		"68c7c642974f3dbb950d44ab": "06",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("stockOwners returned %d entries, want %d: %v", len(got), len(want), got)
+	}
+	for id, code := range want {
+		if got[id] != code {
+			t.Errorf("stock %s → %q, want %q", id, got[id], code)
+		}
+	}
+	// A stock nobody listed must be absent rather than mapped to anything — that absence is
+	// what identifies the central warehouse.
+	if code, present := got["5fab83eebb59bca34e513211"]; present {
+		t.Errorf("the warehouse stock resolved to branch %q; it must not be in the map at all", code)
+	}
+}
+
+func TestStockOwnersWithNoBranchTableCannotTellRatherThanGuessing(t *testing.T) {
+	// An empty map must mean "no information". A caller that read it as "no branch owns
+	// anything" would send every lot to the warehouse.
+	got, err := stockOwners(Input{})
+	if err != nil {
+		t.Fatalf("stockOwners with no dump must not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries from no branch table, want 0", len(got))
+	}
+}
+
+func TestKnowsBranchTellsWhetherTheBranchWasCreatedInThisClinic(t *testing.T) {
+	// The tick list decides this. A branch left out is being imported as its own clinic, so
+	// its rows have no home here.
+	in := Input{BranchMap: map[string]string{
+		"00": "BR00001", "01": "BR00002", "02": "BR00003",
+		"04": "BR00004", "05": "BR00005", "07": "BR00006", "08": "BR00007",
+	}}
+	for _, ticked := range []string{"00", "01", "02", "04", "05", "07", "08"} {
+		if !knowsBranch(in, ticked) {
+			t.Errorf("branch %q was created but knowsBranch said no", ticked)
+		}
+	}
+	for _, unticked := range []string{"03", "06"} {
+		if knowsBranch(in, unticked) {
+			t.Errorf("branch %q was NOT created but knowsBranch said yes", unticked)
+		}
+	}
+}
+
+func TestKnowsBranchWithNoMapKeepsTheSingleBranchImportWorking(t *testing.T) {
+	// Every import before branch mapping supplied no map and sent everything to the one
+	// branch that existed. Answering false here would start dropping lots from imports that
+	// used to work.
+	in := Input{}
+	for _, any := range []string{"01", "03", "center", "", "99"} {
+		if !knowsBranch(in, any) {
+			t.Errorf("with no branch map, knowsBranch(%q) = false — it must not drop anything", any)
+		}
+	}
+}
+
+func TestSurveyCountsWarehouseLotsApartFromBranchLotsAndNotAsErrors(t *testing.T) {
+	// Lots live in the Mongo `items` collection, one document per lot, each pointing at the
+	// stock it sits in. Three of these belong to branches, two to a stock no branch claims.
+	mongo := []byte(`db.getCollection("items").insert([
+  { _id: ObjectId("aa0000000000000000000001"), code: "D001", stock: ObjectId("63608c6c7796354dbae69c55") },
+  { _id: ObjectId("aa0000000000000000000002"), code: "D002", stock: ObjectId("63608c6c7796354dbae69c55") },
+  { _id: ObjectId("aa0000000000000000000003"), code: "D003", stock: ObjectId("660a55b65a0fdc487be92ba2") },
+  { _id: ObjectId("aa0000000000000000000004"), code: "D004", stock: ObjectId("5fab83eebb59bca34e513211") },
+  { _id: ObjectId("aa0000000000000000000005"), code: "D005", stock: ObjectId("5fab83eebb59bca34e513211") }
+]);
+`)
+
+	s, err := SurveyBranches(Input{BranchDump: branchRegistryWithStocks(), MongoDump: mongo})
+	if err != nil {
+		t.Fatalf("survey: %v", err)
+	}
+
+	byCode := map[string]BranchInfo{}
+	for _, b := range s.Branches {
+		byCode[b.Code] = b
+	}
+	if byCode["01"].StockLots != 2 {
+		t.Errorf("branch 01 lots = %d, want 2", byCode["01"].StockLots)
+	}
+	if byCode["04"].StockLots != 1 {
+		t.Errorf("branch 04 lots = %d, want 1", byCode["04"].StockLots)
+	}
+	if s.MainStockLots != 2 {
+		t.Errorf("main_stock_lots = %d, want 2", s.MainStockLots)
+	}
+
+	// The decisive assertion: the warehouse must NOT be reported as a mistyped branch code.
+	// Reading stocks.stock_branch put 'center' here with 566 rows against it.
+	for code := range s.UnknownInData {
+		if code == "center" || code == "5fab83eebb59bca34e513211" {
+			t.Errorf("the warehouse appears in unknown_in_data as %q — it is not a data error", code)
+		}
+	}
+
+	if !strings.Contains(s.Text(), "คลังหลัก") {
+		t.Error("the printed survey does not mention the warehouse lots")
+	}
+}
+
+func TestSurveyDoesNotClassifyLotsWhenTheBranchRegistryIsMissing(t *testing.T) {
+	// With no registry there is nothing to compare a stock against. Calling every lot
+	// central would be a guess presented as a finding.
+	mongo := []byte(`db.getCollection("items").insert([
+  { _id: ObjectId("aa0000000000000000000001"), code: "D001", stock: ObjectId("63608c6c7796354dbae69c55") }
+]);
+`)
+	s, err := SurveyBranches(Input{MongoDump: mongo})
+	if err != nil {
+		t.Fatalf("survey: %v", err)
+	}
+	if s.MainStockLots != 0 {
+		t.Errorf("main_stock_lots = %d with no registry, want 0 — the answer is unknown, not zero-branch",
+			s.MainStockLots)
+	}
+}

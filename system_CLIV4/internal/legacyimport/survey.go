@@ -90,10 +90,19 @@ type BranchSurvey struct {
 	DuplicateDocNoCount int      `json:"duplicate_doc_no_count"`
 	BranchDocNosUnique  bool     `json:"branch_doc_nos_unique"`
 	BillsMissingDocNo   int      `json:"bills_missing_doc_no"`
-	TotalBills          int      `json:"total_bills"`
-	TotalPatients       int      `json:"total_patients"`
-	TotalAppointments   int      `json:"total_appointments"`
-	HasBranchTable      bool     `json:"has_branch_table"`
+	// MainStockLots counts lots sitting in a stock that NO branch claims through
+	// branch.stock_id — V4's central warehouse (MAIN_STOCK). Reported on its own because it
+	// is neither a branch's stock nor an error, and because V4 keeps the warehouse out of
+	// the "รวมทุกสาขา" total on purpose: filed against a branch instead, these lots would
+	// both sit on the wrong shelf and inflate that clinic's inventory value.
+	MainStockLots int `json:"main_stock_lots"`
+	// LotsWithNoStock counts lots whose document names no stock at all. Nothing says where
+	// the box is, so the importer drops them rather than choosing a shelf.
+	LotsWithNoStock   int  `json:"lots_with_no_stock"`
+	TotalBills        int  `json:"total_bills"`
+	TotalPatients     int  `json:"total_patients"`
+	TotalAppointments int  `json:"total_appointments"`
+	HasBranchTable    bool `json:"has_branch_table"`
 }
 
 const maxListed = 25
@@ -104,6 +113,9 @@ const maxListed = 25
 func SurveyBranches(in Input) (*BranchSurvey, error) {
 	s := &BranchSurvey{UnknownInData: map[string]int{}}
 	byCode := map[string]*BranchInfo{}
+	// stockOwner is branch.stock_id → branch_code: which Mongo stock document belongs to
+	// which branch. Built from the same rows as byCode so the registry is read once.
+	stockOwner := map[string]string{}
 
 	// ── the registry itself ──
 	if len(in.BranchDump) > 0 {
@@ -131,6 +143,12 @@ func SurveyBranches(in Input) (*BranchSurvey, error) {
 				CreatedAt: r.Get("created_at"),
 			}
 			byCode[code] = b
+			// stock_id names this branch's document in the Mongo `stocks` collection. It is
+			// how a lot's location is decided, so it is captured here rather than inferred
+			// later from the stocks.stock_branch string.
+			if sid := strings.TrimSpace(r.Get("stock_id")); sid != "" {
+				stockOwner[sid] = code
+			}
 		}
 	}
 
@@ -264,11 +282,29 @@ func SurveyBranches(in Input) (*BranchSurvey, error) {
 		for _, d := range byName["course_bills"] {
 			count(d.Text("create_by_branch"), func(b *BranchInfo) { b.CoursesBought++ })
 		}
-		// Stock lots point at a stock, and the stock knows its branch.
-		stockBranch := indexNames(byName, "stocks", "stock_branch")
-		for _, d := range byName["items"] {
-			if br := stockBranch[docObjectID(d, "stock")]; br != "" {
-				count(br, func(b *BranchInfo) { b.StockLots++ })
+		// Stock lots point at a stock, and the SQL `branch` table says which branch owns
+		// which stock through branch.stock_id. That reference decides it — the same rule
+		// the importer uses, so the numbers here are the numbers that will land.
+		//
+		// Reading stocks.stock_branch instead put the central warehouse's lots (566 of
+		// 3,350 in the export this was built from) into unknown_in_data as if 'center' were
+		// a branch code somebody mistyped. It is not an error; it is the warehouse.
+		//
+		// Only classified when the registry is present. Without it there is nothing to
+		// compare a stock against, and calling every lot central would be a guess dressed
+		// as a finding.
+		if s.HasBranchTable {
+			for _, d := range byName["items"] {
+				stockID := docObjectID(d, "stock")
+				if stockID == "" {
+					s.LotsWithNoStock++
+					continue
+				}
+				if code, owned := stockOwner[stockID]; owned {
+					count(code, func(b *BranchInfo) { b.StockLots++ })
+					continue
+				}
+				s.MainStockLots++
 			}
 		}
 	}
@@ -354,6 +390,13 @@ func (s *BranchSurvey) Text() string {
 		}
 		sort.Strings(codes)
 		fmt.Fprintf(&b, "  · รหัสสาขาที่อยู่ในข้อมูลแต่ไม่มีในตาราง branch: %s\n", strings.Join(codes, ", "))
+	}
+	if s.MainStockLots > 0 || s.LotsWithNoStock > 0 {
+		fmt.Fprintf(&b, "  · ล็อตสต็อกในคลังที่ไม่ได้เป็นของสาขาใด (คลังหลัก): %d", s.MainStockLots)
+		if s.LotsWithNoStock > 0 {
+			fmt.Fprintf(&b, " · ล็อตที่ไม่ระบุคลังเลย: %d (ไม่ถูกนำเข้า)", s.LotsWithNoStock)
+		}
+		b.WriteString("\n    คลังของแต่ละสาขามาจาก branch.stock_id · คลังที่ไม่มีสาขาใดอ้างถึงคือคลังกลาง ไม่ใช่รหัสสาขาที่พิมพ์ผิด\n")
 	}
 	fmt.Fprintf(&b, "  · คนไข้ทั้งหมด %d · ไม่มีสาขา %d\n", s.TotalPatients, s.PatientsNoBranch)
 	fmt.Fprintf(&b, "  · นัดทั้งหมด %d · ไม่มีสาขา %d", s.TotalAppointments, s.AppointmentsNoBranch)
