@@ -43,7 +43,7 @@
   border: 2px solid var(--bad);
   border-left-width: 6px;
   border-radius: 6px;
-  background: rgba(248, 81, 73, 0.14);
+  background: var(--bad-tint);
   color: var(--text);
   font-size: 13px;
   line-height: 1.55;
@@ -62,5 +62,5 @@
 .go.is-prod {
   background: var(--bad);
   border-color: var(--bad);
-  color: #fff;
+  color: var(--on-bad);
 }

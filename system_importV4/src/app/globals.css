@@ -1,4 +1,18 @@
-:root {
+/* Palette tokens.
+ *
+ * Every colour in the app comes from here, which is what made adding a light theme a
+ * matter of one override block rather than a sweep through the components: the 115 KB
+ * GenerateForm does not name a single colour.
+ *
+ * The theme is chosen by data-theme on <html>, set by the inline script in layout.tsx
+ * BEFORE first paint. It is an explicit attribute rather than a @media query so there is
+ * one source of truth — the operator's choice wins, and "follow the machine" is resolved
+ * to a concrete value by that script instead of being a second, competing rule here.
+ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
   --bg: #0f1115;
   --panel: #171a21;
   --panel-2: #1e222b;
@@ -9,6 +23,65 @@
   --ok: #3fb950;
   --warn: #d29922;
   --bad: #f85149;
+
+  /* Text ON a coloured surface. Separate tokens because a hue that reads well against a
+     dark panel is unreadable against a light one, and vice versa. */
+  --on-accent: #fff;
+  --on-ok: #06210c;
+  --on-bad: #fff;
+  --ok-text: #9be6a6;
+  --warn-text: #f0cd7a;
+  --bad-text: #ffb4ae;
+  --info-text: #a9c7ff;
+
+  /* Message backgrounds: the status hue at low alpha. */
+  --ok-tint: rgba(63, 185, 80, 0.12);
+  --warn-tint: rgba(210, 153, 34, 0.12);
+  --bad-tint: rgba(248, 81, 73, 0.12);
+  --info-tint: rgba(76, 139, 245, 0.1);
+
+  --scrim: rgba(8, 10, 14, 0.78);
+  --card-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+/* Light is not the dark palette inverted.
+ *
+ * accent / ok / bad / warn are all DARKENED here, because they carry white text on the
+ * buttons and sit on a near-white page as text elsewhere: #4c8bf5 with white on it is
+ * about 2.7:1, which fails WCAG AA. The values below clear 4.5:1 in both roles.
+ *
+ * --bg is a soft grey rather than #fff: this tool is read for minutes at a time while an
+ * upload runs, and a full-white field next to white panels leaves no panel edge visible.
+ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --panel-2: #eef1f6;
+  --border: #d3d9e3;
+  --text: #1a1d23;
+  --muted: #5c6675;
+  --accent: #1f5fd0;
+  --ok: #136c2c;
+  --warn: #8a6100;
+  --bad: #c62c22;
+
+  --on-accent: #fff;
+  --on-ok: #fff;
+  --on-bad: #fff;
+  --ok-text: #0e5220;
+  --warn-text: #6b4b00;
+  --bad-text: #93231b;
+  --info-text: #14418f;
+
+  --ok-tint: rgba(19, 108, 44, 0.09);
+  --warn-tint: rgba(138, 97, 0, 0.1);
+  --bad-tint: rgba(198, 44, 34, 0.08);
+  --info-tint: rgba(31, 95, 208, 0.08);
+
+  --scrim: rgba(26, 29, 35, 0.45);
+  --card-shadow: 0 18px 50px rgba(20, 24, 33, 0.18);
 }
 
 * {
@@ -127,7 +200,7 @@ button.tab:focus-visible {
 
 button {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
   border-radius: 6px;
   padding: 8px 16px;
@@ -148,20 +221,21 @@ button.secondary {
 
 button.danger {
   background: var(--bad);
+  color: var(--on-bad);
 }
 
 /* The one button that writes to a real server. Green because it is the finish line,
    and it is gated behind a typed confirmation. */
 button.go {
   background: var(--ok);
-  color: #06210c;
+  color: var(--on-ok);
   font-weight: 600;
 }
 
 .msg.ok {
-  background: rgba(63, 185, 80, 0.12);
+  background: var(--ok-tint);
   border: 1px solid var(--ok);
-  color: #9be6a6;
+  color: var(--ok-text);
 }
 
 label {
@@ -245,22 +319,22 @@ code {
 }
 
 .msg.error {
-  background: rgba(248, 81, 73, 0.12);
+  background: var(--bad-tint);
   border: 1px solid var(--bad);
-  color: #ffb4ae;
+  color: var(--bad-text);
   white-space: pre-wrap;
 }
 
 .msg.warn {
-  background: rgba(210, 153, 34, 0.12);
+  background: var(--warn-tint);
   border: 1px solid var(--warn);
-  color: #f0cd7a;
+  color: var(--warn-text);
 }
 
 .msg.info {
-  background: rgba(76, 139, 245, 0.1);
+  background: var(--info-tint);
   border: 1px solid var(--accent);
-  color: #a9c7ff;
+  color: var(--info-text);
 }
 
 .row {

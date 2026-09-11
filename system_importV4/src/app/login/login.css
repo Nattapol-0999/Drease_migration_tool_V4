@@ -63,7 +63,7 @@
   border-radius: 6px;
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 14px;
   font-family: inherit;
   cursor: pointer;
@@ -89,7 +89,7 @@
   padding: 8px 10px;
   border-radius: 6px;
   border: 1px solid var(--bad);
-  background: rgba(248, 81, 73, 0.12);
+  background: var(--bad-tint);
   color: var(--text);
   font-size: 13px;
 }

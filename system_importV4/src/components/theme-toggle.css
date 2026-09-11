@@ -1,0 +1,55 @@
+/* The light/dark switch. Kept in its own file like the other component styles. */
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Which label shows is decided by CSS, not by React state.
+ *
+ * The theme is already on <html> before React runs (see the script in layout.tsx), so
+ * driving this from state would mean rendering the wrong label on the server, then
+ * correcting it — a visible flicker and a hydration mismatch. display:none also takes the
+ * hidden label out of the accessibility tree, so a screen reader is read one label. */
+.theme-toggle .on-dark,
+.theme-toggle .on-light {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle .on-dark {
+  display: inline;
+}
+
+:root[data-theme="light"] .theme-toggle .on-light {
+  display: inline;
+}
+
+/* Login has no header row to sit in, so the control is pinned to the corner of the
+   viewport. Reachable by keyboard in the normal order because it is the first element
+   in the DOM there. */
+.theme-toggle.corner {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 10;
+}

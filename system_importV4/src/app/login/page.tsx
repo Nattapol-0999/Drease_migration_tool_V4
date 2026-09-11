@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import ThemeToggle from "@/components/ThemeToggle";
+
 import "./login.css";
 
 // The login form. A client component because it has to show the reason a login failed;
@@ -53,6 +55,9 @@ export default function LoginPage() {
 
   return (
     <div className="login-wrap">
+      {/* Also here, not only after signing in: an operator on a bright screen should not
+          have to log in through a dark page first to be allowed to change it. */}
+      <ThemeToggle corner />
       <form className="login-card" onSubmit={submit}>
         <h1>system_importV4</h1>
         <p className="login-sub">เครื่องมือย้ายข้อมูล Dr.Ease V2 → V4 · ต้องเข้าสู่ระบบก่อนใช้งาน</p>
