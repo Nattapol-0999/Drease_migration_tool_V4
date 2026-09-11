@@ -128,8 +128,25 @@ END $renamed$;
 
 `, lit(clinic))
 	if !strict {
-		return fill + `-- Not every account has to resolve here: this run does not write users, so a legacy
--- reference to somebody who was never imported simply stays NULL.
+		// Not a failure, but not silence either. This run writes no accounts, so a legacy
+		// reference to somebody who is not in the target yet stays NULL — which is correct
+		// and also means that many patients arrive with no record of who registered them.
+		// Measured on a real patients-only run into a clinic holding one account: 111 of 112
+		// mapped people did not resolve, so 4,425 patient rows would have had a blank
+		// user_insert with nothing said about it. The count is what tells the operator to
+		// import the staff first if that attribution matters.
+		return fill + `-- Unresolved is allowed here: this run does not write users. But say how many, because
+-- every reference to an unresolved person lands NULL.
+DO $unresolved$
+DECLARE
+    n     int;
+    total int;
+BEGIN
+    SELECT count(*) FILTER (WHERE new_id IS NULL), count(*) INTO n, total FROM import_user_map;
+    IF n > 0 THEN
+        RAISE NOTICE 'users: % จาก % บัญชีในไฟล์ยังไม่มีอยู่ในคลินิกนี้ — ทุกแถวที่อ้างคนเหล่านั้น (เช่น patient.user_insert) จะเป็นค่าว่าง · ถ้าต้องการให้บันทึกว่าใครลงทะเบียน ให้นำเข้ากลุ่ม people ก่อน', n, total;
+    END IF;
+END $unresolved$;
 
 `
 	}

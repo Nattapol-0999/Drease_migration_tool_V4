@@ -190,6 +190,14 @@ func TestUnresolvedAccountRefusesTheScriptWhenThisRunWroteThem(t *testing.T) {
 	if strings.Contains(loose, "RAISE EXCEPTION") {
 		t.Errorf("a patients-only run must not be blocked over staff it never imported:\n%s", loose)
 	}
+	// Allowed is not the same as unremarked. Unresolved people mean patient.user_insert
+	// arrives blank, and on a real patients-only run that was 111 of 112 accounts and 4,425
+	// patients. Letting that pass without a number is how attribution disappears quietly.
+	for _, want := range []string{"new_id IS NULL", "RAISE NOTICE", "people"} {
+		if !strings.Contains(loose, want) {
+			t.Errorf("a patients-only run does not report unresolved people (%q missing):\n%s", want, loose)
+		}
+	}
 	for _, s := range []string{strict, loose} {
 		if !strings.Contains(s, "COALESCE(u.clinic_code, '') = 'MBU1'") {
 			t.Errorf("the fill is not scoped to this clinic, so another tenant's row could win the join:\n%s", s)
