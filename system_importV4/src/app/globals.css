@@ -100,8 +100,13 @@ body {
   line-height: 1.5;
 }
 
+/* 1040 + the step rail (168) + its gap (18).
+ *
+ * Widened when the rail was added so the FORM keeps the 1040px it had. Without this the
+ * rail would have taken its column out of the content, and the file tables and branch
+ * grid are the parts that needed the width. */
 main {
-  max-width: 1040px;
+  max-width: 1226px;
   margin: 0 auto;
   padding: 24px 20px 80px;
 }
@@ -355,4 +360,18 @@ code {
 ul.tight {
   margin: 4px 0;
   padding-left: 18px;
+}
+
+/* Text for screen readers only. Used where a state is shown visually (a colour, a tick)
+   and would otherwise reach nobody who cannot see it. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

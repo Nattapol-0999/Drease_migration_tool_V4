@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   CLI_INPUTS,
   IMPORT_GROUPS,
@@ -34,6 +34,7 @@ import {
 import BusyOverlay, { type BusyState } from "./BusyOverlay";
 
 import "./target-picker.css";
+import "./flow-steps.css";
 
 /**
  * postFormWithProgress posts a FormData and reports how many bytes have left the browser.
@@ -2143,17 +2144,8 @@ export default function GenerateForm() {
     </div>
   );
 
-  return (
-    <div>
-      {/* Covers the page while a request is running: the button that started it is at the
-          bottom of a long form, where "กำลังสร้าง…" is easy to miss. */}
-      <BusyOverlay state={busyState} />
-
-      {panelSource}
-      {panelBranches}
-      {panelTarget}
-
-      <div className="panel">
+  const panelGroups = (
+    <div className="panel">
         <h2>4 · เลือกสิ่งที่จะนำเข้า</h2>
         <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
           ค่าเริ่มต้นคือทั้งหมด — ติ๊กออกเมื่อปลายทางมีข้อมูลส่วนนั้นอยู่แล้ว
@@ -2177,9 +2169,11 @@ export default function GenerateForm() {
         {groups.length === 0 && (
           <div className="msg error">เลือกอย่างน้อยหนึ่งกลุ่ม</div>
         )}
-      </div>
+    </div>
+  );
 
-      <div className="panel">
+  const panelScript = (
+    <div className="panel">
         <h2>5 · สร้างสคริปต์</h2>
         <div className="row">
           <button onClick={submit} disabled={busy || groups.length === 0 || tooBig}>
@@ -2365,6 +2359,92 @@ export default function GenerateForm() {
             </pre>
           </>
         )}
+    </div>
+  );
+
+  /* Where the run has actually got to.
+   *
+   * Derived from the state the form already keeps, NOT from scroll position or from which
+   * panel was opened last. Scrolling past a panel is not the same as finishing it, and an
+   * indicator that says otherwise is worse than none: it would report progress that does
+   * not exist.
+   *
+   * "current" is the first step that is not done, so a step completed out of order (the
+   * target can be picked before the files are attached) does not drag the marker forward
+   * past work that still has to happen.
+   */
+  const steps: { key: string; label: string; done: boolean; node: React.ReactNode }[] = [
+    {
+      key: "source",
+      label: "1 · ที่มาของข้อมูล",
+      // Either route counts: files attached here, or dumps the server pulled itself.
+      done: chosen.length > 0 || pulledFields.length > 0,
+      node: panelSource,
+    },
+    {
+      key: "branches",
+      label: "2 · สาขาในไฟล์",
+      // A survey alone is not enough — nothing can be imported until the branches to keep
+      // are ticked and one of them is named the main branch.
+      done: survey !== null && picked.length > 0 && mainCode.trim() !== "",
+      node: panelBranches,
+    },
+    {
+      key: "target",
+      label: "3 · ปลายทาง และสร้างคลินิก",
+      // selected means the environment is configured; clinic + owner are what the CLI
+      // refuses to run without.
+      done: selected !== null && clinic.trim() !== "" && owner.trim() !== "",
+      node: panelTarget,
+    },
+    {
+      key: "groups",
+      label: "4 · เลือกสิ่งที่จะนำเข้า",
+      done: groups.length > 0,
+      node: panelGroups,
+    },
+    {
+      key: "script",
+      label: "5 · สร้างสคริปต์",
+      // The file existing is the only proof this step finished.
+      done: result !== null,
+      node: panelScript,
+    },
+  ];
+  const currentIndex = steps.findIndex((s) => !s.done);
+
+  return (
+    <div>
+      {/* Covers the page while a request is running: the button that started it is at the
+          bottom of a long form, where "กำลังสร้าง…" is easy to miss. */}
+      <BusyOverlay state={busyState} />
+
+      <div className="flow">
+        {steps.map((s, i) => {
+          const state = s.done ? "is-done" : i === currentIndex ? "is-current" : "";
+          return (
+            <Fragment key={s.key}>
+              <div className={`flow-rail ${state}${i === steps.length - 1 ? " is-last" : ""}`}>
+                <div className="flow-marker">
+                  {/* The number and the label repeat the panel's own <h2>, so they are
+                      hidden from assistive tech to avoid reading every heading twice. The
+                      state is not a repeat of anything, so it is announced. */}
+                  <span className="flow-dot" aria-hidden="true">
+                    {s.done ? "✓" : i + 1}
+                  </span>
+                  <span className="flow-label" aria-hidden="true">
+                    {s.label}
+                  </span>
+                  <span className="sr-only">
+                    {s.label} ·{" "}
+                    {s.done ? "เสร็จแล้ว" : i === currentIndex ? "กำลังทำอยู่" : "ยังไม่ถึง"}
+                  </span>
+                </div>
+              </div>
+              <div className="flow-body">{s.node}</div>
+            </Fragment>
+          );
+        })}
       </div>
     </div>
   );

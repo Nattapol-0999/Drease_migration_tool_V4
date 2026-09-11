@@ -1,0 +1,136 @@
+/* The step rail down the left of the form.
+ *
+ * It is a GRID, not a fixed or sticky sidebar: each step marker shares a grid row with the
+ * panel it belongs to, so step 3's dot is physically level with "3 · ปลายทาง". The rail
+ * therefore stretches to exactly the height of the form and scrolls with it — there is no
+ * scroll listener and no position: fixed anywhere in here.
+ *
+ * The consequence worth knowing: a tall panel means a tall gap to the next dot. That is the
+ * point. The distance between two markers is how much work that step is.
+ */
+.flow {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  column-gap: 18px;
+}
+
+.flow-rail {
+  position: relative;
+  /* stretch, so the connector below can run the full height of a row whatever the panel
+     inside it does */
+  align-self: stretch;
+  /* lines the dot up with the panel's <h2> rather than the panel's top edge */
+  padding-top: 28px;
+  padding-left: 2px;
+}
+
+/* The connector. Drawn from under this dot down to the next one, which is why the last
+   step does not get one — a line trailing off below the final step suggests a step that
+   is not there. */
+.flow-rail:not(.is-last)::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 54px;
+  bottom: -12px;
+  width: 2px;
+  background: var(--border);
+}
+
+/* A finished step's connector is coloured all the way down, so the eye can see how far
+   the run has got without reading a single label. */
+.flow-rail.is-done:not(.is-last)::before {
+  background: var(--ok);
+}
+
+.flow-marker {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.flow-dot {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  /* above the connector, so the line does not run through the circle */
+  position: relative;
+  z-index: 1;
+}
+
+.flow-label {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+/* ── the three states ───────────────────────────────────────────────────────────────
+ * done     the condition in flowSteps() is satisfied
+ * current  the FIRST step that is not done — where the operator actually is
+ * todo     everything after that
+ *
+ * Colour is not the only difference: done shows a tick instead of its number and current
+ * gets a ring, so the states are still distinguishable without seeing colour. */
+
+.flow-rail.is-done .flow-dot {
+  border-color: var(--ok);
+  background: var(--ok);
+  color: var(--on-ok);
+}
+
+.flow-rail.is-done .flow-label {
+  color: var(--text);
+}
+
+.flow-rail.is-current .flow-dot {
+  border-color: var(--accent);
+  background: var(--panel);
+  color: var(--accent);
+  box-shadow: 0 0 0 3px var(--info-tint);
+}
+
+.flow-rail.is-current .flow-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.flow-body {
+  min-width: 0;
+}
+
+/* The panel's own top margin would push it below its own marker. */
+.flow-body > .panel {
+  margin-top: 0;
+}
+
+/* ── narrow screens ────────────────────────────────────────────────────────────────
+ * A 168px column next to a form full of file pickers and tables leaves neither enough
+ * room. Below this the grid becomes one column and each marker sits as a short row above
+ * the panel it labels — same information, same order, no horizontal squeeze. */
+@media (max-width: 900px) {
+  .flow {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0;
+  }
+
+  .flow-rail {
+    align-self: auto;
+    padding-top: 16px;
+    padding-bottom: 2px;
+  }
+
+  /* No connector: with the markers stacked directly above their panels there is nothing
+     between them for a line to join. */
+  .flow-rail::before {
+    display: none;
+  }
+}
