@@ -2,6 +2,7 @@ package legacyimport
 
 import (
 	"fmt"
+	"strings"
 
 	"system_cliv4/internal/legacydump"
 )
@@ -113,7 +114,10 @@ var patientMapping = []patientCol{
 // RLS: patient has row-level security (migration 0040) whose policy passes when the
 // app.clinic_code GUC is unset OR equals the row's clinic_code. The importer runs as
 // the table owner without setting that GUC, so the policy passes.
-func buildPatient(rows []legacydump.Row, in Input, rep *Report) (string, error) {
+//
+// srcCols is the column list the parser actually read. It is only used to explain the
+// one failure that looks like data but is not: see the refusal at the end.
+func buildPatient(srcCols []string, rows []legacydump.Row, in Input, rep *Report) (string, error) {
 	e := rep.entity(EntPatient)
 	e.SourceRows = len(rows)
 	tr := truncations{}
@@ -130,11 +134,19 @@ func buildPatient(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	var s sqlBuilder
 	seen := map[string]bool{}
 	badDates, badInts := 0, 0
+	noHN := 0
 
 	for n, r := range rows {
 		hn := r.Get("HN")
 		if hn == "" {
-			return "", fmt.Errorf("patient row %d: empty HN (it is the dedup key)", n+1)
+			// Skipped, not fatal. HN is this record's whole identity in V4 — it is the
+			// dedup key here, what appointments join on, and what the clinic calls the
+			// patient by — so a row without one cannot be written as anything. But one
+			// unusable row is no reason to reject the other thousands, which is what
+			// refusing here used to do. Counted, and reported below.
+			noHN++
+			e.skip("HN ว่าง (ข้ามแถวนั้น — ไม่มี HN คือไม่มีตัวระบุคนไข้)")
+			continue
 		}
 		// (clinic_code, HN) must be unique WITHIN a file: a duplicate HN in the same
 		// dump means two records claim one identity, which the importer must not merge
@@ -175,6 +187,24 @@ WHERE NOT EXISTS (
 `, joinCols(cols), joinCols(vals), lit(in.ClinicCode), lit(hn))
 	}
 
+	// REFUSAL: rows exist but not one of them had an HN.
+	//
+	// That is not data with gaps, it is the wrong column. Row.Get is an exact map lookup, so
+	// a file whose column is `hn` or `HN_code` reads as empty on EVERY row — and with the
+	// skip above, the run would then "succeed" having written no patients at all. A silent
+	// zero is the worst outcome available: the operator moves on believing the clinic is
+	// migrated. So this stops, and names what the parser actually saw, because the fix is to
+	// correct the column name and nothing in a generic message would point there.
+	if noHN > 0 && noHN == len(rows) {
+		return "", fmt.Errorf("patient: ไม่มีแถวไหนมี HN เลย (%d แถว) — ไฟล์นี้น่าจะใช้ชื่อคอลัมน์อื่น "+
+			"ตัวนำเข้าต้องการคอลัมน์ชื่อ `HN` ตรงตัวพิมพ์%s · คอลัมน์ที่อ่านได้จากไฟล์: %s",
+			len(rows), hnCandidates(srcCols), columnList(srcCols, 40))
+	}
+	if noHN > 0 {
+		rep.warnf("patient: ข้าม %d แถวเพราะ HN ว่าง (จาก %d แถว) — แถวที่เหลือนำเข้าครบ",
+			noHN, len(rows))
+	}
+
 	e.Statements = s.stmts
 	if sum := tr.summary(); sum != "" {
 		rep.warnf("patient: truncated %s", sum)
@@ -186,6 +216,40 @@ WHERE NOT EXISTS (
 		rep.warnf("patient: %d unparseable number(s) imported as NULL", badInts)
 	}
 	return s.String(), nil
+}
+
+// hnCandidates names the columns that differ from "HN" only by case or by carrying it as a
+// word, which is what a mistyped export actually looks like. Offered first because reading
+// the answer out of a 60-column list is work the message can do instead.
+func hnCandidates(cols []string) string {
+	var near []string
+	for _, c := range cols {
+		if c == "HN" {
+			continue
+		}
+		if strings.EqualFold(c, "HN") || strings.Contains(strings.ToLower(c), "hn") {
+			near = append(near, "`"+c+"`")
+		}
+	}
+	if len(near) == 0 {
+		return ""
+	}
+	return " · ที่ใกล้เคียงในไฟล์นี้: " + strings.Join(near, ", ")
+}
+
+// columnList prints the source columns, capped: the point is to let the operator recognise
+// the right name, and a 60-item wall of text works against that.
+func columnList(cols []string, max int) string {
+	if len(cols) == 0 {
+		return "(อ่านคอลัมน์ไม่ได้เลย)"
+	}
+	shown := cols
+	tail := ""
+	if len(cols) > max {
+		shown = cols[:max]
+		tail = fmt.Sprintf(" … และอีก %d คอลัมน์", len(cols)-max)
+	}
+	return strings.Join(shown, ", ") + tail
 }
 
 func patientValue(c patientCol, r legacydump.Row, tr truncations) (string, bool) {

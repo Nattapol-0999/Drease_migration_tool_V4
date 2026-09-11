@@ -243,13 +243,15 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	var branchByPatient map[string]string
 
 	if len(in.PatientDump) > 0 && wants(EntPatient, EntAppointment) {
-		_, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
+		// The column list is kept, not discarded: buildPatient needs it to tell a file with
+		// a few unusable rows apart from a file whose HN column is spelled differently.
+		patientCols, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("patient dump: %w", err)
 		}
 		branchByPatient = branchByHN(patientRows)
 		if wants(EntPatient) {
-			if out[EntPatient], err = buildPatient(patientRows, in, rep); err != nil {
+			if out[EntPatient], err = buildPatient(patientCols, patientRows, in, rep); err != nil {
 				return nil, nil, money, err
 			}
 		}
