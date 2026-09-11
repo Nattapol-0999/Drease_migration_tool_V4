@@ -204,23 +204,22 @@ function branchDataCount(b: BranchSurveyRow): number {
   );
 }
 
-/**
- * Whether two branches can live in the same V4 clinic.
+/*
+ * There is no sameTaxEntity() here any more.
  *
- * The test is the TAX ID, because that is what a receipt and a tax invoice print and what
- * clinic_settings can only hold one of. Company NAMES in these exports are typed by hand
- * and disagree with themselves — one tenant spelled the same company three ways across its
- * branches — so a name comparison would split one company apart while missing the branches
- * that really do belong to another.
+ * It answered "can these two branches live in the same V4 clinic" by comparing tax ids, and
+ * the pre-selection used it to tick only the main branch's own company. Since 11 Sep 2026
+ * every branch is ticked and the header carries the majority company's number, so nothing
+ * decides membership by tax id — the form names the mismatched branches instead of excluding
+ * them. Keeping the helper would leave the old policy sitting in the file, readable as though
+ * it were still in force.
  *
- * A blank tax id means "not recorded", not "a different company", so it does not separate.
+ * The comparison itself was right about one thing worth remembering: match on the TAX ID, not
+ * the company name. Names in these exports are typed by hand and disagree with themselves —
+ * one tenant spelled the same company three ways across its branches — so a name comparison
+ * splits one company apart while missing the branches that really do belong to another. That
+ * is why majorityTaxID and branchesUnderAnotherTaxID both key on the number.
  */
-function sameTaxEntity(a: BranchSurveyRow, b: BranchSurveyRow): boolean {
-  const x = a.tax_id.trim();
-  const y = b.tax_id.trim();
-  if (x === "" || y === "") return true;
-  return x === y;
-}
 
 /** A stable identity for the attached files, so a swapped file invalidates the upload. */
 function filesSignature(files: Partial<Record<CliInputField, File>>): string {
@@ -507,27 +506,22 @@ export default function GenerateForm() {
       setSurvey(json.survey);
       setSurveySeconds(json.seconds);
 
-      // Pre-selection follows the LEGAL ENTITY, not the row count. One TIN per clinic is a
-      // hard V4 constraint — clinic_settings holds a single tax id — so a branch belonging
-      // to another company cannot be imported into this clinic at all: its receipts would
-      // print the wrong company's name and number. The busiest branch is taken as the main
-      // one and everything under its company is ticked; the operator can change both.
+      // EVERY branch the registry lists is ticked. The tenant's branches are a fact about
+      // the tenant, and a branch left out has its patients, rooms and bills land on some
+      // other branch — or not land at all — which is a bigger problem than the one the old
+      // pre-selection was avoiding.
       //
-      // Matched on TAX ID, not on the company name. In one real export the same company
-      // appeared as "บริษัท แอนจาลี คลินิก (2015) จำกัด", "แอนจาลีคลินิก" and "แอนจาลี คลีนิก"
-      // across branches while carrying one tax id or none — matching the strings would have
-      // split one company into three and hidden the two that really are separate.
+      // What it was avoiding: clinic_settings holds ONE tax id, so branches belonging to a
+      // second company print that company's number on their receipts. The earlier default
+      // ticked only the main branch's own company and left the others for a separate import.
+      // Decided 11 Sep 2026 to take them all instead, with the majority company's number on
+      // the header — the operator is told below exactly which branches that misnames, and
+      // can still untick them to do it the other way.
       const rows = json.survey.branches ?? [];
       if (rows.length > 0) {
         const main = rows.reduce((a, b) => (branchDataCount(b) > branchDataCount(a) ? b : a));
         setMainCode(main.code);
-        // A blank tax id is UNKNOWN, not "a different company", so those branches are
-        // included: leaving a branch out silently drops its patients from the import
-        // entirely, which is the worse of the two mistakes and the harder one to notice.
-        const sameEntity = rows.filter(
-          (b) => sameTaxEntity(b, main),
-        );
-        setPicked((sameEntity.length > 0 ? sameEntity : rows).map((b) => b.code));
+        setPicked(rows.map((b) => b.code));
       }
     } catch (e) {
       setSurveyErr(e instanceof Error ? e.message : String(e));
@@ -550,14 +544,63 @@ export default function GenerateForm() {
   }
 
   /**
+   * majorityTaxID returns the tax id this clinic's documents will carry.
+   *
+   * The main branch's own number wins, because every other field on the header — legal name,
+   * address, phone — already comes from that row, and taking the number from a different
+   * branch would print one company's TIN above another's address.
+   *
+   * When the main branch recorded none, the most common number among the ticked branches is
+   * used instead: with several branches under one company and a handful that simply never
+   * filled the field in, that company is the answer. Ties break on the lowest number so two
+   * runs over one file always produce the same header.
+   *
+   * Blanks never count. A missing number means nobody typed it, not that a branch belongs to
+   * a company with no TIN.
+   */
+  function majorityTaxID(): string {
+    const own = (mainRow?.tax_id ?? "").trim();
+    if (own !== "") return own;
+
+    const tally = new Map<string, number>();
+    for (const b of pickedRows) {
+      const id = b.tax_id.trim();
+      if (id === "") continue;
+      tally.set(id, (tally.get(id) ?? 0) + 1);
+    }
+    let best = "";
+    let bestCount = 0;
+    for (const [id, count] of [...tally.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (count > bestCount) {
+        best = id;
+        bestCount = count;
+      }
+    }
+    return best;
+  }
+
+  /** Ticked branches whose own tax id differs from the one the header will carry. */
+  function branchesUnderAnotherTaxID(): BranchSurveyRow[] {
+    const header = majorityTaxID();
+    if (header === "") return [];
+    return pickedRows.filter((b) => {
+      const id = b.tax_id.trim();
+      return id !== "" && id !== header;
+    });
+  }
+
+  /**
    * taxProfileToSend takes the receipt header from the MAIN branch's own row.
    *
-   * tax_id is deliberately left EMPTY (decided 9 Sep 2026). The export's tax ids are not
-   * consistent enough to print on a tax invoice — in one tenant three different companies
-   * appeared and four branches had no number at all — and a wrong number on a tax document
-   * is a legal problem, not a data problem. The backend writes this profile only when the
-   * clinic has none saved, so a human filling the number in afterwards is never overwritten
-   * by a re-run.
+   * tax_id used to be left EMPTY on purpose (9 Sep 2026): the export's numbers are not
+   * consistent — one tenant carried three companies and four branches with no number at all
+   * — and a wrong number on a tax document is a legal problem, not a data problem, so a human
+   * was left to type it.
+   *
+   * Reversed 11 Sep 2026: the majority company's number is written now. What has not changed
+   * is who carries the risk of it being wrong for a minority branch, so the form names those
+   * branches on screen before the clinic is created. The backend still writes this profile
+   * only into a clinic that has none, so a correction made in Settings survives a re-run.
    */
   function taxProfileToSend(): TaxProfileInput | null {
     if (!mainRow) return null;
@@ -565,7 +608,7 @@ export default function GenerateForm() {
     if (!legal) return null;
     return {
       legal_name: legal,
-      tax_id: "",
+      tax_id: majorityTaxID(),
       tax_branch_type: "",
       tax_branch_code: "",
       tax_address: mainRow.address,
@@ -1914,35 +1957,40 @@ export default function GenerateForm() {
             </tbody>
           </table>
 
-          {/* One TIN per clinic is a database fact, not a preference: clinic_settings holds
-              a single tax id. Branches under two companies in one clinic means one of them
-              prints the other's name on its receipts. */}
+          {/* One TIN per clinic is a database fact, not a preference: clinic_settings holds a
+              single tax id. Since 11 Sep 2026 every branch is imported anyway and the header
+              carries the majority company's number, so this panel no longer tells the operator
+              to split — it names the branches that will print a number which is not theirs, so
+              that is a thing somebody accepted rather than a thing nobody was told. */}
           {(() => {
-            // Grouped by TAX ID, which is the value clinic_settings can only hold one of.
-            // Blank ids are left out of the count because "not recorded" is not evidence of
-            // a second company, and treating it as one would block every export whose
-            // branch table is half-filled.
-            const ids = Array.from(
-              new Set(pickedRows.map((b) => b.tax_id.trim()).filter((t) => t !== "")),
-            );
-            if (ids.length <= 1) return null;
+            const other = branchesUnderAnotherTaxID();
+            if (other.length === 0) return null;
+            const header = majorityTaxID();
+            // Grouped by tax id: one line per company, not per branch, because the decision
+            // being accepted is about companies.
+            const byID = new Map<string, BranchSurveyRow[]>();
+            for (const b of other) {
+              const id = b.tax_id.trim();
+              byID.set(id, [...(byID.get(id) ?? []), b]);
+            }
             return (
-              <div className="msg error">
-                สาขาที่ติ๊กไว้อยู่ใต้ <b>{ids.length} เลขผู้เสียภาษี</b> — V4 เก็บเลขนี้ได้{" "}
-                <b>ค่าเดียวต่อคลินิก</b> (<code>clinic_settings</code>) ฉะนั้นใบเสร็จและใบกำกับภาษีของสาขาที่เป็น
-                นิติบุคคลอื่นจะพิมพ์หัวผิดนิติบุคคล
+              <div className="msg warn">
+                ใบเสร็จและใบกำกับภาษีของคลินิกนี้จะพิมพ์เลขผู้เสียภาษี <code>{header}</code> ทุกใบ เพราะ V4
+                เก็บเลขนี้ได้ <b>ค่าเดียวต่อคลินิก</b> (<code>clinic_settings</code>)
+                <br />
+                สาขาต่อไปนี้จดทะเบียนเป็นนิติบุคคลอื่น — เอกสารที่ออกที่สาขาเหล่านี้จะ<b>ระบุผู้ขายไม่ตรงกับที่จดทะเบียน</b>
                 <ul className="tight">
-                  {ids.map((id) => {
-                    const rows = pickedRows.filter((b) => b.tax_id.trim() === id);
-                    return (
-                      <li key={id}>
-                        <code>{id}</code> — {rows[0].legal_name || "(ไม่ระบุชื่อ)"} · สาขา{" "}
-                        {rows.map((b) => b.code).join(", ")}
-                      </li>
-                    );
-                  })}
+                  {Array.from(byID.entries()).map(([id, rows]) => (
+                    <li key={id}>
+                      <code>{id}</code> — {rows[0].legal_name || "(ไม่ระบุชื่อ)"} · สาขา{" "}
+                      {rows.map((b) => b.code).join(", ")} ({rows.length} สาขา)
+                    </li>
+                  ))}
                 </ul>
-                ต้องแยกเป็นคลินิกละนิติบุคคล — ติ๊กเฉพาะสาขาของเลขเดียวรอบนี้ แล้วทำอีกรอบให้ที่เหลือ
+                <span className="muted" style={{ fontSize: 12 }}>
+                  ถ้าต้องให้แต่ละนิติบุคคลออกเอกสารในนามของตัวเอง ให้ติ๊กเฉพาะสาขาของเลขเดียวรอบนี้
+                  แล้วนำเข้าที่เหลือเป็นคลินิกแยกอีกรอบ
+                </span>
               </div>
             );
           })()}
@@ -1986,9 +2034,23 @@ export default function GenerateForm() {
                 </b>
                 <br />
                 หัวใบเสร็จจะใช้ชื่อนิติบุคคลของสาขาหลัก:{" "}
-                <b>{mainRow.legal_name || mainRow.name || "(ไม่ระบุ)"}</b>{" "}
+                <b>{mainRow.legal_name || mainRow.name || "(ไม่ระบุ)"}</b>
+                {majorityTaxID() ? (
+                  <>
+                    {" "}
+                    เลขผู้เสียภาษี <code>{majorityTaxID()}</code>
+                  </>
+                ) : (
+                  <>
+                    {" "}
+                    <span className="muted" style={{ fontSize: 12 }}>
+                      · ไม่มีสาขาใดกรอกเลขผู้เสียภาษีไว้ จึงเว้นว่าง ต้องไปกรอกในระบบก่อนออกใบกำกับ
+                    </span>
+                  </>
+                )}
                 <span className="muted" style={{ fontSize: 12 }}>
-                  · เลขผู้เสียภาษี<b>เว้นว่างไว้</b>ตามที่ตกลง ไปกรอกในระบบทีหลัง (import จะไม่เขียนทับของที่คนกรอกเอง)
+                  {" "}
+                  · import จะไม่เขียนทับโปรไฟล์ที่มีคนกรอกไว้แล้ว
                 </span>
               </>
             )}
