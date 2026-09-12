@@ -80,6 +80,15 @@ var photoOrder = []string{EntPhoto}
 const (
 	nasFolder        = "nas-doctorease"
 	legacyPageSubdir = "mris_images/page"
+	// V2 already rendered its own thumbnails, and they sit beside the full images under
+	// the SAME relative path — measured on a real export: 81 of 82 page files have a twin
+	// at thumb/<year>/<dir>/<file>, 250x250 and about 7 KB against 313 KB for the page.
+	//
+	// So the thumbnail V4 wants does not have to be generated: it is already in the
+	// archive and only has to be carried across. Whether a given twin actually exists is
+	// something only the caller can see (it holds the tar), which is why this side emits
+	// the path and the caller decides — the same split as FileSize.
+	legacyThumbSubdir = "mris_images/thumb"
 )
 
 // photoCategory is the storage category the bytes land under on the V4 host. It is the
@@ -87,6 +96,11 @@ const (
 // "opd-photo", ext)), so an imported image is served by the existing endpoint with no
 // special case anywhere.
 const photoCategory = "opd-photo"
+
+// photoThumbCategory is where the carried-over thumbnail lands. It matches the layout the
+// spec of 11 Sep 2026 documents for thumb_path (<clinic>/opd-photo-thumb/<name>) so an
+// imported thumbnail is served by the same ?thumb=1 path as one the app rendered itself.
+const photoThumbCategory = "opd-photo-thumb"
 
 // PhotoFile is one image to copy, plus every column value the row needs except the
 // byte count. The caller reads that off the file and fills FileSize in.
@@ -100,6 +114,19 @@ type PhotoFile struct {
 	// TargetPath is the path RELATIVE to the V4 uploads dir:
 	// "<clinic>/opd-photo/<hash><ext>". It is also photos.file_path verbatim.
 	TargetPath string `json:"target_path"`
+
+	// ThumbSourcePath is where V2's own thumbnail for this image WOULD be inside the tar.
+	// ThumbTargetPath is where it would land, and becomes photos.thumb_path.
+	//
+	// Both are emitted unconditionally: this side cannot open the archive, so it states
+	// where to look and the caller reports whether the file was there. A missing twin is
+	// not an error — thumb_path is nullable and the app falls back to the full image.
+	//
+	// The extension is taken from the SOURCE, not forced to .jpg. ServePhoto picks
+	// Content-Type from the path, so naming a PNG .jpg would send the wrong header for a
+	// file that is otherwise fine.
+	ThumbSourcePath string `json:"thumb_source_path"`
+	ThumbTargetPath string `json:"thumb_target_path"`
 
 	// ── photos columns ───────────────────────────────────────────────────────
 	HN         string `json:"hn"`
@@ -129,8 +156,11 @@ type PhotoManifest struct {
 	ClinicCode string `json:"clinic_code"`
 	// UploadsSubdir is the directory every TargetPath sits under, so a caller can
 	// create it once.
-	UploadsSubdir string      `json:"uploads_subdir"`
-	Files         []PhotoFile `json:"files"`
+	UploadsSubdir string `json:"uploads_subdir"`
+	// UploadsThumbSubdir is the same for ThumbTargetPath. A separate directory rather than
+	// a suffix inside the first one, so a thumbnail can never be mistaken for the image.
+	UploadsThumbSubdir string      `json:"uploads_thumb_subdir"`
+	Files              []PhotoFile `json:"files"`
 }
 
 // buildPhotos reads the `page` collection and returns the copy plan. It renders no SQL:
@@ -165,8 +195,9 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	droppedCreatedBy := 0
 
 	man := &PhotoManifest{
-		ClinicCode:    in.ClinicCode,
-		UploadsSubdir: path.Join(in.ClinicCode, photoCategory),
+		ClinicCode:         in.ClinicCode,
+		UploadsSubdir:      path.Join(in.ClinicCode, photoCategory),
+		UploadsThumbSubdir: path.Join(in.ClinicCode, photoThumbCategory),
 	}
 
 	// dedupe within the manifest itself. Two revisions cannot share a rev_id, but a
@@ -267,6 +298,13 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				SourcePath: path.Join(nasFolder, legacyPageSubdir, url),
 				SourceURL:  url,
 				TargetPath: target,
+				// Same `url`, the other tree, and the SAME hashed name so the pair is
+				// obvious on disk: <hash>.jpg in opd-photo and <hash>.jpg in
+				// opd-photo-thumb. Determinism is preserved because the name is still
+				// derived from clinic + rev_id.
+				ThumbSourcePath: path.Join(nasFolder, legacyThumbSubdir, url),
+				ThumbTargetPath: path.Join(man.UploadsThumbSubdir,
+					photoFileName(in.ClinicCode, revID)+ext),
 				HN:         hn,
 				ClinicCode: in.ClinicCode,
 				TakenAt:    takenAt,

@@ -512,6 +512,12 @@ interface PhotoImportBase {
   unsupportedCount: number;
   /** file_path ends .jpg while the bytes are PNG, or the reverse. Renders; header is wrong. */
   extMismatchCount: number;
+  /**
+   * How many matched images found V2's own thumbnail beside them in the archive. Those get
+   * a thumb_path; the rest stay NULL and the app falls back to the full image.
+   */
+  thumbFound: number;
+  thumbBytes: number;
   /** How many INSERT statements the script holds (one per matched image). */
   rows: number;
   /** The CLI's own stdout: counts, skipped revisions, warnings. */
@@ -534,6 +540,8 @@ export type PhotoImportResponse =
       ok: true;
       mode: "apply";
       filesSent: number;
+      /** Of filesSent, how many were V2 thumbnails rather than full images. */
+      thumbsSent: number;
       bytesSent: number;
       seconds: string;
       log: string;

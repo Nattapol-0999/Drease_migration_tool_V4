@@ -37,6 +37,14 @@ export interface ManifestFile {
   source_path: string;
   source_url: string;
   target_path: string;
+  /**
+   * Where V2's own thumbnail for this image would be in the archive, and where it would
+   * land. The CLI emits both unconditionally because it cannot open the tar; this file
+   * reports whether the twin was actually there. Optional in the type so a manifest from
+   * an older CLI still parses.
+   */
+  thumb_source_path?: string;
+  thumb_target_path?: string;
   hn: string;
   clinic_code: string;
   taken_at: string;
@@ -50,6 +58,7 @@ export interface ManifestFile {
 export interface Manifest {
   clinic_code: string;
   uploads_subdir: string;
+  uploads_thumb_subdir?: string;
   files: ManifestFile[];
 }
 
@@ -155,6 +164,12 @@ export interface SurveyFile {
   bytes: number;
   /** Sniffed from the file's own bytes, never from its name. */
   mime: string;
+  /**
+   * Set only when V2's thumbnail for this image is actually in the archive. Absent means
+   * thumb_path stays NULL and the app falls back to the full image — which is why a
+   * missing twin is not an error.
+   */
+  thumb?: { source_path: string; target_path: string; bytes: number };
 }
 
 /** One image the live upload endpoint would turn away, with the reason. */
@@ -182,6 +197,9 @@ export interface Survey {
   wouldReject: WouldRejectFile[];
   oversizeCount: number;
   unsupportedCount: number;
+  /** How many of the matched images found V2's thumbnail beside them, and its total size. */
+  thumbFound: number;
+  thumbBytes: number;
   /**
    * file_path ends .jpg but the bytes are a PNG, or the reverse. ServePhoto picks the
    * Content-Type from the extension, so the header would be wrong — browsers sniff and
@@ -205,6 +223,8 @@ export async function surveyArchive(manifest: Manifest, root: string): Promise<S
   let totalBytes = 0;
   let oversizeCount = 0;
   let unsupportedCount = 0;
+  let thumbFound = 0;
+  let thumbBytes = 0;
 
   for (const f of manifest.files) {
     const abs = join(root, f.source_path);
@@ -212,12 +232,36 @@ export async function surveyArchive(manifest: Manifest, root: string): Promise<S
       const st = await stat(abs);
       if (!st.isFile()) throw new Error("not a file");
       const mime = await sniffImage(abs);
+
+      // V2's own thumbnail, if the export carried one. Only stat'd — nothing is decided
+      // here about where it goes; the CLI already said that.
+      let thumb: SurveyFile["thumb"];
+      if (f.thumb_source_path && f.thumb_target_path) {
+        try {
+          const tst = await stat(join(root, f.thumb_source_path));
+          if (tst.isFile() && tst.size > 0) {
+            thumb = {
+              source_path: f.thumb_source_path,
+              target_path: f.thumb_target_path,
+              bytes: tst.size,
+            };
+            thumbFound++;
+            thumbBytes += tst.size;
+          }
+        } catch {
+          // No twin for this one. thumb_path stays NULL and the app serves the full
+          // image, so there is nothing to report per file — the count below says how
+          // many were missing.
+        }
+      }
+
       matched.push({
         hn: f.hn,
         source_url: f.source_url,
         target_path: f.target_path,
         bytes: st.size,
         mime,
+        thumb,
       });
       totalBytes += st.size;
 
@@ -271,6 +315,8 @@ export async function surveyArchive(manifest: Manifest, root: string): Promise<S
     wouldReject,
     oversizeCount,
     unsupportedCount,
+    thumbFound,
+    thumbBytes,
     extMismatch,
   };
 }
@@ -315,6 +361,8 @@ export async function extractArchive(tarPath: string): Promise<string> {
 
 export interface ShipResult {
   filesSent: number;
+  /** Of those, how many were V2 thumbnails carried across rather than full images. */
+  thumbsSent: number;
   bytesSent: number;
   log: string;
 }
@@ -349,6 +397,7 @@ export async function shipFiles(
     const byTarget = new Map(manifest.files.map((f) => [f.target_path, f]));
     let files = 0;
     let bytes = 0;
+    let thumbs = 0;
 
     for (const m of survey.matched) {
       const f = byTarget.get(m.target_path);
@@ -358,6 +407,17 @@ export async function shipFiles(
       await copyFile(join(extractRoot, f.source_path), dest);
       files++;
       bytes += m.bytes;
+
+      // The thumbnail travels in the SAME bundle as its image. Two archives would create a
+      // window where a row could point at a thumbnail that had not arrived, and the whole
+      // reason bytes go before rows is to have no such window.
+      if (m.thumb) {
+        const tdest = join(payload, m.thumb.target_path);
+        await mkdir(dirname(tdest), { recursive: true });
+        await copyFile(join(extractRoot, m.thumb.source_path), tdest);
+        thumbs++;
+        bytes += m.thumb.bytes;
+      }
     }
     if (files === 0) throw new Error("ไม่มีไฟล์ที่จับคู่ได้เลย จึงไม่มีอะไรจะส่ง");
 
@@ -398,16 +458,24 @@ export async function shipFiles(
     // flags below plus the explicit chown/chmod make the result identical to
     // storage.Write's own output (root:root, dirs 755, files 644), and they are scoped to
     // this clinic's opd-photo directory so nothing else in the tree is touched.
+    // Two directories now: the images and, when the export carried them, V2's thumbnails.
+    // Both are derived from the manifest and shell-quoted, and both are scoped to this
+    // clinic — the remote half runs under sudo, so nothing outside these may be touched.
     const subdir = join(t.dir, manifest.uploads_subdir).replaceAll("\\", "/");
+    const dirs = [subdir];
+    if (thumbs > 0 && manifest.uploads_thumb_subdir) {
+      dirs.push(join(t.dir, manifest.uploads_thumb_subdir).replaceAll("\\", "/"));
+    }
+    const quoted = dirs.map(shellQuote);
     const remote = [
       `set -e`,
-      `sudo -n mkdir -p ${shellQuote(subdir)}`,
+      ...quoted.map((d) => `sudo -n mkdir -p ${d}`),
       `sudo -n tar --no-same-owner --no-same-permissions -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(t.dir)}`,
-      `sudo -n chown -R root:root ${shellQuote(subdir)}`,
-      `sudo -n find ${shellQuote(subdir)} -type d -exec chmod 755 {} +`,
-      `sudo -n find ${shellQuote(subdir)} -type f -exec chmod 644 {} +`,
+      ...quoted.map((d) => `sudo -n chown -R root:root ${d}`),
+      ...quoted.map((d) => `sudo -n find ${d} -type d -exec chmod 755 {} +`),
+      ...quoted.map((d) => `sudo -n find ${d} -type f -exec chmod 644 {} +`),
       `rm -f ${shellQuote(remoteTmp)}`,
-      `find ${shellQuote(subdir)} -type f | wc -l`,
+      `find ${quoted.join(" ")} -type f | wc -l`,
     ].join(" && ");
 
     const { stdout, stderr } = await run(
@@ -427,8 +495,13 @@ export async function shipFiles(
 
     return {
       filesSent: files,
+      thumbsSent: thumbs,
       bytesSent: bytes,
-      log: [`ไฟล์ในโฟลเดอร์ปลายทางหลังแตกไฟล์: ${stdout.trim()}`, stderr.trim()]
+      log: [
+        `ไฟล์ในโฟลเดอร์ปลายทางหลังแตกไฟล์: ${stdout.trim()}`,
+        `ส่งรูปจริง ${files} ไฟล์ · thumbnail ${thumbs} ไฟล์`,
+        stderr.trim(),
+      ]
         .filter(Boolean)
         .join("\n"),
     };
@@ -483,6 +556,11 @@ function intOrNull(s: string | undefined): string {
  *     Real codes are BR00001-shaped (7 chars) so this does not bite, and it is left to
  *     fail loudly rather than truncated — a silently shortened code points at no branch or
  *     the wrong one, which is worse than a refused transaction.
+ *   - thumb_path set when V2's own thumbnail was in the archive, NULL when it was not.
+ *     The export already carries them beside the full images (250x250, ~7 KB against
+ *     ~313 KB), so this is a file copy, not a render — nothing here decodes an image. A
+ *     row without one is not broken: the app falls back to the full image, which is why
+ *     the spec says thumb_path needs no backfill.
  *   - consent_given true, by the clinic owner's decision.
  *   - One transaction, with a guard that the clinic exists first. `photos` has no foreign
  *     key to `clinic`, so a wrong clinic_code would insert rows that no tenant can ever
@@ -500,6 +578,10 @@ export function buildInsertSQL(
   out.push("-- Dr.Ease V2 → V4: รูปหน้าเวชระเบียน (mris.page → public.photos)");
   out.push(`-- clinic_code : ${clinic}`);
   out.push(`-- รูป         : ${survey.matched.length} ไฟล์ (rev ล่าสุดของแต่ละหน้า)`);
+  out.push(
+    `-- thumbnail   : ${survey.thumbFound} ไฟล์จากถุงของ V2 เอง (คัดลอกมา ไม่ได้สร้างใหม่) · ` +
+      `อีก ${survey.matched.length - survey.thumbFound} ไฟล์ thumb_path เป็น NULL แล้วระบบใช้รูปจริงแทน`,
+  );
   out.push("--");
   if (survey.wouldReject.length > 0) {
     out.push(
@@ -558,7 +640,7 @@ export function buildInsertSQL(
 SELECT ${c}, ${hn},
        (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
        NULL, ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, 'note',
-       ${lit(f.target_path)}, NULL,
+       ${lit(f.target_path)}, ${m.thumb ? lit(m.thumb.target_path) : "NULL"},
        ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
        '[]'::jsonb, now(), now()
 WHERE NOT EXISTS (
@@ -628,9 +710,27 @@ export async function readManifest(path: string, clinic: string): Promise<Manife
   if (!m.uploads_subdir.startsWith(`${clinic}/`)) {
     throw new Error(`manifest ชี้โฟลเดอร์ ${m.uploads_subdir} ที่ไม่ใช่ของคลินิก ${clinic}`);
   }
+  // Both target paths are checked, and both source paths too: everything below is used to
+  // build a filesystem path on a host where the far half runs under sudo, so a crafted
+  // value in the dump must not be able to climb out of the clinic's folder.
   for (const f of m.files) {
-    if (!f.target_path.startsWith(`${clinic}/`) || f.target_path.includes("..")) {
-      throw new Error(`manifest มี target_path ที่ออกนอกโฟลเดอร์คลินิก: ${f.target_path}`);
+    for (const [label, p] of [
+      ["target_path", f.target_path],
+      ["thumb_target_path", f.thumb_target_path],
+    ] as const) {
+      if (p === undefined) continue;
+      if (!p.startsWith(`${clinic}/`) || p.includes("..")) {
+        throw new Error(`manifest มี ${label} ที่ออกนอกโฟลเดอร์คลินิก: ${p}`);
+      }
+    }
+    for (const [label, p] of [
+      ["source_path", f.source_path],
+      ["thumb_source_path", f.thumb_source_path],
+    ] as const) {
+      if (p === undefined) continue;
+      if (p.startsWith("/") || p.includes("..")) {
+        throw new Error(`manifest มี ${label} ที่ออกนอกถุง: ${p}`);
+      }
     }
   }
   return m;

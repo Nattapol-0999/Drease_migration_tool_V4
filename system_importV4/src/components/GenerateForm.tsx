@@ -1738,6 +1738,22 @@ export default function GenerateForm() {
                             </span>
                           </li>
                         ) : null}
+                        {photoSurvey.thumbFound !== undefined ? (
+                          <li>
+                            thumbnail จากถุงของ V2 เอง {photoSurvey.thumbFound} ไฟล์
+                            {photoSurvey.thumbBytes ? (
+                              <> ({(photoSurvey.thumbBytes / 1024 / 1024).toFixed(1)} MB)</>
+                            ) : null}
+                            {photoSurvey.matched !== undefined &&
+                            photoSurvey.matched > photoSurvey.thumbFound ? (
+                              <>
+                                {" "}
+                                · อีก {photoSurvey.matched - photoSurvey.thumbFound} ไฟล์ไม่มีคู่{" "}
+                                <span className="muted">(ระบบใช้รูปจริงแทนเอง)</span>
+                              </>
+                            ) : null}
+                          </li>
+                        ) : null}
                         {photoSurvey.extMismatchCount ? (
                           <li>
                             นามสกุลไม่ตรงกับไบต์จริง {photoSurvey.extMismatchCount} ไฟล์ —{" "}

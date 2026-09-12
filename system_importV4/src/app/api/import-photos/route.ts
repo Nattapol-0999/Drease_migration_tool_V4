@@ -167,6 +167,9 @@ export async function POST(req: Request): Promise<Response> {
       oversizeCount: survey.oversizeCount,
       unsupportedCount: survey.unsupportedCount,
       extMismatchCount: survey.extMismatch.length,
+      // V2's own thumbnails, carried across rather than rendered.
+      thumbFound: survey.thumbFound,
+      thumbBytes: survey.thumbBytes,
       rows,
       report,
     };
@@ -246,6 +249,7 @@ export async function POST(req: Request): Promise<Response> {
       mode,
       ...base,
       filesSent: ship.filesSent,
+      thumbsSent: ship.thumbsSent,
       bytesSent: ship.bytesSent,
       seconds,
       log: log || "psql ไม่ได้ส่งข้อความใด (สำเร็จ)",
