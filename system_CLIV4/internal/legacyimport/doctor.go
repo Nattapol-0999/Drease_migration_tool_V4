@@ -28,10 +28,32 @@ import (
 // are guarded by NOT EXISTS on (clinic_code, doctor_code). Dropped: phone_number (V4's
 // doctor has no phone column; it is used for clinic_staff.tel instead) and doctor_user
 // (redundant with user_id).
+// BRANCH: the legacy `doctor` table has no branch column at all — its ten columns are
+// doctor_code, doctorname_th, doctorname_en, doctornickname, phone_number,
+// medical_license, color, doctor_user, doctor_active, doctor_user_id. So whatever goes
+// into V4's NOT NULL doctor.branch_code is a CHOICE, and it used to be the constant "01",
+// which is a legacy code: correct for a tenant this tool created (buildClinic mints a
+// branch row '01' to match), wrong for one whose branches came from signup as
+// BR00001/BR00002 — there it names no branch that exists.
+//
+// Nothing in the backend filters on this column, so a wrong value raises no error. What it
+// does is drop the provider out of every per-branch calendar roster: ListDoctors returns
+// branch_code as "where this provider works" precisely so the calendar can bucket by it,
+// and a code matching no branch lands in no bucket. Blank is not an option either —
+// migration 0320 added CHECK (branch_code <> ”).
+//
+// It now goes through branchResolver like room, patient, appointment and money already do.
+// With no source value every row takes the resolver's default, which is the first branch
+// of the caller's map — the same answer syncDoctorProvider reaches at runtime through
+// GetFirstActiveBranchForSetup, and what migration 0320's own backfill used
+// (MIN(clinic.branch_code)). The count is reported, because "every doctor at one branch"
+// is a guess and the clinic is the only one who can correct it.
 func buildDoctor(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 	e := rep.entity(EntDoctor)
 	e.SourceRows = len(rows)
 	tr := truncations{}
+	br := newBranchResolver(in)
+	defer br.report(rep, "doctor")
 
 	cols := []string{
 		"doctor_code", "code", "tha_name", "doctor_name", "doctorname_th",
@@ -131,7 +153,7 @@ WHERE NOT EXISTS (
 			nullLit(tha), nullLit(tha), nullLit(tha),
 			nullLit(eng), nullLit(eng),
 			nullLit(nick), nullLit(lic), nullLit(color), nullLit(active),
-			userID, staffID, lit(in.ClinicCode), lit(BranchCode),
+			userID, staffID, lit(in.ClinicCode), lit(br.resolve(r.Get("branch_code"))),
 			lit(in.ClinicCode), lit(codeLit))
 	}
 

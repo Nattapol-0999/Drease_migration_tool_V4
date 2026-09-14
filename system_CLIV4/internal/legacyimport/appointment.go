@@ -48,10 +48,16 @@ var apptDocFields = []string{
 // one place.
 // branchByPatient maps HN → legacy branch code, used because the legacy appointment rows
 // do not carry a usable branch of their own (see branchByHN).
+// branchOfRoom, when supplied, maps a legacy room code to the V4 branch_code that room is
+// imported at. It is used ONLY to report a disagreement, never to change what is written:
+// validate_appointment_assignment overwrites NEW.branch_code with the room's branch on
+// every insert, so the value this builder emits for a row with a room is advisory. Without
+// the count, an appointment that says one branch and lands at another is invisible.
 func buildAppointment(
 	rows []legacydump.Row,
 	bookable map[string]bool,
 	branchByPatient map[string]string,
+	branchOfRoom map[string]string,
 	in Input,
 	rep *Report,
 ) (string, error) {
@@ -64,6 +70,8 @@ func buildAppointment(
 	// Appointments whose HN is not in the patient dump have nothing to derive a branch
 	// from; they fall back to the default and are counted so the number is visible.
 	noPatientBranch := 0
+	// "branch this builder wrote → branch the trigger will put it at", per pair.
+	branchOverridden := map[string]int{}
 	defer func() {
 		if noPatientBranch > 0 {
 			rep.notef("appointment: %d แถวหาสาขาจากคนไข้ไม่ได้ (ไม่พบ HN ในไฟล์คนไข้) — ใช้สาขาเริ่มต้น", noPatientBranch)
@@ -176,6 +184,16 @@ func buildAppointment(
 		}
 		branchLit := br.resolve(legacyBranch)
 
+		// The trigger has the last word on branch_code when the row names a room, so what
+		// matters here is whether the two answers agree. Counted per (from → to) pair
+		// rather than as one total: 232 bookings moving Ratchada→Siam is a mapping to
+		// examine, while a handful scattered across pairs is data entry.
+		if room != "" {
+			if roomBranch, known := branchOfRoom[room]; known && roomBranch != branchLit {
+				branchOverridden[branchLit+" → "+roomBranch]++
+			}
+		}
+
 		s.comment("legacy id %s · HN %s · room %s · %s %s", ref, orDash(hn), orDash(room),
 			r.Get("appointment_date"), r.Get("appointment_time_start"))
 		// Insert-only: a re-run skips appointments already imported for this clinic
@@ -202,6 +220,21 @@ DO NOTHING;
 	}
 	rep.notef("appointment: status from confirm_check — reserve=%d confirm=%d cancel=%d",
 		statusCount["reserve"], statusCount["confirm"], statusCount["cancel"])
+
+	// The room wins, and the operator is told how often that changed the answer. Kept as a
+	// WARNING rather than a note: these rows are filed at a branch other than the one the
+	// source recorded, and per-branch reports will read differently because of it.
+	if len(branchOverridden) > 0 {
+		total := 0
+		pairs := make([]string, 0, len(branchOverridden))
+		for pair, n := range branchOverridden {
+			total += n
+			pairs = append(pairs, fmt.Sprintf("%s (%d นัด)", pair, n))
+		}
+		sort.Strings(pairs)
+		rep.warnf("appointment: %d นัด สาขาที่ได้จากคนไข้/ต้นทาง ไม่ตรงกับสาขาของห้องที่จอง — V4 ยึดสาขาของห้อง (validate_appointment_assignment เขียนทับ branch_code ทุกครั้งที่มี room_id) ฉะนั้นนัดเหล่านี้จะไปอยู่สาขาของห้อง · %s",
+			total, strings.Join(pairs, ", "))
+	}
 
 	// Loudly, and per code. The appointments were kept; what changed is that a link V4
 	// would have rejected is now recorded in doc.legacy_doctor_code instead of

@@ -228,16 +228,46 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 	}
 
-	// ── rooms ───────────────────────────────────────────────────────────────────
+	// ── appointments: PARSED here, BUILT further down ────────────────────────────
+	//
+	// The parse has to happen before rooms, because a room's status depends on whether an
+	// appointment books it: V4 refuses an appointment naming a room with status 0, so a
+	// room the source closed but the history still references must be imported active
+	// (see buildRoom's `booked` parameter). The BUILD stays below, after patients, because
+	// an appointment takes its branch from the patient's.
+	var apptRows []legacydump.Row
+	if len(in.AppointmentDump) > 0 && wants(EntAppointment) {
+		if _, apptRows, err = legacydump.Parse(string(in.AppointmentDump), "appointment"); err != nil {
+			return nil, nil, money, fmt.Errorf("appointment dump: %w", err)
+		}
+	}
 
-	if len(in.RoomDump) > 0 && wants(EntRoom) {
+	// ── rooms ───────────────────────────────────────────────────────────────────
+	//
+	// Parsed when appointments are selected even if rooms are not: V4 derives an
+	// appointment's branch from its room, so the only way to report a booking whose branch
+	// is about to be overwritten is to know what branch each room is at.
+	var branchOfRoom map[string]string
+
+	if len(in.RoomDump) > 0 && wants(EntRoom, EntAppointment) {
 		// The legacy room master lives in a table called `clinic`.
 		_, roomRows, err := legacydump.Parse(string(in.RoomDump), "clinic")
 		if err != nil {
 			return nil, nil, money, fmt.Errorf("room dump: %w", err)
 		}
-		if out[EntRoom], err = buildRoom(roomRows, in, rep); err != nil {
-			return nil, nil, money, err
+		branchOfRoom = branchByRoom(roomRows, in)
+		if wants(EntRoom) {
+			// An empty set when appointments are not part of this run, which keeps every
+			// source status as-is — and means a rooms-only run followed by an
+			// appointments-only run can still hit the trigger. Reported rather than guessed
+			// at, because reopening rooms nothing books would be a change made for no reason.
+			booked := roomsWithAppointments(apptRows)
+			if len(booked) == 0 && !wants(EntAppointment) {
+				rep.notef("room: รอบนี้ไม่ได้นำเข้านัด จึงคงสถานะห้องตามต้นทางทุกห้อง — ถ้าจะนำเข้านัดรอบหลัง ห้องที่ปิดอยู่จะทำให้นัดที่อ้างถึงมันล้มทั้งไฟล์")
+			}
+			if out[EntRoom], err = buildRoom(roomRows, booked, in, rep); err != nil {
+				return nil, nil, money, err
+			}
 		}
 	}
 
@@ -276,13 +306,9 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		out[EntPatientAddressFill] = fillSQL
 	}
 
-	if len(in.AppointmentDump) > 0 && wants(EntAppointment) {
-		_, apptRows, err := legacydump.Parse(string(in.AppointmentDump), "appointment")
-		if err != nil {
-			return nil, nil, money, fmt.Errorf("appointment dump: %w", err)
-		}
+	if len(apptRows) > 0 {
 		bookable := buildBookableDoctors(doctorRows, userRows)
-		if out[EntAppointment], err = buildAppointment(apptRows, bookable, branchByPatient, in, rep); err != nil {
+		if out[EntAppointment], err = buildAppointment(apptRows, bookable, branchByPatient, branchOfRoom, in, rep); err != nil {
 			return nil, nil, money, err
 		}
 	}
