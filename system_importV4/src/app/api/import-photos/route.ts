@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { describeTrim, trimMongoDump } from "@/lib/mongo-trim";
 import { requireSession } from "@/lib/require-session";
 import {
   buildInsertSQL,
@@ -17,6 +18,7 @@ import {
   shipFiles,
   surveyArchive,
 } from "@/lib/photo-import";
+import { sessionExists, stagedPath, stagedSize } from "@/lib/upload-staging";
 import { TARGET_IDS, type TargetId } from "@/lib/types";
 import { describeTarget, hint, psqlCommand, resolveTarget, runSSH, sshArgs } from "@/lib/server-target";
 
@@ -33,17 +35,27 @@ export const dynamic = "force-dynamic";
 // plan the apply will execute — two routes could drift, and a preview that does not match
 // what happens is worse than no preview.
 //
-// The archive is uploaded again for the apply rather than cached between calls. This
-// process is one server with no shared store, so a cache would be a temp file whose
-// lifetime nobody owns; re-sending 20-odd MB from a File the browser already holds costs
-// a few seconds and removes that whole class of problem.
+// TWO WAYS THE FILES ARRIVE, and why the big one exists.
+//
+//   sessionId — the files are already on disk, put there chunk by chunk by
+//               /api/upload-chunk (fields `mongo` and `images`). Nothing large travels in
+//               this request, so the only ceiling is staging disk (MAX_UPLOAD_BYTES).
+//   attached  — the files ride in this request body. Kept for a small clinic and for any
+//               caller that has not moved over, and still capped at MAX_TOTAL_BYTES.
+//
+// The second path is what the first clinic used and it worked because that export was
+// small: mris.js 28 MB + public_img.tar.gz 25.6 MB = 53.7 MB, just under the cap. The next
+// tenant was not: 437 photos came to 520 MB of images, and no proxy in front of this app
+// will carry that in one body — nginx stops at 64 MB, Cloudflare's free plan at 100 MB.
+// Chunked upload already solved this for the SQL and Mongo dumps (a 233 MB Mongo export
+// goes up routinely); this route was the last one still demanding one request.
 //
 // WRITE ORDER: bytes to the backend host first, rows to the database second. A file with
 // no row is invisible; a row with no file is a broken image inside a medical record.
 
-// 64 MB matches the generate route, nginx's client_max_body_size on the tool host, and
-// Next's own bodySizeLimit. Cloudflare's free plan caps at 100 MB above all of them, so
-// raising this alone would not help.
+// 64 MB matches nginx's client_max_body_size on the tool host and Next's own
+// bodySizeLimit. It bounds the ATTACHED path only — a staged upload never puts the file
+// in a request body, so the number does not apply to it.
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 
 const CLINIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -95,19 +107,43 @@ export async function POST(req: Request): Promise<Response> {
     );
   }
 
+  // Staged first: when a session id is supplied the bytes are already on disk and this
+  // request carries only the form fields.
+  const sessionId = String(form.get("sessionId") ?? "").trim();
   const pageFile = form.get("page");
   const imagesFile = form.get("images");
-  if (!(pageFile instanceof File) || pageFile.size === 0) {
-    return fail("ยังไม่ได้แนบไฟล์ export ของ mris.page (.js)");
-  }
-  if (!(imagesFile instanceof File) || imagesFile.size === 0) {
-    return fail("ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)");
-  }
-  const total = pageFile.size + imagesFile.size;
-  if (total > MAX_TOTAL_BYTES) {
-    return fail(
-      `ไฟล์รวมกัน ${(total / 1024 / 1024).toFixed(1)} MB ใหญ่เกิน ${MAX_TOTAL_BYTES / 1024 / 1024} MB`,
-    );
+
+  let stagedPageBytes = 0;
+  let stagedImageBytes = 0;
+  if (sessionId) {
+    if (!(await sessionExists(sessionId))) {
+      return fail(
+        "ไม่พบไฟล์ที่อัปโหลดไว้ (session หมดอายุหรือถูกล้าง) — แนบไฟล์ใหม่",
+        409,
+      );
+    }
+    stagedPageBytes = await stagedSize(sessionId, "mongo");
+    stagedImageBytes = await stagedSize(sessionId, "images");
+    if (stagedPageBytes === 0) {
+      return fail("ในการอัปโหลดนี้ไม่มีไฟล์ MongoDB (.js) — ต้องมีเพื่ออ่าน collection page");
+    }
+    if (stagedImageBytes === 0) {
+      return fail("ในการอัปโหลดนี้ไม่มีไฟล์รูป (public_img.tar.gz)");
+    }
+  } else {
+    if (!(pageFile instanceof File) || pageFile.size === 0) {
+      return fail("ยังไม่ได้แนบไฟล์ export ของ mris.page (.js)");
+    }
+    if (!(imagesFile instanceof File) || imagesFile.size === 0) {
+      return fail("ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)");
+    }
+    const total = pageFile.size + imagesFile.size;
+    if (total > MAX_TOTAL_BYTES) {
+      return fail(
+        `ไฟล์รวมกัน ${(total / 1024 / 1024).toFixed(1)} MB ใหญ่เกิน ${MAX_TOTAL_BYTES / 1024 / 1024} MB ` +
+          `— ไฟล์ขนาดนี้ต้องอัปโหลดแบบแบ่งชิ้นก่อน แล้วส่ง sessionId มาแทนการแนบไฟล์`,
+      );
+    }
   }
 
   // apply retypes the clinic_code, the same gate the SQL import uses. It is the last
@@ -122,10 +158,35 @@ export async function POST(req: Request): Promise<Response> {
 
   const work = await mkdtemp(join(tmpdir(), "importv4-page-"));
   let extractRoot = "";
+  let trimLog = "";
   try {
     // 1 · the copy plan comes from the CLI, which owns every mapping decision.
+    //
+    // The dump is FILTERED to the one collection this route reads before the CLI sees it,
+    // the same way /api/generate filters before its own run. It matters more here than it
+    // looks: the CLI reads its input with os.ReadFile and keeps every parsed document, and
+    // a legacy mris export is mostly audit logs. Measured on the agafar export, `page` is
+    // 0.4 MB of a 233 MB file — the rest is bills (57 MB), payment_summary (44 MB) and
+    // userlogsv2 (43 MB), none of which page.go looks at. Handing over the whole thing on
+    // a 908 MB box means a gigabyte of swap for nothing.
     const pagePath = join(work, "page.js");
-    await writeFile(pagePath, Buffer.from(await pageFile.arrayBuffer()));
+    const rawPagePath = sessionId ? stagedPath(sessionId, "mongo") : join(work, "page-raw.js");
+    if (!sessionId) {
+      await writeFile(rawPagePath, Buffer.from(await (pageFile as File).arrayBuffer()));
+    }
+    try {
+      const trimmed = await trimMongoDump(rawPagePath, pagePath, ["page"]);
+      trimLog = describeTrim(trimmed);
+      if (trimmed.keptBytes === 0) {
+        return fail(
+          "ในไฟล์ MongoDB ที่ส่งมาไม่มี collection `page` เลย — รูปหน้าเวชระเบียนอยู่ในฐาน mris " +
+            "ต้อง export collection page มาด้วย",
+          422,
+        );
+      }
+    } catch (err) {
+      return fail(`กรอง collection page จากไฟล์ MongoDB ไม่สำเร็จ: ${(err as Error).message}`, 422);
+    }
 
     let report: string;
     try {
@@ -142,8 +203,16 @@ export async function POST(req: Request): Promise<Response> {
     const manifest = await readManifest(join(work, `photos_${clinic}.json`), clinic);
 
     // 2 · unpack the operator's archive and weigh every planned file.
-    const tarPath = join(work, "images.tar.gz");
-    await writeFile(tarPath, Buffer.from(await imagesFile.arrayBuffer()));
+    //
+    // A staged archive is read where it already is. Copying it first would double the disk
+    // a 530 MB upload costs and buy nothing: extractArchive only reads it.
+    let tarPath: string;
+    if (sessionId) {
+      tarPath = stagedPath(sessionId, "images");
+    } else {
+      tarPath = join(work, "images.tar.gz");
+      await writeFile(tarPath, Buffer.from(await (imagesFile as File).arrayBuffer()));
+    }
     extractRoot = await extractArchive(tarPath);
     const survey = await surveyArchive(manifest, extractRoot);
 
@@ -172,6 +241,13 @@ export async function POST(req: Request): Promise<Response> {
       thumbBytes: survey.thumbBytes,
       rows,
       report,
+      // What filtering the dump saved, and how the files got here. Both belong in the
+      // preview: an operator comparing two runs needs to know which path each took.
+      trim: trimLog,
+      source: sessionId ? "staged" : "attached",
+      sourceBytes: sessionId
+        ? { page: stagedPageBytes, images: stagedImageBytes }
+        : { page: (pageFile as File).size, images: (imagesFile as File).size },
     };
 
     if (mode === "survey") {
@@ -204,7 +280,7 @@ export async function POST(req: Request): Promise<Response> {
     // 4 · then the rows, in one transaction on the database host.
     const r = await runSSH(sshArgs(dbTarget, psqlCommand(dbTarget)), sql);
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
-    const log = [ship.log, r.stdout, r.stderr].filter(Boolean).join("\n").trim();
+    const log = [trimLog, ship.log, r.stdout, r.stderr].filter(Boolean).join("\n").trim();
 
     // Recorded whether it worked or not: without this there is no answer to "who moved
     // which clinic's images, where, and when".
@@ -217,6 +293,9 @@ export async function POST(req: Request): Promise<Response> {
         clinic,
         uploads_host: uploads.sshHost,
         database: dbTarget.dbName,
+        // Which path the bytes took, so a failure can be traced without guessing.
+        source: sessionId ? "staged" : "attached",
+        session: sessionId || undefined,
         planned: manifest.files.length,
         files_sent: ship.filesSent,
         bytes_sent: ship.bytesSent,

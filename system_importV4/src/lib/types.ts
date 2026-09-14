@@ -25,6 +25,29 @@ export const CLI_INPUTS = [
 export type CliInputField = (typeof CLI_INPUTS)[number]["field"];
 
 /**
+ * Files that are UPLOADED the same way as the CLI inputs but are not inputs to the
+ * generate step.
+ *
+ * `images` is the photo archive (public_img.tar.gz). It is deliberately NOT a member of
+ * CLI_INPUTS: that list drives the generate form's attachment slots AND the loop in
+ * /api/generate that copies each staged file to the CLI's working directory as either
+ * sql.sql or mongo.js. An entry there would put a 530 MB tarball through that loop as
+ * `sql.sql` and hand it to the CLI as a MySQL dump.
+ *
+ * It still needs the chunked upload path, because a real clinic's archive is far past
+ * anything a single request can carry: measured on the first multi-branch tenant, 437
+ * photos came to 520 MB while /api/import-photos accepted 64 MB in one body. Sharing the
+ * staging directory is what makes that size reachable — the ceiling there is
+ * MAX_UPLOAD_BYTES (4 GB of disk), not a proxy's body limit.
+ */
+export const STAGED_ONLY_FIELDS = ["images"] as const;
+
+export type StagedOnlyField = (typeof STAGED_ONLY_FIELDS)[number];
+
+/** Every field the staging directory and /api/upload-chunk accept. */
+export type StagedField = CliInputField | StagedOnlyField;
+
+/**
  * Largest total attachment the tool accepts, counted before anything is sent.
  *
  * A dump this large never travels as one request. It is sliced into CHUNK_BYTES pieces

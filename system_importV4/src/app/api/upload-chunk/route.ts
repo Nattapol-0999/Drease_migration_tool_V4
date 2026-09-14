@@ -6,6 +6,7 @@ import {
   createSession,
   isValidField,
   sessionBytes,
+  stagedFieldNames,
   sessionExists,
   sweepStaging,
 } from "@/lib/upload-staging";
@@ -52,7 +53,9 @@ export async function POST(req: Request): Promise<Response> {
 
   const field = String(form.get("field") ?? "");
   if (!isValidField(field)) {
-    return fail(`field "${field}" ไม่อยู่ในรายการที่รับ (sql, mongo)`);
+    // The list comes from the one place that decides it, so adding a field cannot leave
+    // this message telling the operator something untrue.
+    return fail(`field "${field}" ไม่อยู่ในรายการที่รับ (${stagedFieldNames().join(", ")})`);
   }
 
   const offsetRaw = String(form.get("offset") ?? "");

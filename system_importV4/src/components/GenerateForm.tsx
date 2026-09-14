@@ -12,6 +12,7 @@ import {
   type BranchSurvey,
   type BranchSurveyRow,
   type CliInputField,
+  type StagedField,
   type JobStartResponse,
   type JobStatusResponse,
   type JobView,
@@ -84,7 +85,7 @@ function postFormWithProgress(
  */
 async function uploadOneChunk(
   sessionId: string,
-  field: CliInputField,
+  field: StagedField,
   offset: number,
   slice: Blob,
   onProgress: (loadedInSlice: number) => void,
@@ -315,6 +316,10 @@ export default function GenerateForm() {
   const [photoDone, setPhotoDone] = useState<string | null>(null);
   const [photoLog, setPhotoLog] = useState<string | null>(null);
   const [photoConfirm, setPhotoConfirm] = useState("");
+  // The upload the photo step's two files were put in, kept so survey → apply does not
+  // send 530 MB twice. Cleared whenever either file changes (see the effect below), so a
+  // reused session can only ever hold the files currently attached.
+  const [photoSessionId, setPhotoSessionId] = useState("");
 
   useEffect(() => {
     fetch("/api/target")
@@ -698,26 +703,101 @@ export default function GenerateForm() {
     }
   }
 
-  // Swapping the MongoDB file invalidates the photo survey: the plan was derived from the
-  // old file's `page` collection, and offering an apply built on a file that is no longer
-  // attached is how the wrong images get written.
+  // Swapping either file invalidates the photo survey: the plan was derived from the old
+  // file's `page` collection and weighed against the old archive, and offering an apply
+  // built on a file that is no longer attached is how the wrong images get written.
+  //
+  // The staged upload is dropped with it. It is keyed on nothing but this state, so a
+  // session held past a file change would be the previous bytes wearing the new file's
+  // name — the exact confusion the survey reset exists to prevent.
   const mongoName = files.mongo?.name ?? "";
   const mongoSize = files.mongo?.size ?? 0;
+  const imgName = imgFile?.name ?? "";
+  const imgSize = imgFile?.size ?? 0;
   useEffect(() => {
     setPhotoSurvey(null);
     setPhotoDone(null);
     setPhotoErr(null);
     setPhotoLog(null);
-  }, [mongoName, mongoSize]);
+    setPhotoSessionId("");
+  }, [mongoName, mongoSize, imgName, imgSize]);
 
   /**
    * runPhotoImport calls the one route in either mode.
    *
-   * Both modes post the same two files. The survey is not cached and replayed as the
-   * apply: the server rebuilds the plan from the dump each time, so what the operator
-   * confirmed is what runs even if they changed a file in between — a stale preview is
-   * how the wrong images get written.
+   * The two files go up CHUNKED, then the mode call carries only the session id. They used
+   * to ride in this request, which held while both were small — the first clinic's
+   * 28 MB dump + 25.6 MB archive fit under the 64 MB body cap with room to spare. The next
+   * one did not: 437 photos came to 520 MB, and nginx (64 MB) and Cloudflare (100 MB) both
+   * sit in front of this app. The staging directory has no such ceiling.
+   *
+   * The plan is still rebuilt from the dump on every call rather than cached between
+   * survey and apply: what the operator confirmed is what runs, even if a file changed in
+   * between. Re-uploading is what is avoided here, not re-planning.
    */
+  /**
+   * uploadPhotoInputs puts the Mongo dump and the image archive on the server in slices and
+   * answers with the session that holds them.
+   *
+   * The Mongo dump goes to the `mongo` field — the same one the SQL import uses — because it
+   * IS the same file: the catalog and the `page` collection come out of one export. The
+   * archive goes to `images`, which exists only for this step.
+   *
+   * A session already built for these exact files is reused, so a survey followed by an
+   * apply sends the bytes once. The effect above drops it the moment either file changes.
+   */
+  async function uploadPhotoInputs(dump: File, images: File): Promise<string> {
+    if (photoSessionId) return photoSessionId;
+
+    const parts: { field: StagedField; file: File }[] = [
+      { field: "mongo", file: dump },
+      { field: "images", file: images },
+    ];
+    const totalBytes = parts.reduce((n, p) => n + p.file.size, 0);
+    const chunkCount = parts.reduce((n, p) => n + Math.ceil(p.file.size / CHUNK_BYTES), 0);
+
+    setBusyState({
+      title: "นำเข้ารูปหน้าเวชระเบียน",
+      phase: `กำลังส่งไฟล์ขึ้นเซิร์ฟเวอร์ (ชิ้น 1/${chunkCount})`,
+      percent: 0,
+      detail: `0 B / ${human(totalBytes)}`,
+      startedAt: Date.now(),
+      note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้ — ไฟล์กำลังส่งอยู่",
+    });
+
+    let sid = "";
+    let sentBytes = 0;
+    let chunkNo = 0;
+    try {
+      for (const { field, file } of parts) {
+        for (let offset = 0; offset < file.size; offset += CHUNK_BYTES) {
+          const slice = file.slice(offset, Math.min(offset + CHUNK_BYTES, file.size));
+          chunkNo++;
+          const base = sentBytes;
+          const label = `กำลังส่งไฟล์ขึ้นเซิร์ฟเวอร์ (ชิ้น ${chunkNo}/${chunkCount})`;
+          sid = await uploadOneChunk(sid, field, offset, slice, (loadedInSlice) =>
+            setBusyState((s) =>
+              s
+                ? {
+                    ...s,
+                    phase: label,
+                    percent: ((base + loadedInSlice) / totalBytes) * 100,
+                    detail: `${human(base + loadedInSlice)} / ${human(totalBytes)}`,
+                  }
+                : s,
+            ),
+          );
+          sentBytes += slice.size;
+        }
+      }
+    } finally {
+      setBusyState(null);
+    }
+
+    setPhotoSessionId(sid);
+    return sid;
+  }
+
   async function runPhotoImport(mode: "survey" | "apply") {
     const dump = files.mongo;
     if (!dump || !imgFile) return;
@@ -729,19 +809,30 @@ export default function GenerateForm() {
     }
     setPhotoBusy(mode);
     try {
+      const sid = await uploadPhotoInputs(dump, imgFile);
+
       const body = new FormData();
       body.append("mode", mode);
       body.append("targetId", targetId);
       body.append("clinicCode", clinic.trim());
-      // The same file the catalog is read from. The CLI picks the `page` collection out
-      // of it and ignores the rest, exactly as it already ignores collections it has no
-      // mapping for.
-      body.append("page", dump);
-      body.append("images", imgFile);
+      body.append("sessionId", sid);
       if (mode === "apply") body.append("confirm", photoConfirm.trim());
 
+      setPhotoBusy(mode);
       const res = await fetch("/api/import-photos", { method: "POST", body });
       const json = (await res.json()) as PhotoImportResponse;
+
+      // The staging sweep drops a session after six hours, and a redeploy clears the whole
+      // directory. Both surface as 409 here. Forgetting the id turns the next click into a
+      // fresh upload instead of a second identical failure.
+      if (res.status === 409) {
+        setPhotoSessionId("");
+        // The response is a union and a 409 is always the failing arm, but the narrowing
+        // has to be written out for the type to admit it.
+        const why = "error" in json ? json.error : "ไฟล์ที่อัปโหลดไว้หายไป";
+        setPhotoErr(`${why} — กดอีกครั้งเพื่อส่งไฟล์ขึ้นใหม่`);
+        return;
+      }
 
       if (!json.ok) {
         setPhotoErr(json.error);
