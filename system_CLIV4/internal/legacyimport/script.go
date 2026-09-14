@@ -171,15 +171,28 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 
 	// The money block is only guarded when it is actually part of this run: -only
 	// catalog must not be blocked by a rule about bills it is not importing.
+	//
+	// Only guard 4 goes here. Guard 5 asks whether a patient exists, and in a run that
+	// carries patients too the answer is created further down this same file — so it is
+	// emitted just before the money phase instead. See money_guards.go.
 	writingMoney := strings.TrimSpace(batches[EntInvoice]) != ""
 	if writingMoney {
-		b.WriteString(buildMoneyPreflightGuards(in.ClinicCode, money.invoiceHN, money.receiptHN, money.hns))
+		b.WriteString(buildMoneyPreflightGuards(in.ClinicCode, money.invoiceHN, money.receiptHN))
 	}
 
 	for _, name := range order {
 		sqlText, ok := batches[name]
 		if !ok || strings.TrimSpace(sqlText) == "" {
 			continue
+		}
+		// Guard 5, immediately before the first money entity: the patient phase is above
+		// (order puts EntPatient well before EntInvoice) so this run's patients are already
+		// in the transaction, and no bill has been written yet, so refusing here still
+		// costs nothing. A money-only run reaches this with an empty patient batch above
+		// and is checked against whatever the target already holds — the original intent.
+		if name == EntInvoice && writingMoney {
+			b.WriteString("-- ── ตรวจก่อนเขียนเงิน (ด่าน 5) ────────────────────────────────────\n")
+			b.WriteString(buildMoneyPatientGuard(in.ClinicCode, money.hns))
 		}
 		b.WriteString(fmt.Sprintf("-- ── %s ─────────────────────────────────────────────────────────\n", name))
 		b.WriteString(sqlText)

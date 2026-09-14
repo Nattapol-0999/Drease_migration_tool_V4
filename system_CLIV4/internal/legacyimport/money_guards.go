@@ -15,10 +15,23 @@ import (
 // the only place that can enforce them against what was ACTUALLY written is the script
 // itself.
 //
-// Two run BEFORE the inserts, because a clash is cheaper to report than to undo:
+// One runs BEFORE any insert, because a clash is cheaper to report than to undo:
 //
 //	4  document numbers must not already belong to a different patient
+//
+// One runs BETWEEN the patient phase and the money phase:
+//
 //	5  every bill's HN must exist in patient
+//
+// Guard 5 used to sit with guard 4 at the top of the file, and that made a full import
+// impossible. It asks whether a patient exists, and in a run that imports patients AND
+// money the patients are written by the same script 2,800 lines further down — so the
+// guard read an empty table and refused. Measured on a real export: 4,372 HNs reported
+// missing while 6,439 patient inserts sat below the guard waiting to create them.
+//
+// Moving it after the patient phase keeps every property that mattered: the patients of
+// THIS run are already in the transaction, no money row has been written yet, and a
+// money-only run still gets checked against whatever the target already holds.
 //
 // Three run AFTER, checking the rows that landed:
 //
@@ -35,8 +48,11 @@ import (
 // before rendering. They are kept anyway: "should be unreachable" is a claim about code,
 // and the money is worth checking against the database instead.
 
-// buildMoneyPreflightGuards renders guards 4 and 5.
-func buildMoneyPreflightGuards(clinic string, invoiceHN, receiptHN map[string]string, hns map[string]bool) string {
+// buildMoneyPreflightGuards renders guard 4 (a and b).
+//
+// These two only ever look at rows that were ALREADY at the target, so the top of the
+// script is the right place: nothing this run writes can change the answer.
+func buildMoneyPreflightGuards(clinic string, invoiceHN, receiptHN map[string]string) string {
 	var b strings.Builder
 
 	if len(invoiceHN) > 0 {
@@ -83,10 +99,22 @@ END $guard$;
 `, sqlValuesPairs(receiptHN), lit(clinic)))
 	}
 
-	if len(hns) > 0 {
-		b.WriteString(fmt.Sprintf(`-- GUARD 5: ทุกบิลต้องมีคนไข้อยู่จริงในคลินิกนี้
+	return b.String()
+}
+
+// buildMoneyPatientGuard renders guard 5, and is emitted between the patient phase and
+// the money phase — never at the top of the script. See the package comment: at the top
+// it read a table the same run had not filled yet and refused every full import.
+func buildMoneyPatientGuard(clinic string, hns map[string]bool) string {
+	if len(hns) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`-- GUARD 5: ทุกบิลต้องมีคนไข้อยู่จริงในคลินิกนี้
 -- invoice.hn เป็นข้อความ ไม่มี FK ไปหา patient — บิลที่อ้าง HN ที่ไม่มีตัวตนจะกลายเป็น
 -- ยอดค้างที่หาเจ้าของไม่ได้ และไม่มีใครเห็นในประวัติคนไข้คนใด
+--
+-- ด่านนี้อยู่ตรงนี้ ไม่ใช่หัวไฟล์ เพราะคนไข้ของรอบนี้ถูกเขียนไปแล้วข้างบน ส่วนบิลยังไม่ถูกเขียน
+-- ถ้าย้ายขึ้นไปหัวไฟล์ มันจะอ่านตาราง patient ที่ยังว่างแล้วปฏิเสธการนำเข้าที่ถูกต้องทุกครั้ง
 DO $guard$
 DECLARE
     missing text;
@@ -100,14 +128,11 @@ BEGIN
      );
 
     IF n > 0 THEN
-        RAISE EXCEPTION 'invoice: มี %% HN ในบิลที่ไม่มีคนไข้ในคลินิกนี้ — นำเข้าคนไข้ให้ครบก่อน แล้วรันอีกครั้ง: %%', n, left(missing, 2000);
+        RAISE EXCEPTION 'invoice: มี %% HN ในบิลที่ไม่มีคนไข้ในคลินิกนี้ — นำเข้ากลุ่ม patients มาด้วย หรือนำเข้าคนไข้ให้ครบก่อน แล้วรันอีกครั้ง: %%', n, left(missing, 2000);
     END IF;
 END $guard$;
 
-`, sqlTextArray(hns), lit(clinic)))
-	}
-
-	return b.String()
+`, sqlTextArray(hns), lit(clinic))
 }
 
 // buildMoneyVerifyGuards renders guards 1–3, which read the rows the script just wrote.
