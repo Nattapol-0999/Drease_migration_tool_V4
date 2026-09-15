@@ -1129,21 +1129,48 @@ export default function GenerateForm() {
   async function importToServer() {
     if (!result) return;
 
-    // 2ข: no archive is a legitimate choice, but a silent one is how a tenant ends up with
-    // no images and nobody noticing for a week. Asked once, here, not enforced.
-    const withPhotos = photoSessionId !== "" && imgFile !== null;
-    if (!withPhotos) {
-      const why = !imgFile
-        ? "ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)"
-        : "ไฟล์รูปยังไม่ได้อัปโหลดขึ้นเซิร์ฟเวอร์ — กด “ตรวจก่อน (อ่านอย่างเดียว)” ที่ส่วนรูปหนึ่งครั้ง";
+    // ONE PRESS MEANS ONE PRESS. An attached archive that has not been uploaded yet is
+    // uploaded HERE — requiring "ตรวจก่อน" first would be the second button this change
+    // exists to remove, and that is exactly how the first attempt at it still shipped
+    // without images.
+    //
+    // 2ข applies only when there is no archive at all: that is a legitimate choice, but a
+    // silent one is how a tenant ends up with no images and nobody noticing for a week.
+    let photoSession = photoSessionId;
+    if (!imgFile) {
       if (
         !window.confirm(
-          `${why}\n\nรอบนี้จะนำเข้าเฉพาะข้อมูล ไม่มีรูปหน้าเวชระเบียน\n\nกด OK เพื่อนำเข้าโดยไม่เอารูป · กด Cancel เพื่อกลับไปแนบไฟล์`,
+          "ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)\n\n" +
+            "รอบนี้จะนำเข้าเฉพาะข้อมูล ไม่มีรูปหน้าเวชระเบียน\n\n" +
+            "กด OK เพื่อนำเข้าโดยไม่เอารูป · กด Cancel เพื่อกลับไปแนบไฟล์",
         )
       ) {
         return;
       }
+    } else if (!photoSession) {
+      // The dump goes up with it: the photo step reads the `page` collection out of the
+      // same MongoDB file, and generate has already consumed its own copy.
+      if (!files.mongo) {
+        setImportErr(
+          "นำเข้ารูปต้องมีไฟล์ MongoDB (.js) ด้วย — collection page อยู่ในไฟล์นั้น · แนบไฟล์ .js แล้วกดอีกครั้ง",
+        );
+        return;
+      }
+      setImporting(true);
+      try {
+        photoSession = await uploadPhotoInputs(files.mongo, imgFile);
+      } catch (e) {
+        setImportErr(
+          `ส่งไฟล์รูปขึ้นเซิร์ฟเวอร์ไม่สำเร็จ — ยังไม่ได้นำเข้าอะไรเลย: ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        );
+        setImporting(false);
+        setBusyState(null);
+        return;
+      }
     }
+    const withPhotos = photoSession !== "" && imgFile !== null;
 
     setImportErr(null);
     setImportLog(null);
@@ -1172,7 +1199,7 @@ export default function GenerateForm() {
           targetId,
           // Empty means "SQL only" on the server side too, so the decision above is the
           // only place it is made.
-          photoSessionId: withPhotos ? photoSessionId : "",
+          photoSessionId: withPhotos ? photoSession : "",
         }),
       });
       const text = await res.text();
@@ -2512,20 +2539,21 @@ export default function GenerateForm() {
                     is stated here rather than left for the operator to infer — the previous
                     version gave no clue and three tenants went in with no images. */}
                 <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-                  {photoSessionId && imgFile ? (
+                  {imgFile ? (
                     <>
-                      รอบนี้จะนำเข้า <b>ข้อมูล + รูปหน้าเวชระเบียน</b> ({human(imgFile.size)}) ในครั้งเดียว ·
-                      รูปคัดลอกหลัง SQL ผ่านแล้ว ถ้ารูปล้มข้อมูลยังอยู่และกดรูปซ้ำได้
-                    </>
-                  ) : imgFile ? (
-                    <>
-                      แนบไฟล์รูปไว้แล้วแต่ยังไม่ได้อัปโหลด — กด{" "}
-                      <b>ตรวจก่อน (อ่านอย่างเดียว)</b> ที่ส่วนรูปหนึ่งครั้ง แล้วปุ่มนี้จะนำเข้ารูปให้ด้วย
+                      รอบนี้จะนำเข้า <b>ข้อมูล + รูปหน้าเวชระเบียน</b> ({human(imgFile.size)}) ในการกดครั้งเดียว
+                      {photoSessionId ? (
+                        <> · ไฟล์รูปอยู่บนเซิร์ฟเวอร์แล้ว ไม่ต้องส่งซ้ำ</>
+                      ) : (
+                        <> · จะส่งไฟล์รูปขึ้นเซิร์ฟเวอร์ก่อนแล้วนำเข้าให้เอง</>
+                      )}
+                      <br />
+                      รูปคัดลอกหลัง SQL ผ่านแล้ว — ถ้ารูปล้ม ข้อมูลยังอยู่และกดนำเข้ารูปซ้ำได้
                     </>
                   ) : (
                     <>
                       รอบนี้จะนำเข้า <b>เฉพาะข้อมูล ไม่มีรูป</b> — ถ้าต้องการรูป แนบ{" "}
-                      <code>public_img.tar.gz</code> ที่ส่วน “รูปหน้าเวชระเบียน” ก่อน
+                      <code>public_img.tar.gz</code> ที่ส่วน “รูปหน้าเวชระเบียน” ด้านบน แล้วกดปุ่มนี้ปุ่มเดียว
                     </>
                   )}
                 </div>
@@ -2538,8 +2566,8 @@ export default function GenerateForm() {
                     {importing
                       ? "กำลังนำเข้า…"
                       : onProduction
-                        ? `import to ${selected.label} (ของจริง)${photoSessionId && imgFile ? " + รูป" : ""}`
-                        : `import to ${selected.label}${photoSessionId && imgFile ? " + รูป" : ""}`}
+                        ? `import to ${selected.label} (ของจริง)${imgFile ? " + รูป" : ""}`
+                        : `import to ${selected.label}${imgFile ? " + รูป" : ""}`}
                   </button>
                   {importing && (
                     <span className="muted">กำลังรัน psql บน {selected.label}…</span>
