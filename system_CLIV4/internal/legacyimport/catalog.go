@@ -437,8 +437,30 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 
 			// Every SKU needs a catalog_item or it cannot be sold at all. item_type is
 			// 'drug' for the whole collection (locked decision).
-			status := catalogStatus("drug", price, false)
-			if status == statusDraft {
+			//
+			// STATUS FOLLOWS items.active, AND NOTHING ELSE — settled with the clinic owner
+			// on 15 Sep 2026, replacing catalogStatus("drug", price, false).
+			//
+			// The old rule asked two questions the export cannot answer. It wanted a selling
+			// price, and 316 of this tenant's 398 SKUs carry 0 in V2 while the stock screen
+			// still lists them as ใช้งาน; it also wanted the five label fields
+			// (generic_name/strength/dosage_form/indication/warning), and the export has none
+			// of them for any SKU — measured, 0 of 398. So every drug arrived as draft: not
+			// sellable, absent from the item picker, and no amount of correct data in the
+			// dump could have changed that. The owner's answer is that V2's own switch is the
+			// authority: what the stock screen calls ใช้งาน is what V4 should offer.
+			//
+			// On this tenant that is 270 active (ยา 147 · อุปกรณ์ 81 · อื่นๆ 42) and 128 kept
+			// as draft. Draft still means receivable into stock and visible to staff, so a
+			// SKU switched off in V2 loses nothing but the ability to be sold.
+			//
+			// The price is no longer consulted at all: an item with no price sells at 0 and
+			// the counter can type one, which is a smaller problem than an item that cannot
+			// be dispensed.
+			itemActive := docBool(d, "active")
+			status := statusActive
+			if !itemActive {
+				status = statusDraft
 				draft++
 			}
 			sCatalog.comment("%s · %s → drug", code, oneLine(name))
@@ -514,8 +536,12 @@ ON CONFLICT (mongo_id) DO NOTHING;
 	eCatalog.SourceRows = len(firstSeen)
 	eSlot.Statements = sSlot.stmts
 
+	// Counted as "how many did V2 switch off", because that is now the only thing that
+	// decides it. The old message blamed a missing price and the five label fields, which
+	// stopped being the rule on 15 Sep 2026 — leaving it would send the operator looking for
+	// data to fill in that would change nothing.
 	if draft > 0 {
-		rep.warnf("catalog_item(drug): %d SKU เป็น status=draft — รับเข้าคลังได้ แต่ขายไม่ได้จนกว่าจะใส่ราคาขายและฉลากยา 5 ฟิลด์ (ต้นทางไม่มีข้อมูลนี้)", draft)
+		rep.notef("catalog_item(drug): %d SKU เป็น status=draft เพราะระบบเดิมปิดใช้งานไว้ (items.active=false) — รับเข้าคลังและเห็นในรายการได้ แต่ขายไม่ได้จนกว่าจะเปิดใช้งานในหน้าตั้งค่า · ที่เหลือเข้าเป็น status=1 ตามที่ระบบเดิมบอกว่าใช้งาน", draft)
 	}
 	if noBranch > 0 {
 		rep.warnf("slot_stock: %d ล็อตไม่รู้คลังต้นทาง จึงไม่ถูก import (slot_stock บังคับ branch_code ต้องไม่ว่าง)", noBranch)
