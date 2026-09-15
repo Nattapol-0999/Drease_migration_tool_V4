@@ -53,6 +53,28 @@ interface Job {
   isProduction?: boolean;
   psqlLog?: string;
 
+  // photos, when the import job carried them too.
+  //
+  // Kept SEPARATE from `error` on purpose. The SQL commits first and the photos follow, so
+  // "data in, images not" is a real and recoverable outcome: the operator re-runs the photo
+  // step alone rather than deleting the tenant and starting over. Folding it into `error`
+  // would report the whole import as failed and invite exactly that.
+  photo?: {
+    ran: boolean;
+    ok: boolean;
+    /** Why it did not run, or why it failed. Empty when it worked. */
+    message?: string;
+    planned?: number;
+    matched?: number;
+    filesSent?: number;
+    thumbsSent?: number;
+    bytesSent?: number;
+    rows?: number;
+    seconds?: string;
+    uploads?: string;
+    log?: string;
+  };
+
   // survey
   //
   // Kept as the parsed object rather than a path: it is a few kilobytes, the browser needs
@@ -86,6 +108,7 @@ export interface JobView {
   target?: string;
   isProduction?: boolean;
   psqlLog?: string;
+  photo?: Job["photo"];
   survey?: unknown;
   sqlBytesIn?: number;
   mongoBytesIn?: number;
@@ -121,6 +144,7 @@ export function jobView(j: Job): JobView {
     target: j.target,
     isProduction: j.isProduction,
     psqlLog: j.psqlLog,
+    photo: j.photo,
     survey: j.survey,
     sqlBytesIn: j.sqlBytesIn,
     mongoBytesIn: j.mongoBytesIn,
@@ -152,6 +176,8 @@ export interface JobHandle {
   }): void;
   /** import only. */
   setImportResult(r: { target: string; isProduction: boolean; psqlLog: string }): void;
+  /** Result of the photo step that ran inside this import job. */
+  setPhotoResult(r: NonNullable<Job["photo"]>): void;
   /** survey only: the parsed branch survey plus the sizes it was read from. */
   setSurveyResult(r: { survey: unknown; sqlBytes: number; mongoBytes: number }): void;
 }
@@ -205,6 +231,9 @@ export async function startJob(
       job.target = r.target;
       job.isProduction = r.isProduction;
       job.psqlLog = r.psqlLog;
+    },
+    setPhotoResult: (r) => {
+      job.photo = r;
     },
     setSurveyResult: (r) => {
       job.survey = r.survey;

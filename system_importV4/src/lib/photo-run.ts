@@ -1,0 +1,308 @@
+import "server-only";
+
+import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { describeTrim, trimMongoDump } from "@/lib/mongo-trim";
+import {
+  buildInsertSQL,
+  cleanup,
+  describeUploads,
+  extractArchive,
+  readManifest,
+  readUploadsTarget,
+  shipFiles,
+  surveyArchive,
+} from "@/lib/photo-import";
+import type { Survey } from "@/lib/photo-import";
+import { describeTarget, psqlCommand, resolveTarget, runSSH, sshArgs } from "@/lib/server-target";
+import { sessionExists, stagedPath, stagedSize } from "@/lib/upload-staging";
+import type { TargetId } from "@/lib/types";
+
+const run = promisify(execFile);
+
+/**
+ * The photo import, as one callable step.
+ *
+ * WHY THIS IS NOT INSIDE THE ROUTE
+ * Two callers need the identical behaviour and must not drift apart:
+ *
+ *   /api/import-photos     the standalone survey/apply pair, still there because a failed
+ *                          photo copy has to be retryable without re-running the SQL
+ *   /api/import-to-server  the one button an operator presses, which runs the SQL and then
+ *                          the photos in the same job
+ *
+ * A second copy of this logic in the second caller is how the two would end up filing
+ * images differently, so it lives here and both call it.
+ *
+ * ERRORS THROW, they are not returned. The route turns a PhotoRunError into its HTTP
+ * response; the job-based caller lets it fail the job. Either way the message is the one
+ * the operator sees, so it says what happened and what to do — never a bare status code.
+ */
+
+export interface PhotoRunOptions {
+  /** Path to system_cliv4. */
+  cli: string;
+  clinic: string;
+  targetId: TargetId;
+  /** Staging session holding fields `mongo` and `images`. */
+  sessionId: string;
+  /** survey plans and reports; apply also ships bytes and writes rows. */
+  mode: "survey" | "apply";
+  /** Recorded in the audit line, so "who did this" survives in the log. */
+  user: string;
+  /** Optional progress sink — the job-based caller shows these to the operator. */
+  onPhase?: (phase: string) => void;
+}
+
+export interface PhotoRunResult {
+  mode: "survey" | "apply";
+  target: string;
+  uploads: string;
+  isProduction: boolean;
+  planned: number;
+  matched: number;
+  // The shapes come straight from Survey rather than being restated, so a change there
+  // cannot silently narrow what this reports.
+  missing: Survey["missing"];
+  extraCount: number;
+  extraSample: string[];
+  totalBytes: number;
+  wouldReject: Survey["wouldReject"];
+  wouldRejectCount: number;
+  oversizeCount: number;
+  unsupportedCount: number;
+  extMismatchCount: number;
+  thumbFound: number;
+  thumbBytes: number;
+  rows: number;
+  report: string;
+  trim: string;
+  source: "staged";
+  sourceBytes: { page: number; images: number };
+  /** survey only: the INSERT statements that apply would run. */
+  sql?: string;
+  /** apply only. */
+  filesSent?: number;
+  thumbsSent?: number;
+  bytesSent?: number;
+  seconds?: string;
+  log?: string;
+}
+
+export class PhotoRunError extends Error {
+  readonly status: number;
+  /** Whatever was already known when it failed, so a caller can still show the counts. */
+  readonly partial?: Partial<PhotoRunResult>;
+
+  constructor(message: string, status = 422, partial?: Partial<PhotoRunResult>) {
+    super(message);
+    this.name = "PhotoRunError";
+    this.status = status;
+    this.partial = partial;
+  }
+}
+
+export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRunResult> {
+  const { cli, clinic, targetId, sessionId, mode, user, onPhase } = opts;
+  const phase = (s: string) => onPhase?.(s);
+
+  // Where the rows go (database host) and where the bytes go (backend host) are two
+  // different machines, and BOTH must be configured before anything is unpacked.
+  const dbTarget = resolveTarget(targetId);
+  if (!dbTarget) {
+    throw new PhotoRunError(`ปลายทางฐานข้อมูลของ ${targetId} ยังตั้งค่าไม่ครบ`, 503);
+  }
+  const { target: uploads, missing } = readUploadsTarget(targetId);
+  if (!uploads) {
+    throw new PhotoRunError(
+      `ยังตั้งค่าที่เก็บไฟล์รูปของ ${targetId} ไม่ครบ — ขาด ${missing.join(", ")}`,
+      503,
+    );
+  }
+
+  if (!(await sessionExists(sessionId))) {
+    throw new PhotoRunError(
+      "ไม่พบไฟล์ที่อัปโหลดไว้ (session หมดอายุหรือถูกล้าง) — แนบไฟล์ใหม่",
+      409,
+    );
+  }
+  const stagedPageBytes = await stagedSize(sessionId, "mongo");
+  const stagedImageBytes = await stagedSize(sessionId, "images");
+  if (stagedPageBytes === 0) {
+    throw new PhotoRunError(
+      "ในการอัปโหลดนี้ไม่มีไฟล์ MongoDB (.js) — ต้องมีเพื่ออ่าน collection page",
+      400,
+    );
+  }
+  if (stagedImageBytes === 0) {
+    throw new PhotoRunError("ในการอัปโหลดนี้ไม่มีไฟล์รูป (public_img.tar.gz)", 400);
+  }
+
+  // Real disk, not /tmp: on the deployed box /tmp is a 455 MB tmpfs and the unpacked
+  // archive is 538 MB. See workRoot() in lib/photo-import for the failure that taught us.
+  const work = await mkdtemp(
+    join(process.env.UPLOAD_STAGING_DIR?.trim() || tmpdir(), "importv4-page-"),
+  );
+  let extractRoot = "";
+  let trimLog = "";
+  try {
+    // 1 · the copy plan comes from the CLI, which owns every mapping decision.
+    //
+    // The dump is filtered to the one collection this step reads before the CLI sees it.
+    // The CLI reads its input with os.ReadFile and keeps every parsed document, and a
+    // legacy mris export is mostly audit logs: measured, `page` is 0.4 MB of a 233 MB file
+    // while bills (57 MB), payment_summary (44 MB) and userlogsv2 (43 MB) are never read.
+    phase("กรอง collection page ออกจากไฟล์ MongoDB");
+    const pagePath = join(work, "page.js");
+    try {
+      const trimmed = await trimMongoDump(stagedPath(sessionId, "mongo"), pagePath, ["page"]);
+      trimLog = describeTrim(trimmed);
+      if (trimmed.keptBytes === 0) {
+        throw new PhotoRunError(
+          "ในไฟล์ MongoDB ที่ส่งมาไม่มี collection `page` เลย — รูปหน้าเวชระเบียนอยู่ในฐาน mris " +
+            "ต้อง export collection page มาด้วย",
+        );
+      }
+    } catch (err) {
+      if (err instanceof PhotoRunError) throw err;
+      throw new PhotoRunError(
+        `กรอง collection page จากไฟล์ MongoDB ไม่สำเร็จ: ${(err as Error).message}`,
+      );
+    }
+
+    phase("อ่านแผนคัดลอกรูปจาก CLI");
+    let report: string;
+    try {
+      const { stdout } = await run(cli, ["-clinic", clinic, "-page", pagePath, "-out", work], {
+        maxBuffer: 32 * 1024 * 1024,
+        windowsHide: true,
+      });
+      report = stdout;
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string };
+      throw new PhotoRunError((e.stderr || e.message || "").trim() || "รัน CLI ไม่สำเร็จ");
+    }
+
+    const manifest = await readManifest(join(work, `photos_${clinic}.json`), clinic);
+
+    // 2 · unpack the archive where it already lies and weigh every planned file. Copying it
+    // first would double the disk a 530 MB upload costs; extractArchive only reads it.
+    phase(`แตกไฟล์รูป ${(stagedImageBytes / 1048576).toFixed(1)} MB`);
+    extractRoot = await extractArchive(stagedPath(sessionId, "images"));
+    const survey = await surveyArchive(manifest, extractRoot);
+
+    const { sql, rows } = buildInsertSQL(clinic, manifest, survey);
+
+    const base: PhotoRunResult = {
+      mode,
+      target: describeTarget(dbTarget),
+      uploads: describeUploads(uploads),
+      isProduction: dbTarget.isProduction,
+      planned: manifest.files.length,
+      matched: survey.matched.length,
+      missing: survey.missing,
+      extraCount: survey.extraCount,
+      extraSample: survey.extraSample,
+      totalBytes: survey.totalBytes,
+      // Imported anyway, but reported: these are the images today's upload endpoint would
+      // turn away (3 MB / JPG-PNG only). Capped because the list is for recognising a
+      // pattern, not for reading end to end.
+      wouldReject: survey.wouldReject.slice(0, 50),
+      wouldRejectCount: survey.wouldReject.length,
+      oversizeCount: survey.oversizeCount,
+      unsupportedCount: survey.unsupportedCount,
+      extMismatchCount: survey.extMismatch.length,
+      thumbFound: survey.thumbFound,
+      thumbBytes: survey.thumbBytes,
+      rows,
+      report,
+      trim: trimLog,
+      source: "staged",
+      sourceBytes: { page: stagedPageBytes, images: stagedImageBytes },
+    };
+
+    if (mode === "survey") {
+      return { ...base, sql };
+    }
+
+    // Nothing matched means the archive is not the one this dump describes — the wrong
+    // tenant's images, or a tar made from the wrong directory. Refusing here is the last
+    // point at which that costs nothing.
+    if (survey.matched.length === 0) {
+      throw new PhotoRunError(
+        "ไม่มีรูปที่จับคู่กับไฟล์ในถุงได้เลย — ไม่มีอะไรจะนำเข้า (ตรวจว่า tar ถูก export จาก public/ และมีโฟลเดอร์ nas-doctorease/)",
+        422,
+        base,
+      );
+    }
+
+    // 3 · bytes first. A row pointing at a file that never arrived is a broken image in
+    // somebody's record, so nothing is inserted until the copy has succeeded.
+    phase(`คัดลอก ${survey.matched.length} ไฟล์ (${(survey.totalBytes / 1048576).toFixed(1)} MB) ไปเครื่องปลายทาง`);
+    const started = Date.now();
+    let ship;
+    try {
+      ship = await shipFiles(uploads, manifest, survey, extractRoot);
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string };
+      throw new PhotoRunError(
+        `คัดลอกไฟล์รูปไปที่ ${describeUploads(uploads)} ไม่สำเร็จ — ยังไม่ได้เขียนแถวใดลงฐานข้อมูล: ${(e.stderr || e.message || "").trim()}`,
+        422,
+        base,
+      );
+    }
+
+    // 4 · then the rows, in one transaction on the database host.
+    phase(`เขียน ${rows} แถวลง photos`);
+    const r = await runSSH(sshArgs(dbTarget, psqlCommand(dbTarget)), sql);
+    const seconds = ((Date.now() - started) / 1000).toFixed(1);
+    const log = [trimLog, ship.log, r.stdout, r.stderr].filter(Boolean).join("\n").trim();
+
+    // Recorded whether it worked or not: without this there is no answer to "who moved
+    // which clinic's images, where, and when".
+    console.log(
+      JSON.stringify({
+        event: "import-photos",
+        at: new Date().toISOString(),
+        user,
+        target: targetId,
+        clinic,
+        uploads_host: uploads.sshHost,
+        database: dbTarget.dbName,
+        source: "staged",
+        session: sessionId,
+        planned: manifest.files.length,
+        files_sent: ship.filesSent,
+        bytes_sent: ship.bytesSent,
+        rows,
+        exit: r.code,
+        seconds,
+      }),
+    );
+
+    if (r.code !== 0) {
+      throw new PhotoRunError(
+        `เขียนแถวไม่สำเร็จ (exit ${r.code}) — ฐานข้อมูลไม่ถูกเปลี่ยนเพราะอยู่ในทรานแซกชันเดียว ` +
+          `แต่ไฟล์รูป ${ship.filesSent} ไฟล์ถูกคัดลอกขึ้นเครื่องปลายทางแล้ว (ไม่มีแถวอ้างถึง จึงไม่มีใครเห็น)`,
+        422,
+        { ...base, filesSent: ship.filesSent, bytesSent: ship.bytesSent, seconds, log },
+      );
+    }
+
+    return {
+      ...base,
+      filesSent: ship.filesSent,
+      thumbsSent: ship.thumbsSent,
+      bytesSent: ship.bytesSent,
+      seconds,
+      log: log || "psql ไม่ได้ส่งข้อความใด (สำเร็จ)",
+    };
+  } finally {
+    await cleanup(extractRoot);
+    await rm(work, { recursive: true, force: true });
+  }
+}

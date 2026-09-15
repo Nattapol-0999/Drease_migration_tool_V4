@@ -8,7 +8,13 @@ import { promisify } from "node:util";
 import { requireSession } from "@/lib/require-session";
 import { describeTrim, trimMongoDump } from "@/lib/mongo-trim";
 import { startJob, type JobHandle } from "@/lib/jobs";
-import { dropSession, stagedFields, stagedPath, sessionExists } from "@/lib/upload-staging";
+import {
+  dropSession,
+  stagedFields,
+  stagedPath,
+  stagedSize,
+  sessionExists,
+} from "@/lib/upload-staging";
 import { MAX_CLI_INPUT_BYTES, MONGO_COLLECTIONS_USED } from "@/lib/types";
 
 const run = promisify(execFile);
@@ -315,7 +321,22 @@ async function generate(
     // The upload has been consumed (or has failed in a way that needs a new file), and the
     // form opens a new session on every attempt, so keeping it would only leave a
     // multi-gigabyte file on disk until the sweep noticed.
-    await dropSession(sessionId);
+    //
+    // EXCEPT when a photo archive is staged alongside it. /api/import-to-server runs the
+    // photo step in the same job as the SQL, and it reads BOTH `mongo` (for the `page`
+    // collection) and `images` out of this same session. Dropping it here would mean the
+    // operator uploading 763 MB a second time between pressing generate and pressing
+    // import — the very thing the combined button exists to avoid. The import route drops
+    // the session when it is finished with it, and sweepStaging clears anything abandoned
+    // after six hours, so nothing is left behind either way.
+    const keepForPhotos = (await stagedSize(sessionId, "images")) > 0;
+    if (keepForPhotos) {
+      h.addLog(
+        "เก็บไฟล์ที่อัปโหลดไว้ต่อ เพราะมีไฟล์รูปรอนำเข้าในขั้นถัดไป (ไม่ต้องอัปโหลดซ้ำ)",
+      );
+    } else {
+      await dropSession(sessionId);
+    }
     // The filtered copies fed to the CLI are dead weight once it has run — the script is
     // the artifact worth keeping. On a 921 MB input these two files are most of the disk
     // this job touches.

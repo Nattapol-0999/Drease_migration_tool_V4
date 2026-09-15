@@ -154,6 +154,29 @@ export interface JobView {
   isProduction?: boolean;
   psqlLog?: string;
   /**
+   * import: the photo step that ran inside the same job, when an archive was attached.
+   *
+   * SEPARATE FROM `error` on purpose. The SQL commits before the images copy, so "data in,
+   * images missing" is a real and recoverable state: the operator re-runs the photo step
+   * alone. Reporting it through `error` would say the whole import failed, which would send
+   * them to delete the tenant and start over for nothing.
+   */
+  photo?: {
+    /** false when the SQL failed first, so the photos were never attempted. */
+    ran: boolean;
+    ok: boolean;
+    message?: string;
+    planned?: number;
+    matched?: number;
+    filesSent?: number;
+    thumbsSent?: number;
+    bytesSent?: number;
+    rows?: number;
+    seconds?: string;
+    uploads?: string;
+    log?: string;
+  };
+  /**
    * survey: the branch survey itself, carried in the job rather than written to a file.
    * It is a few kilobytes and the browser needs all of it, unlike a generated script.
    */

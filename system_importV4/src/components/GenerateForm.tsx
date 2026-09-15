@@ -991,6 +991,10 @@ export default function GenerateForm() {
       // The server deletes the staging session once the CLI has run, so the id it held is
       // no longer usable. Forgetting it here means a second attempt uploads again instead
       // of failing with "session not found", which would be true but unhelpful.
+      //
+      // The PHOTO session is a different upload and survives on purpose: /api/generate keeps
+      // it when an archive is staged beside the dumps, so pressing import next runs the
+      // photos without sending 763 MB a second time.
       setSessionId("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -1108,8 +1112,39 @@ export default function GenerateForm() {
    * from disk. Like generation this is a job, because psql on a large script runs longer
    * than the 100 seconds Cloudflare allows.
    */
+  /**
+   * importToServer runs the SQL and, when an archive is attached, the photos — one press.
+   *
+   * WHY THE PHOTOS RIDE ALONG
+   * They used to be a separate survey-then-apply further up the page, and it was never
+   * pressed: three tenants went in and not one got its images. So the archive is uploaded
+   * with everything else and this button does both, in the order the data requires — SQL
+   * first, because photos.branch_code is resolved from the patient's branch and every row is
+   * keyed on an HN.
+   *
+   * The standalone photo step stays on the page for the case this cannot cover: the SQL
+   * commits before the images copy, so "data in, images missing" is recoverable without
+   * deleting the tenant.
+   */
   async function importToServer() {
     if (!result) return;
+
+    // 2ข: no archive is a legitimate choice, but a silent one is how a tenant ends up with
+    // no images and nobody noticing for a week. Asked once, here, not enforced.
+    const withPhotos = photoSessionId !== "" && imgFile !== null;
+    if (!withPhotos) {
+      const why = !imgFile
+        ? "ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)"
+        : "ไฟล์รูปยังไม่ได้อัปโหลดขึ้นเซิร์ฟเวอร์ — กด “ตรวจก่อน (อ่านอย่างเดียว)” ที่ส่วนรูปหนึ่งครั้ง";
+      if (
+        !window.confirm(
+          `${why}\n\nรอบนี้จะนำเข้าเฉพาะข้อมูล ไม่มีรูปหน้าเวชระเบียน\n\nกด OK เพื่อนำเข้าโดยไม่เอารูป · กด Cancel เพื่อกลับไปแนบไฟล์`,
+        )
+      ) {
+        return;
+      }
+    }
+
     setImportErr(null);
     setImportLog(null);
     setImportDone(null);
@@ -1118,9 +1153,13 @@ export default function GenerateForm() {
       title: `นำเข้าไปที่ ${selected?.label ?? targetId}`,
       phase: "กำลังเริ่ม",
       percent: null,
-      detail: `สคริปต์ ${human(result.sqlBytes)}`,
+      detail: withPhotos
+        ? `สคริปต์ ${human(result.sqlBytes)} + รูป ${human(imgFile?.size ?? 0)}`
+        : `สคริปต์ ${human(result.sqlBytes)}`,
       startedAt: Date.now(),
-      note: "สคริปต์อยู่ในทรานแซกชันเดียว ถ้ามีอะไรผิดฐานข้อมูลจะไม่ถูกเปลี่ยน",
+      note: withPhotos
+        ? "สคริปต์อยู่ในทรานแซกชันเดียว · รูปคัดลอกหลัง SQL ผ่านแล้ว ถ้ารูปล้มข้อมูลยังอยู่"
+        : "สคริปต์อยู่ในทรานแซกชันเดียว ถ้ามีอะไรผิดฐานข้อมูลจะไม่ถูกเปลี่ยน",
     });
     try {
       const res = await fetch("/api/import-to-server", {
@@ -1131,6 +1170,9 @@ export default function GenerateForm() {
           clinicCode: clinic.trim(),
           confirm: serverConfirm.trim(),
           targetId,
+          // Empty means "SQL only" on the server side too, so the decision above is the
+          // only place it is made.
+          photoSessionId: withPhotos ? photoSessionId : "",
         }),
       });
       const text = await res.text();
@@ -1153,8 +1195,30 @@ export default function GenerateForm() {
       const done = await waitForJob(start.jobId, (job) =>
         setBusyState((s) => (s ? { ...s, phase: job.phase } : s)),
       );
-      setImportLog(done.psqlLog ?? null);
-      setImportDone(`นำเข้าสำเร็จ → ${done.target ?? targetId} (${done.seconds}s)`);
+
+      // The photo half reports separately, because its failure is not the import's failure.
+      const photo = done.photo;
+      const parts = [`นำเข้าสำเร็จ → ${done.target ?? targetId} (${done.seconds}s)`];
+      if (photo?.ran && photo.ok) {
+        parts.push(
+          `รูป: คัดลอก ${photo.filesSent} ไฟล์ (${human(photo.bytesSent ?? 0)}) · เขียน ${photo.rows} แถว`,
+        );
+        // The upload was consumed by the server; a later press would find nothing.
+        setPhotoSessionId("");
+      }
+      setImportLog([done.psqlLog, photo?.log].filter(Boolean).join("\n").trim() || null);
+      setImportDone(parts.join(" · "));
+
+      // Data in, images not: say so where the operator is looking, and point at the retry
+      // instead of leaving them to work out that the tenant does not need deleting.
+      if (photo && !photo.ok) {
+        setImportErr(
+          `ข้อมูลเข้าฐานเรียบร้อยแล้ว แต่รูปไม่เข้า: ${photo.message ?? "ไม่ทราบสาเหตุ"}` +
+            (photo.ran
+              ? " — ไฟล์รูปที่อัปโหลดไว้ยังอยู่ กดนำเข้ารูปซ้ำได้ที่ส่วน “รูปหน้าเวชระเบียน” ไม่ต้องนำเข้า SQL ใหม่"
+              : ""),
+        );
+      }
     } catch (e) {
       setImportErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2444,6 +2508,27 @@ export default function GenerateForm() {
                   onChange={(e) => setServerConfirm(e.target.value)}
                   placeholder={clinic.trim() || "clinic_code"}
                 />
+                {/* Whether the photos are coming along is decided by what is staged, so it
+                    is stated here rather than left for the operator to infer — the previous
+                    version gave no clue and three tenants went in with no images. */}
+                <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+                  {photoSessionId && imgFile ? (
+                    <>
+                      รอบนี้จะนำเข้า <b>ข้อมูล + รูปหน้าเวชระเบียน</b> ({human(imgFile.size)}) ในครั้งเดียว ·
+                      รูปคัดลอกหลัง SQL ผ่านแล้ว ถ้ารูปล้มข้อมูลยังอยู่และกดรูปซ้ำได้
+                    </>
+                  ) : imgFile ? (
+                    <>
+                      แนบไฟล์รูปไว้แล้วแต่ยังไม่ได้อัปโหลด — กด{" "}
+                      <b>ตรวจก่อน (อ่านอย่างเดียว)</b> ที่ส่วนรูปหนึ่งครั้ง แล้วปุ่มนี้จะนำเข้ารูปให้ด้วย
+                    </>
+                  ) : (
+                    <>
+                      รอบนี้จะนำเข้า <b>เฉพาะข้อมูล ไม่มีรูป</b> — ถ้าต้องการรูป แนบ{" "}
+                      <code>public_img.tar.gz</code> ที่ส่วน “รูปหน้าเวชระเบียน” ก่อน
+                    </>
+                  )}
+                </div>
                 <div className="row" style={{ marginTop: 10 }}>
                   <button
                     className={`go${onProduction ? " is-prod" : ""}`}
@@ -2453,8 +2538,8 @@ export default function GenerateForm() {
                     {importing
                       ? "กำลังนำเข้า…"
                       : onProduction
-                        ? `import to ${selected.label} (ของจริง)`
-                        : `import to ${selected.label}`}
+                        ? `import to ${selected.label} (ของจริง)${photoSessionId && imgFile ? " + รูป" : ""}`
+                        : `import to ${selected.label}${photoSessionId && imgFile ? " + รูป" : ""}`}
                   </button>
                   {importing && (
                     <span className="muted">กำลังรัน psql บน {selected.label}…</span>
