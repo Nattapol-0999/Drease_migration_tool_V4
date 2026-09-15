@@ -156,7 +156,11 @@ export async function POST(req: Request): Promise<Response> {
     }
   }
 
-  const work = await mkdtemp(join(tmpdir(), "importv4-page-"));
+  // Real disk, not /tmp: the trimmed dump and the CLI's manifest land here, and on the
+  // deployed box /tmp is a 455 MB tmpfs. See workRoot() in lib/photo-import.
+  const work = await mkdtemp(
+    join(process.env.UPLOAD_STAGING_DIR?.trim() || tmpdir(), "importv4-page-"),
+  );
   let extractRoot = "";
   let trimLog = "";
   try {

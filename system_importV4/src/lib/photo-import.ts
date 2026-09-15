@@ -25,6 +25,24 @@ import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, open, readFile, rm, stat, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+/**
+ * workRoot is where this module unpacks and re-bundles image bytes.
+ *
+ * NOT os.tmpdir(). On the deployed box /tmp is a 455 MB tmpfs — it spends RAM on a 908 MB
+ * instance, and it is far too small for the job: a real clinic's archive is 530 MB
+ * compressed and 538 MB unpacked, so `tar -xzf` into /tmp dies partway with "Cannot write:
+ * Disk quota exceeded" and the step fails with no folder ever created on the backend host.
+ * That is exactly how the photo import looked broken while the upload side was already
+ * fixed.
+ *
+ * UPLOAD_STAGING_DIR is reused because it is already required to point at real disk (see
+ * upload-staging.ts) and is already sized for these files — the archive itself is sitting
+ * in it. os.tmpdir() stays as the fallback so a dev box with no env set behaves as before.
+ */
+function workRoot(): string {
+  return process.env.UPLOAD_STAGING_DIR?.trim() || tmpdir();
+}
 import { promisify } from "node:util";
 
 import { TARGET_IDS, type TargetId } from "@/lib/types";
@@ -346,7 +364,7 @@ async function listArchiveFiles(root: string): Promise<string[]> {
  * relies on. Twenty-odd MB of scans is cheap; a misparsed column is not.
  */
 export async function extractArchive(tarPath: string): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "importv4-img-"));
+  const dir = await mkdtemp(join(workRoot(), "importv4-img-"));
   try {
     await run("tar", ["-xzf", tarPath, "-C", dir], { maxBuffer: 8 * 1024 * 1024 });
   } catch (err) {
@@ -389,7 +407,7 @@ export async function shipFiles(
   survey: Survey,
   extractRoot: string,
 ): Promise<ShipResult> {
-  const stage = await mkdtemp(join(tmpdir(), "importv4-stage-"));
+  const stage = await mkdtemp(join(workRoot(), "importv4-stage-"));
   const bundle = join(stage, "..", `importv4-bundle-${process.pid}.tar.gz`);
   const payload = join(stage, "payload");
 
