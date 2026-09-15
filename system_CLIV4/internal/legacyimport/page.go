@@ -54,14 +54,26 @@ import (
 //
 // DECISIONS TAKEN HERE (implementation, reversible):
 //
-//   - visit_id STAYS NULL, and that is not laziness. SaveMedia (PUT
+//   - visit_id is NO LONGER left NULL. It used to be, on the grounds that SaveMedia (PUT
 //     /v3/charts/:hn/:vn/media) does `DELETE FROM photos WHERE clinic_code = ? AND
-//     visit_id = ?` — a hard delete — before re-inserting the visit's list. An imported
-//     row carrying a visit_id would be destroyed the first time a doctor saved media on
-//     that encounter. The v4 query file states the contract this relies on: "Legacy
-//     photos (visit_id NULL) are never touched."
-//   - kind = 'note'. The column is CHECK (before|after|note) and a scanned record page
-//     is neither a before nor an after photo.
+//     visit_id = ?` — a hard delete — so a bound row would be destroyed the first time a
+//     doctor saved media on that encounter.
+//
+//     That reasoning was right about the danger and wrong about the outcome: the
+//     before/after modal reads media PER VISIT, so a page with visit_id NULL can never
+//     appear in it at all. Measured on a real migrated clinic: 435 of 437 imported rows
+//     had visit_id NULL and the modal was empty. The pages are therefore bound to a visit
+//     by the caller (see the web tool's buildInsertSQL), and v4 migration 0420 adds
+//     photos.legacy_import so DeleteMediaByVisit skips them instead. Binding without
+//     that column deployed WILL destroy the scans — the two changes ship together.
+//   - kind comes from the area_tag family: before → before, after → after, everything
+//     else → note. The column is CHECK (before|after|note). A scanned OPD form is
+//     neither a before nor an after photo, and calling it one would file a lab result in
+//     the "ก่อนทำ" slot; but V2's own before/after pages ARE those things and belong in
+//     the slots, which is why they are no longer flattened to note.
+//   - doctype "trash" is NOT imported (owner's decision, 15 Sep 2026). V2 already threw
+//     those pages away; carrying them over refills a bin the clinic emptied. The count is
+//     reported so the omission is visible rather than silent.
 //   - The on-disk filename is a hash of clinic+rev_id, not a random UUID and not the
 //     rev_id itself. Random would break this package's determinism promise (the same
 //     dump must produce a byte-identical artifact, so two runs can be diffed); the raw
@@ -142,9 +154,17 @@ type PhotoFile struct {
 	// target — but only when that import ran for this clinic. Empty when the value is
 	// not a number.
 	CreatedBy string `json:"created_by,omitempty"`
-	// AreaTag is page.doctype ("OPD01004"), clipped to the column width. It is the only
-	// place the legacy document type survives.
+	// AreaTag is page.doctype folded to its FAMILY: every "OPD…" code becomes "OPD",
+	// every "BA…" becomes "BA", and "before"/"after" pass through untouched. One real
+	// clinic emitted 15 distinct doctype codes (OPD08020, OPD01007, OPD07001, BA2, BA6,
+	// …); the digits are a V2 form number that means nothing at the target, and 15 tags
+	// no v4 screen has ever heard of is a filter nobody can use. Clipped to the column
+	// width. Folding decided by the clinic owner, 15 Sep 2026.
 	AreaTag string `json:"area_tag"`
+	// Kind is photos.kind — CHECK (before|after|note) — and it decides which slot the
+	// per-visit before/after modal drops the image into. Derived from AreaTag, never read
+	// from the source: see areaKind.
+	Kind string `json:"kind"`
 	// Note carries the page identity that photos has no columns for: page number,
 	// docgroup, and the visit dates. Written for a human reading the record, not for
 	// this tool to parse back.
@@ -161,6 +181,43 @@ type PhotoManifest struct {
 	// a suffix inside the first one, so a thumbnail can never be mistaken for the image.
 	UploadsThumbSubdir string      `json:"uploads_thumb_subdir"`
 	Files              []PhotoFile `json:"files"`
+}
+
+// legacyTrashDoctype is the doctype V2 stamps on a page the clinic deleted. Those pages are
+// skipped, not imported: V2 already threw them away.
+const legacyTrashDoctype = "trash"
+
+// areaFamily folds a V2 doctype into the tag that is stored.
+//
+// "OPD08020", "OPD01007", "OPD07001" … are all the same thing to anyone reading a record —
+// a scanned OPD form — and the digits are a V2 form number with no meaning at the target.
+// "BA2"/"BA6" are the same story. "before"/"after" are already meaningful and pass straight
+// through, as does anything else the export happens to contain (kept verbatim rather than
+// bucketed into "other", so an unexpected value is visible instead of disguised).
+func areaFamily(doctype string) string {
+	t := strings.TrimSpace(doctype)
+	switch {
+	case strings.HasPrefix(t, "OPD"):
+		return "OPD"
+	case strings.HasPrefix(t, "BA"):
+		return "BA"
+	default:
+		return t
+	}
+}
+
+// areaKind maps the stored tag to photos.kind, whose CHECK allows only before|after|note.
+//
+// Only V2's own "before"/"after" pages become before/after. Everything else is a note: a
+// scanned form, a lab result or a consent page is not a before-photo, and putting one in
+// that slot would make the modal state something the source never said.
+func areaKind(areaTag string) string {
+	switch areaTag {
+	case "before", "after":
+		return areaTag
+	default:
+		return "note"
+	}
 }
 
 // buildPhotos reads the `page` collection and returns the copy plan. It renders no SQL:
@@ -210,6 +267,13 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	sameInstant := map[string][]string{}
 
 	pages, revs, skippedRevs := 0, 0, 0
+	// Pages V2 had already deleted. Counted rather than dropped in silence: "437 files in
+	// the archive, 404 rows imported" has to have a stated reason.
+	trashed := 0
+	// How the imported pages landed across photos.kind. The before/after modal only fills
+	// its two slots from before/after, so this number is what says how much of the record
+	// will be reachable there.
+	kinds := map[string]int{}
 
 	for n, d := range docs {
 		hn := strings.TrimSpace(d.Text("hn"))
@@ -268,8 +332,20 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 			}
 			seenTarget[target] = true
 
-			areaTag, cut := clip(strings.TrimSpace(pd.Text("doctype")), 16)
+			// Pages V2 deleted are dropped here, BEFORE the target path is reserved, so a
+			// trashed page cannot claim a filename or count as imported.
+			doctype := strings.TrimSpace(pd.Text("doctype"))
+			if doctype == legacyTrashDoctype {
+				e.skip("V2 ทิ้งหน้านี้แล้ว (doctype=trash)")
+				trashed++
+				delete(seenTarget, target)
+				continue
+			}
+
+			areaTag, cut := clip(areaFamily(doctype), 16)
 			tr.note("area_tag", cut)
+			kind := areaKind(areaTag)
+			kinds[kind]++
 
 			note, cut := clip(photoNote(pd), 0)
 			tr.note("note", cut)
@@ -311,6 +387,7 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				DoctorCode: doctorCode,
 				CreatedBy:  createdBy,
 				AreaTag:    areaTag,
+				Kind:       kind,
 				Note:       note,
 			})
 		}
@@ -340,6 +417,13 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	if skippedRevs > 0 {
 		rep.warnf("photos: ข้าม %d rev ที่ไม่ใช่อันล่าสุด — ประวัติการแก้ของหน้าเหล่านั้นไม่ถูกนำเข้า (มติเจ้าของคลินิก)", skippedRevs)
 	}
+	if trashed > 0 {
+		rep.notef("photos: ข้าม %d หน้าที่ V2 ทิ้งแล้ว (doctype=trash) — ไม่นำเข้าตามมติเจ้าของคลินิก "+
+			"ฉะนั้นจำนวนไฟล์ในถุงจะมากกว่าจำนวนแถวเท่าจำนวนนี้", trashed)
+	}
+	rep.notef("photos: kind ที่ได้ — before %d · after %d · note %d · "+
+		"โมดัลก่อน-หลังเติมช่องได้จาก before/after เท่านั้น ส่วน note อ่านได้จากแถบรูปของแฟ้ม",
+		kinds["before"], kinds["after"], kinds["note"])
 	for key, urls := range sameInstant {
 		if len(urls) > 1 {
 			parts := strings.SplitN(key, "|", 2)

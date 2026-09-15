@@ -130,8 +130,18 @@ func TestPageMapsEveryColumn(t *testing.T) {
 	if f.ClinicCode != "C9D4865" {
 		t.Errorf("clinic_code = %q", f.ClinicCode)
 	}
-	if f.AreaTag != "OPD01004" {
-		t.Errorf("area_tag = %q, want the legacy doctype", f.AreaTag)
+	// The fixture's doctype is OPD01004 and the stored tag is the FAMILY, not the code.
+	// Changed by the clinic owner on 15 Sep 2026: one clinic produced 15 distinct doctype
+	// codes, the digits are a V2 form number that means nothing at the target, and 15 tags
+	// no v4 screen knows about is a filter nobody can use.
+	if f.AreaTag != "OPD" {
+		t.Errorf("area_tag = %q, want the doctype family \"OPD\"", f.AreaTag)
+	}
+	// A scanned OPD form is not a before-photo. kind decides which slot the before/after
+	// modal fills, and putting a form there would make the chart claim something the
+	// source never said.
+	if f.Kind != "note" {
+		t.Errorf("kind = %q, want note for a scanned OPD form", f.Kind)
 	}
 	if f.DoctorCode != "4764" {
 		t.Errorf("doctor_code = %q, want page.doctor kept as-is (doctor.go preserves legacy codes)", f.DoctorCode)
@@ -249,5 +259,169 @@ func TestPageRejectsWrongCollection(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "patient") {
 		t.Errorf("error %q should name the collections it did find", err)
+	}
+}
+
+// ── area_tag family folding · kind · trash (owner's decisions, 15 Sep 2026) ──────────
+
+// Every doctype the real clinic actually produced, folded to the tag that gets stored and
+// the kind that decides the modal slot. The counts in the comments are from that clinic's
+// 437 pages, so this table is not hypothetical.
+func TestPageFoldsDoctypeIntoFamilyAndDerivesKind(t *testing.T) {
+	cases := []struct {
+		doctype  string
+		wantTag  string
+		wantKind string
+		why      string
+	}{
+		{"OPD08020", "OPD", "note", "117 pages — a scanned OPD form, not a before-photo"},
+		{"OPD01007", "OPD", "note", "42 pages"},
+		{"OPD07001", "OPD", "note", "18 pages"},
+		{"OPD01000", "OPD", "note", "12 pages"},
+		{"OPD08021", "OPD", "note", "7 pages"},
+		{"OPD01004", "OPD", "note", "6 pages"},
+		{"OPD01005", "OPD", "note", "5 pages"},
+		{"OPD01006", "OPD", "note", "4 pages"},
+		{"OPD01008", "OPD", "note", "1 page"},
+		{"OPD07003", "OPD", "note", "1 page"},
+		{"BA2", "BA", "note", "5 pages — a V2 series number, not a before/after label"},
+		{"BA6", "BA", "note", "5 pages"},
+		{"before", "before", "before", "124 pages — V2 said before, so it fills the ก่อน slot"},
+		{"after", "after", "after", "57 pages"},
+	}
+
+	for _, c := range cases {
+		body := strings.Replace(realSample, `"doctype": "OPD01004",`,
+			`"doctype": "`+c.doctype+`",`, 1)
+		if !strings.Contains(body, `"doctype": "`+c.doctype+`"`) {
+			t.Fatalf("fixture did not take doctype %q", c.doctype)
+		}
+		man, _ := buildOne(t, body)
+		if len(man.Files) != 1 {
+			t.Fatalf("doctype %q: files = %d, want 1", c.doctype, len(man.Files))
+		}
+		if got := man.Files[0].AreaTag; got != c.wantTag {
+			t.Errorf("doctype %q → area_tag %q, want %q (%s)", c.doctype, got, c.wantTag, c.why)
+		}
+		if got := man.Files[0].Kind; got != c.wantKind {
+			t.Errorf("doctype %q → kind %q, want %q (%s)", c.doctype, got, c.wantKind, c.why)
+		}
+	}
+}
+
+// An unfamiliar doctype is kept verbatim rather than bucketed into "other": a value nobody
+// planned for should be visible in the record, not disguised as a known one.
+func TestPageKeepsUnknownDoctypeVerbatim(t *testing.T) {
+	body := strings.Replace(realSample, `"doctype": "OPD01004",`, `"doctype": "XRAY9",`, 1)
+	man, _ := buildOne(t, body)
+	if got := man.Files[0].AreaTag; got != "XRAY9" {
+		t.Errorf("area_tag = %q, want the unknown doctype kept as-is", got)
+	}
+	if got := man.Files[0].Kind; got != "note" {
+		t.Errorf("kind = %q, want note: only V2's own before/after fill the modal slots", got)
+	}
+}
+
+// A page V2 already deleted is not imported. 33 of the real clinic's 437 pages were trash;
+// carrying them over refills a bin the clinic had emptied.
+func TestPageSkipsTrashedPages(t *testing.T) {
+	body := strings.Replace(realSample, `"doctype": "OPD01004",`, `"doctype": "trash",`, 1)
+	rep := NewReport("C9D4865")
+	_, err := buildPhotos([]byte(body), Input{ClinicCode: "C9D4865"}, rep)
+	if err == nil {
+		t.Fatal("expected an error: the only page was trashed, so nothing is importable")
+	}
+	if n := rep.Entities[EntPhoto].Skipped["V2 ทิ้งหน้านี้แล้ว (doctype=trash)"]; n != 1 {
+		t.Errorf("trash skip counter = %d, want 1; skipped = %v", n, rep.Entities[EntPhoto].Skipped)
+	}
+	// The omission has to be stated with a number, or "437 files but 404 rows" has no
+	// explanation anyone can find later.
+	var noted bool
+	for _, s := range rep.Notes {
+		if strings.Contains(s, "V2 ทิ้งแล้ว") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("no note reporting the trashed pages; notes = %v", rep.Notes)
+	}
+}
+
+// A trashed page must not consume the filename it would have had: the target is reserved
+// before the doctype is read, so the skip has to release it. Two pages of the same patient,
+// one trashed, prove the survivor still gets its own path.
+func TestPageTrashDoesNotStealTheSurvivorsFilename(t *testing.T) {
+	const twoPages = `db.page.insert({
+    "_id": ObjectId("6a69baf54a1fd3fab955352f"),
+    "hn": "016900066",
+    "page": [
+        {
+            "page_id": ObjectId("6a69baf5846d48306c9757fb"),
+            "page": "001",
+            "doctype": "trash",
+            "doctor": "4764",
+            "rev": [
+                {
+                    "rev_id": ObjectId("6a69baf5846d48306c9757fc"),
+                    "url": "2026/dir/trashed.jpg",
+                    "created_at": ISODate("2026-07-29T08:33:57.787Z"),
+                    "user": "634"
+                }
+            ],
+            "anno": [ ]
+        },
+        {
+            "page_id": ObjectId("6a69baf5846d48306c9757fd"),
+            "page": "002",
+            "doctype": "before",
+            "doctor": "4764",
+            "rev": [
+                {
+                    "rev_id": ObjectId("6a69baf5846d48306c9757fe"),
+                    "url": "2026/dir/kept.jpg",
+                    "created_at": ISODate("2026-07-29T08:34:38.796Z"),
+                    "user": "634"
+                }
+            ],
+            "anno": [ ]
+        }
+    ]
+});`
+
+	man, rep := buildOne(t, twoPages)
+	if len(man.Files) != 1 {
+		t.Fatalf("files = %d, want 1 (the trashed page dropped, the other kept)", len(man.Files))
+	}
+	f := man.Files[0]
+	if f.SourceURL != "2026/dir/kept.jpg" {
+		t.Errorf("imported %q, want the non-trashed page", f.SourceURL)
+	}
+	if f.AreaTag != "before" || f.Kind != "before" {
+		t.Errorf("area_tag/kind = %q/%q, want before/before", f.AreaTag, f.Kind)
+	}
+	if n := rep.Entities[EntPhoto].Skipped["V2 ทิ้งหน้านี้แล้ว (doctype=trash)"]; n != 1 {
+		t.Errorf("trash skip counter = %d, want 1", n)
+	}
+	// Not the "duplicate rev" skip: that would mean the trashed page had held the path.
+	if n := rep.Entities[EntPhoto].Skipped["rev ซ้ำในไฟล์ต้นทาง (rev_id เดียวกันปรากฏสองครั้ง)"]; n != 0 {
+		t.Errorf("duplicate-target skip fired %d times — the trashed page kept its reservation", n)
+	}
+}
+
+// The kind breakdown is reported, because it is the only thing that says how much of the
+// imported record the before/after modal can actually show.
+func TestPageReportsKindBreakdown(t *testing.T) {
+	_, rep := buildOne(t, realSample)
+	var found string
+	for _, s := range rep.Notes {
+		if strings.Contains(s, "kind ที่ได้") {
+			found = s
+		}
+	}
+	if found == "" {
+		t.Fatalf("no note with the kind breakdown; notes = %v", rep.Notes)
+	}
+	if !strings.Contains(found, "note 1") {
+		t.Errorf("note %q should count this fixture's single OPD page as note", found)
 	}
 }

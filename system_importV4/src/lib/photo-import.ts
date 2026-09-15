@@ -69,6 +69,13 @@ export interface ManifestFile {
   doctor_code?: string;
   created_by?: string;
   area_tag: string;
+  /**
+   * photos.kind — CHECK (before|after|note). Derived by the CLI from the doctype family
+   * (page.go: areaKind), never guessed here. Optional in the type so a manifest produced
+   * by an older CLI still parses; those fall back to "note", which is what every imported
+   * row used to be.
+   */
+  kind?: string;
   note?: string;
 }
 
@@ -548,6 +555,56 @@ function intOrNull(s: string | undefined): string {
 }
 
 /**
+ * kindOf reads photos.kind off the manifest, refusing anything the column's CHECK would
+ * reject.
+ *
+ * The value is decided by the CLI (page.go: areaKind) — this is not a second opinion, it is a
+ * seatbelt for a manifest from an older CLI (no kind at all) or a hand-edited one. "note" is
+ * the safe fallback because it is what every imported page used to be: it lands the page in
+ * the record without claiming it is a before or after photo.
+ */
+function kindOf(f: ManifestFile): string {
+  const k = (f.kind ?? "").trim();
+  return k === "before" || k === "after" || k === "note" ? k : "note";
+}
+
+/**
+ * IMPORT_VISIT_DATE is the date of the visit every imported page is filed under.
+ *
+ * Chosen by the clinic owner on 15 Sep 2026 over the alternative of using each page's own
+ * วันตรวจ (page.vd_first, present on all 437 pages of the reference clinic and spread across
+ * 68 real dates from Sep 2022 to Jul 2026). The tradeoff was put to them explicitly: one
+ * visit per patient collapses years of treatment into a single encounter and shows a date the
+ * patient never attended, but it is one row per patient instead of one per patient-per-day
+ * and every old page lands in the same place. They picked the single date.
+ *
+ * The real dates are NOT lost: taken_at still carries the exact revision timestamp and the
+ * note still spells out "วันตรวจ YYYY-MM-DD" for every page.
+ */
+const IMPORT_VISIT_DATE = "2026-01-01";
+
+/** Title shown on the visit so nobody mistakes it for an encounter that was keyed in v4. */
+const IMPORT_VISIT_TITLE = "นำเข้าจากระบบเดิม";
+
+/**
+ * visitPlan groups the shipped images by HN and picks the values the visit row needs.
+ *
+ * doctor_code comes from the EARLIEST page of that patient (owner's choice, 15 Sep 2026):
+ * one visit carries one doctor, 13 patients in the reference clinic had pages from more than
+ * one, and the first page is the only pick that does not depend on iteration order.
+ */
+function visitPlan(files: ManifestFile[]): { hn: string; doctorCode?: string }[] {
+  const earliest = new Map<string, ManifestFile>();
+  for (const f of files) {
+    const prev = earliest.get(f.hn);
+    if (!prev || f.taken_at < prev.taken_at) earliest.set(f.hn, f);
+  }
+  return [...earliest.keys()]
+    .sort()
+    .map((hn) => ({ hn, doctorCode: earliest.get(hn)?.doctor_code }));
+}
+
+/**
  * buildInsertSQL renders the rows for the images that were actually shipped.
  *
  * Shape of each statement, and why:
@@ -559,9 +616,24 @@ function intOrNull(s: string | undefined): string {
  *     precision from the source revision, so two genuinely different pages colliding on
  *     it AND on byte count is not a case that occurs; when the manifest itself contains
  *     such a pair the CLI says so in its warnings.
- *   - visit_id NULL. See page.go: SaveMedia hard-deletes a visit's rows before rewriting
- *     them, so a row bound to a visit would be destroyed the first time a doctor saved
- *     media there.
+ *   - visit_id points at a visit this script creates, one per patient, dated
+ *     IMPORT_VISIT_DATE. It used to be NULL because SaveMedia hard-deletes a visit's rows
+ *     before rewriting them. That danger is real and has not gone away — it is now handled
+ *     at the other end: v4 migration 0420 adds photos.legacy_import and scopes
+ *     DeleteMediaByVisit to legacy_import = false, so the replace can no longer reach an
+ *     imported page. Running this SQL against a database WITHOUT 0420 is refused by a guard
+ *     below rather than left to fail on "column does not exist".
+ *
+ *     The reason for binding at all: the before/after modal reads media per visit
+ *     (ListMediaByVisit → WHERE visit_id = ?), so a page with visit_id NULL cannot appear
+ *     in it under any circumstances. Measured on a migrated clinic: 435 of 437 rows had
+ *     visit_id NULL and the modal was empty on screen.
+ *
+ *     A patient with no `patient` row gets NO visit (and so keeps visit_id NULL): a visit
+ *     hanging off a patient that does not exist is worse than a page that is only reachable
+ *     from the record's photo list. The count is reported.
+ *   - kind from the manifest (before|after|note), decided by the CLI from the doctype
+ *     family. It is what the modal uses to choose a slot.
  *   - branch_code read from the patient, in SQL, at insert time. The legacy page export
  *     does not say which branch a scan belongs to, but the patient it belongs to does, and
  *     that is the same answer: a scan is filed at the branch that holds the record. Doing
@@ -639,6 +711,99 @@ export function buildInsertSQL(
   out.push("END $guard$;");
   out.push("");
 
+  // GUARD: without 0420 the rows below would bind pages to a visit while the media lane can
+  // still hard-delete them. Refuse with a sentence that names the migration instead of
+  // letting Postgres say "column legacy_import does not exist" a thousand rows in.
+  out.push("-- GUARD: ปลายทางต้องมี migration 0420 (photos.legacy_import) ก่อน — ถ้าไม่มีแล้วผูก visit");
+  out.push("-- การกดบันทึกในโมดัลก่อน-หลังจะลบรูปที่นำเข้าทิ้งถาวร");
+  out.push("DO $guard418$");
+  out.push("BEGIN");
+  out.push("    IF NOT EXISTS (");
+  out.push("        SELECT 1 FROM information_schema.columns");
+  out.push("         WHERE table_name = 'photos' AND column_name = 'legacy_import'");
+  out.push("    ) THEN");
+  out.push(
+    "        RAISE EXCEPTION 'ฐานปลายทางยังไม่มีคอลัมน์ photos.legacy_import — " +
+      "รัน migration 0420 ของ drease-v4-backend ก่อน แล้วนำเข้ารูปอีกครั้ง';",
+  );
+  out.push("    END IF;");
+  out.push("END $guard418$;");
+  out.push("");
+
+  // ── visit ที่รูปจะไปผูก ──────────────────────────────────────────────────────────
+  const plan = visitPlan(
+    survey.matched
+      .map((m) => byTarget.get(m.target_path))
+      .filter((f): f is ManifestFile => Boolean(f)),
+  );
+
+  out.push("-- ══════════════════════════════════════════════════════════════════════════");
+  out.push(`-- visit ของรูปที่นำเข้า — ${plan.length} ใบ (1 ใบต่อคนไข้) วันที่ ${IMPORT_VISIT_DATE}`);
+  out.push("--");
+  out.push('-- โมดัล "รูป / ก่อน-หลัง" อ่านรูปทีละ visit (WHERE visit_id = ?) รูปที่ visit_id เป็น');
+  out.push("-- NULL จึงไม่มีทางโผล่ในโมดัลได้เลย — จึงต้องมี visit ให้ผูก");
+  out.push("--");
+  out.push("-- VN คิดจากจำนวน visit ที่มีอยู่ในวันนั้น + 1 ไม่ใช่เลขที่ตายตัวในสคริปต์ เพราะ");
+  out.push("-- uniq_visit_master_clinic_day_vn บังคับให้ VN ไม่ซ้ำต่อ (คลินิก + วัน) ไม่ใช่ต่อคนไข้");
+  out.push("-- ถ้าวันนั้นมีใบของระบบอยู่ก่อนแล้ว เลขจะไล่ต่อจากของเดิมแทนที่จะชนกัน");
+  out.push("--");
+  out.push("-- insert-only · รันซ้ำไม่เพิ่มใบซ้ำ (กันด้วย clinic_code + HN + visit_date)");
+  out.push("-- ══════════════════════════════════════════════════════════════════════════");
+  out.push("");
+
+  for (const v of plan) {
+    const c = lit(clinic);
+    const hn = lit(v.hn);
+    out.push(`-- hn ${v.hn}`);
+    out.push(
+      `INSERT INTO visit_master (clinic_code, "HN", "VN", visit_date, branch_code, doctor_code, title)
+SELECT ${c}, ${hn},
+       lpad((SELECT count(*) + 1 FROM visit_master
+              WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)})::text, 3, '0'),
+       DATE ${lit(IMPORT_VISIT_DATE)},
+       (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
+       ${nullLit(v.doctorCode)}, ${lit(IMPORT_VISIT_TITLE)}
+WHERE EXISTS (
+    SELECT 1 FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}
+) AND NOT EXISTS (
+    SELECT 1 FROM visit_master
+     WHERE clinic_code = ${c} AND "HN" = ${hn} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
+);`,
+    );
+    out.push("");
+  }
+
+  // How many patients ended up with no visit, and what that costs: their pages keep visit_id
+  // NULL and cannot appear in the before/after modal. Stated with a number rather than left
+  // to be discovered when a doctor opens an empty modal.
+  out.push("-- ใบที่มีอยู่จริงหลังรัน (คนไข้ที่ยังไม่มีในตาราง patient จะไม่ได้ใบ)");
+  out.push("DO $visits$");
+  out.push("DECLARE");
+  out.push("    made bigint;");
+  out.push("    noBr bigint;");
+  out.push("BEGIN");
+  out.push("    SELECT count(*), count(*) FILTER (WHERE branch_code IS NULL)");
+  out.push("      INTO made, noBr");
+  out.push("      FROM visit_master");
+  out.push(`     WHERE clinic_code = ${lit(clinic)} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}`);
+  out.push(`       AND title = ${lit(IMPORT_VISIT_TITLE)};`);
+  out.push(`    IF made < ${plan.length} THEN`);
+  out.push(
+    `        RAISE NOTICE 'visit: มี % ใบ จากที่ต้องการ ${plan.length} ใบ — ส่วนที่ขาดคือ HN ` +
+      "ที่ยังไม่มีในตาราง patient · รูปของคนเหล่านั้นเข้าฐานแล้วแต่จะไม่โผล่ในโมดัลก่อน-หลัง', made;",
+  );
+  out.push("    ELSE");
+  out.push("        RAISE NOTICE 'visit: มีครบ % ใบสำหรับรูปที่นำเข้า', made;");
+  out.push("    END IF;");
+  out.push("    IF noBr > 0 THEN");
+  out.push(
+    "        RAISE NOTICE 'visit: % ใบไม่มี branch_code เพราะ patient ของ HN นั้นไม่มีสาขา " +
+      "— ใบเหล่านั้นจะหลุดจากตัวกรองสาขาทุกจอ', noBr;",
+  );
+  out.push("    END IF;");
+  out.push("END $visits$;");
+  out.push("");
+
   let rows = 0;
   for (const m of survey.matched) {
     const f = byTarget.get(m.target_path);
@@ -654,13 +819,17 @@ export function buildInsertSQL(
     out.push(
       `INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
                     thumb_path, file_size, consent_given, note, doctor_code, created_by,
-                    taken_at, annotations, created_at, updated_at)
+                    taken_at, annotations, legacy_import, created_at, updated_at)
 SELECT ${c}, ${hn},
        (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
-       NULL, ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, 'note',
+       (SELECT vm.id FROM visit_master vm
+         WHERE vm.clinic_code = ${c} AND vm."HN" = ${hn}
+           AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
+         LIMIT 1),
+       ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, ${lit(kindOf(f))},
        ${lit(f.target_path)}, ${m.thumb ? lit(m.thumb.target_path) : "NULL"},
        ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
-       '[]'::jsonb, now(), now()
+       '[]'::jsonb, true, now(), now()
 WHERE NOT EXISTS (
     SELECT 1 FROM photos
      WHERE clinic_code = ${c} AND hn = ${hn}
