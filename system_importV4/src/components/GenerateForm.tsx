@@ -1724,7 +1724,8 @@ export default function GenerateForm() {
               nas-doctorease/
             </code>
             <br />
-            ต้องมีโฟลเดอร์ <code>nas-doctorease/</code> อยู่ในถุง · รวมกับไฟล์ .js แล้วไม่เกิน 64 MB
+            ต้องมีโฟลเดอร์ <code>nas-doctorease/</code> อยู่ในถุง · ไฟล์ใหญ่เท่าไรก็ได้ ระบบส่งขึ้นเป็นชิ้น
+            เหมือนไฟล์ dump (คลินิกจริงวัดได้ 437 รูป = 530 MB)
           </div>
 
           {files.mongo ? (
