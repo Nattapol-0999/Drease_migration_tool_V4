@@ -104,6 +104,17 @@ export const MONGO_COLLECTIONS_USED = [
   "payment_summary",
   "course_bills",
   "page",
+  // Point balances (loyalty_account). This list is an ALLOWLIST used to trim the mongo dump
+  // before the CLI sees it, so a collection missing here is invisible to the CLI no matter
+  // what it can parse — which is exactly how the loyalty group failed on its first run:
+  // the CLI refused with 'ไม่มี collection "points"' while the collection sat in the
+  // uploaded file, already discarded by mongo-trim.
+  "points",
+  // The movement history behind those balances. NOT imported (owner's decision, 15 Sep
+  // 2026) — it is carried through only so the CLI can COUNT it and state how many rows were
+  // left out. Dropping it here instead would make that warning read "0 documents", which
+  // says the ledger did not exist rather than that it was deliberately skipped.
+  "point_logs",
 ] as const;
 
 // Groups the CLI can import separately (`-only`). Selecting a subset is how a target
