@@ -573,41 +573,40 @@ function kindOf(f: ManifestFile): string {
  *
  * Chosen by the clinic owner on 15 Sep 2026 over the alternative of using each page's own
  * วันตรวจ (page.vd_first, present on all 437 pages of the reference clinic and spread across
- * 68 real dates from Sep 2022 to Jul 2026). The tradeoff was put to them explicitly: one
- * visit per patient collapses years of treatment into a single encounter and shows a date the
- * patient never attended, but it is one row per patient instead of one per patient-per-day
- * and every old page lands in the same place. They picked the single date.
+ * 68 real dates from Sep 2022 to Jul 2026). The tradeoff was put to them explicitly: filing
+ * everything under one date collapses years of treatment into a single day and shows a date
+ * the patient never attended, but every old page lands in the same place instead of being
+ * scattered over 68 days. They picked the single date.
  *
  * The real dates are NOT lost: taken_at still carries the exact revision timestamp and the
  * note still spells out "วันตรวจ YYYY-MM-DD" for every page.
  */
 const IMPORT_VISIT_DATE = "2026-01-01";
 
-/** Title shown on the visit so nobody mistakes it for an encounter that was keyed in v4. */
+/**
+ * Title shown on the visit so nobody mistakes it for an encounter that was keyed in v4.
+ *
+ * The SAME text on every visit, by the owner's decision on 16 Sep 2026. With one visit per
+ * page a patient now has several visits on IMPORT_VISIT_DATE and they read identically in the
+ * record's visit list; the alternatives put on the table were the V2 page number or that
+ * page's real วันตรวจ in the title, and both were declined.
+ */
 const IMPORT_VISIT_TITLE = "นำเข้าจากระบบเดิม";
 
 /**
- * visitPlan groups the shipped images by HN and picks the values the visit row needs.
+ * buildInsertSQL renders the rows for the images that were actually shipped. One statement
+ * per image, and that statement writes all three rows the image needs: its own visit, the
+ * `photos` row, and the `face_chart` that turns it into a page the doctor can draw on.
  *
- * doctor_code comes from the EARLIEST page of that patient (owner's choice, 15 Sep 2026):
- * one visit carries one doctor, 13 patients in the reference clinic had pages from more than
- * one, and the first page is the only pick that does not depend on iteration order.
- */
-function visitPlan(files: ManifestFile[]): { hn: string; doctorCode?: string }[] {
-  const earliest = new Map<string, ManifestFile>();
-  for (const f of files) {
-    const prev = earliest.get(f.hn);
-    if (!prev || f.taken_at < prev.taken_at) earliest.set(f.hn, f);
-  }
-  return [...earliest.keys()]
-    .sort()
-    .map((hn) => ({ hn, doctorCode: earliest.get(hn)?.doctor_code }));
-}
-
-/**
- * buildInsertSQL renders the rows for the images that were actually shipped: a visit per
- * patient, the `photos` rows themselves, and a `face_chart` per visit that turns every
- * imported page into a page the doctor can draw on.
+ * ONE VISIT AND ONE CHART PER IMAGE — owner's decision, 16 Sep 2026
+ *
+ * They asked for one face_chart row per photo. face_chart is UNIQUE (clinic_code, visit_id),
+ * so one chart per photo is only reachable by giving each photo its own visit; the earlier
+ * shape (one visit per patient, one chart listing all of that patient's pages) could not
+ * produce it without dropping that index from the app's own schema, which was declined.
+ *
+ * The cost was stated and accepted: the reference clinic goes from 174 visits to 404, and a
+ * patient with five pages shows five visits on IMPORT_VISIT_DATE reading identically.
  *
  * Shape of each statement, and why:
  *
@@ -618,7 +617,7 @@ function visitPlan(files: ManifestFile[]): { hn: string; doctorCode?: string }[]
  *     precision from the source revision, so two genuinely different pages colliding on
  *     it AND on byte count is not a case that occurs; when the manifest itself contains
  *     such a pair the CLI says so in its warnings.
- *   - visit_id points at a visit this script creates, one per patient, dated
+ *   - visit_id points at a visit this script creates for THIS image alone, dated
  *     IMPORT_VISIT_DATE. It used to be NULL because SaveMedia hard-deletes a visit's rows
  *     before rewriting them. That danger is real and has not gone away — it is now handled
  *     at the other end: v4 migration 0420 adds photos.legacy_import and scopes
@@ -732,114 +731,176 @@ export function buildInsertSQL(
   out.push("END $guard418$;");
   out.push("");
 
-  // ── visit ที่รูปจะไปผูก ──────────────────────────────────────────────────────────
-  const plan = visitPlan(
-    survey.matched
-      .map((m) => byTarget.get(m.target_path))
-      .filter((f): f is ManifestFile => Boolean(f)),
-  );
+  // ── visit + photos + face_chart: หนึ่งคำสั่งต่อหนึ่งรูป ───────────────────────────
+  //
+  // Postgres runs the data-modifying CTEs of one statement against the SAME snapshot, so
+  // reading v/ph through their RETURNING output is the documented way to hand an id from one
+  // INSERT to the next — it is not the same thing as reading the table back, and it cannot
+  // see a sibling CTE's writes. That is exactly what is needed here: photos.id and
+  // visit_master.id are generated by the database, and with several visits per patient
+  // sharing one date, looking a visit up by (HN, visit_date) would now pick an arbitrary
+  // sibling.
+  const pairs: { m: SurveyFile; f: ManifestFile }[] = [];
+  for (const m of survey.matched) {
+    const f = byTarget.get(m.target_path);
+    if (f) pairs.push({ m, f });
+  }
+  const patients = new Set(pairs.map((p) => p.f.hn)).size;
 
   out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push(`-- visit ของรูปที่นำเข้า — ${plan.length} ใบ (1 ใบต่อคนไข้) วันที่ ${IMPORT_VISIT_DATE}`);
+  out.push(
+    `-- รูป ${pairs.length} ใบ → visit ${pairs.length} ใบ + face_chart ${pairs.length} ใบ ` +
+      `(1 ใบต่อ 1 รูป) วันที่ ${IMPORT_VISIT_DATE} · คนไข้ ${patients} คน`,
+  );
+  out.push("--");
+  out.push("-- 1 รูป = 1 คำสั่ง ที่เขียน 3 แถว: visit ของรูปใบนั้น · แถว photos · ผังหน้า face_chart");
+  out.push("-- face_chart มี UNIQUE (clinic_code, visit_id) = 1 ใบต่อ visit ฉะนั้น 1 ผังหน้าต่อ 1 รูป");
+  out.push("-- ทำได้ทางเดียวคือให้รูปแต่ละใบมี visit ของตัวเอง");
+  out.push("--");
+  out.push("-- ทำไมต้องรวมเป็นคำสั่งเดียว: photos.id กับ visit_master.id ฐานออกให้เองตอน insert");
+  out.push("-- ฝั่งเครื่องมือรู้ล่วงหน้าไม่ได้ · และเมื่อ visit หลายใบอยู่วันเดียวกัน การหา visit ด้วย");
+  out.push("-- (HN + visit_date LIMIT 1) จะหยิบใบพี่น้องผิดใบทันที — RETURNING เท่านั้นที่ผูกถูกใบแน่นอน");
+  out.push("--");
+  out.push("-- base_type = 'photo:<photos.id>' และ strokes = [{\"page\":true,\"view\":\"photo:<id>\"}]");
+  out.push("-- เป็นรูปแบบที่แอปเขียนเองอยู่แล้ว (ยืนยันจากแถวจริง TEST01 visit 213: base_type");
+  out.push("-- photo:615 และมี page marker ทั้ง photo:614/photo:615 อยู่ในแถวเดียว) ·");
+  out.push("-- normalizeFaceView รับ photo:<เลขบวก> เป็น page ที่ถูกต้อง");
   out.push("--");
   out.push('-- โมดัล "รูป / ก่อน-หลัง" อ่านรูปทีละ visit (WHERE visit_id = ?) รูปที่ visit_id เป็น');
   out.push("-- NULL จึงไม่มีทางโผล่ในโมดัลได้เลย — จึงต้องมี visit ให้ผูก");
   out.push("--");
   out.push("-- VN คิดจากจำนวน visit ที่มีอยู่ในวันนั้น + 1 ไม่ใช่เลขที่ตายตัวในสคริปต์ เพราะ");
-  out.push("-- uniq_visit_master_clinic_day_vn บังคับให้ VN ไม่ซ้ำต่อ (คลินิก + วัน) ไม่ใช่ต่อคนไข้");
+  out.push("-- uniq_visit_master_clinic_day_vn บังคับให้ VN ไม่ซ้ำต่อ (คลินิก + วัน)");
   out.push("-- ถ้าวันนั้นมีใบของระบบอยู่ก่อนแล้ว เลขจะไล่ต่อจากของเดิมแทนที่จะชนกัน");
   out.push("--");
-  out.push("-- insert-only · รันซ้ำไม่เพิ่มใบซ้ำ (กันด้วย clinic_code + HN + visit_date)");
+  out.push("-- insert-only · รันซ้ำไม่เพิ่มของซ้ำทั้ง 3 ตาราง เพราะทุกแถวแขวนอยู่กับกุญแจเดียวกัน");
+  out.push("-- (clinic_code + hn + taken_at + file_size) ของแถว photos เอง");
+  out.push("--");
+  out.push("-- HN ที่ยังไม่มีในตาราง patient: ไม่ได้ visit และไม่ได้ผังหน้า แต่แถว photos ยังเข้าฐาน");
+  out.push("-- (visit_id NULL) — รูปอยู่ในแฟ้มแต่เปิดในโมดัลก่อน-หลังไม่ได้ · รายงานจำนวนท้ายสคริปต์");
   out.push("-- ══════════════════════════════════════════════════════════════════════════");
   out.push("");
 
-  for (const v of plan) {
-    const c = lit(clinic);
-    const hn = lit(v.hn);
-    out.push(`-- hn ${v.hn}`);
-    out.push(
-      `INSERT INTO visit_master (clinic_code, "HN", "VN", visit_date, branch_code, doctor_code, title)
-SELECT ${c}, ${hn},
-       lpad((SELECT count(*) + 1 FROM visit_master
-              WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)})::text, 3, '0'),
-       DATE ${lit(IMPORT_VISIT_DATE)},
-       (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
-       ${nullLit(v.doctorCode)}, ${lit(IMPORT_VISIT_TITLE)}
-WHERE EXISTS (
-    SELECT 1 FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}
-) AND NOT EXISTS (
-    SELECT 1 FROM visit_master
-     WHERE clinic_code = ${c} AND "HN" = ${hn} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
-);`,
-    );
-    out.push("");
-  }
-
-  // How many patients ended up with no visit, and what that costs: their pages keep visit_id
-  // NULL and cannot appear in the before/after modal. Stated with a number rather than left
-  // to be discovered when a doctor opens an empty modal.
-  out.push("-- ใบที่มีอยู่จริงหลังรัน (คนไข้ที่ยังไม่มีในตาราง patient จะไม่ได้ใบ)");
-  out.push("DO $visits$");
-  out.push("DECLARE");
-  out.push("    made bigint;");
-  out.push("    noBr bigint;");
-  out.push("BEGIN");
-  out.push("    SELECT count(*), count(*) FILTER (WHERE branch_code IS NULL)");
-  out.push("      INTO made, noBr");
-  out.push("      FROM visit_master");
-  out.push(`     WHERE clinic_code = ${lit(clinic)} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}`);
-  out.push(`       AND title = ${lit(IMPORT_VISIT_TITLE)};`);
-  out.push(`    IF made < ${plan.length} THEN`);
-  out.push(
-    `        RAISE NOTICE 'visit: มี % ใบ จากที่ต้องการ ${plan.length} ใบ — ส่วนที่ขาดคือ HN ` +
-      "ที่ยังไม่มีในตาราง patient · รูปของคนเหล่านั้นเข้าฐานแล้วแต่จะไม่โผล่ในโมดัลก่อน-หลัง', made;",
-  );
-  out.push("    ELSE");
-  out.push("        RAISE NOTICE 'visit: มีครบ % ใบสำหรับรูปที่นำเข้า', made;");
-  out.push("    END IF;");
-  out.push("    IF noBr > 0 THEN");
-  out.push(
-    "        RAISE NOTICE 'visit: % ใบไม่มี branch_code เพราะ patient ของ HN นั้นไม่มีสาขา " +
-      "— ใบเหล่านั้นจะหลุดจากตัวกรองสาขาทุกจอ', noBr;",
-  );
-  out.push("    END IF;");
-  out.push("END $visits$;");
-  out.push("");
-
-  let rows = 0;
-  for (const m of survey.matched) {
-    const f = byTarget.get(m.target_path);
-    if (!f) continue;
-    rows++;
-
+  const rows = pairs.length;
+  for (const { m, f } of pairs) {
     const c = lit(clinic);
     const hn = lit(f.hn);
     const taken = `${lit(f.taken_at)}::timestamptz`;
     const size = String(m.bytes);
+    const doctor = nullLit(f.doctor_code);
+    // A patient whose branch is blank is SKIPPED rather than allowed to abort the run
+    // (owner's decision, 16 Sep 2026). visit_master.branch_code is NOT NULL with
+    // CHECK (branch_code <> ''), so feeding it a blank would take the whole transaction
+    // down on one bad patient row and no image at all would land.
+    //
+    // Measured note: `patient` carries the same pair of constraints (NOT NULL +
+    // patient_branch_not_blank), so today this can filter nothing — the counter below reads
+    // 0 unless someone drops those. It is written anyway because the alternative is a
+    // 400-image import that dies on row one, and the guard costs a comparison.
+    //
+    // The one key that decides "already imported", written once and used by all three
+    // INSERTs. Three separate keys would let a re-run land two rows out of three, and the
+    // one that goes missing would be the chart nobody notices is absent.
+    const dup = `SELECT 1 FROM photos
+                       WHERE clinic_code = ${c} AND hn = ${hn}
+                         AND taken_at = ${taken} AND file_size = ${size}`;
 
     out.push(`-- hn ${f.hn} · ${f.source_url}`);
     out.push(
-      `INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
-                    thumb_path, file_size, consent_given, note, doctor_code, created_by,
-                    taken_at, annotations, legacy_import, created_at, updated_at)
-SELECT ${c}, ${hn},
-       (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
-       (SELECT vm.id FROM visit_master vm
-         WHERE vm.clinic_code = ${c} AND vm."HN" = ${hn}
-           AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
-         LIMIT 1),
-       ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, ${lit(kindOf(f))},
-       ${lit(f.target_path)}, ${m.thumb ? lit(m.thumb.target_path) : "NULL"},
-       ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
-       '[]'::jsonb, true, now(), now()
-WHERE NOT EXISTS (
-    SELECT 1 FROM photos
-     WHERE clinic_code = ${c} AND hn = ${hn}
-       AND taken_at = ${taken} AND file_size = ${size}
-);`,
+      `WITH v AS (
+    INSERT INTO visit_master (clinic_code, "HN", "VN", visit_date, branch_code, doctor_code, title)
+    SELECT ${c}, ${hn},
+           lpad((SELECT count(*) + 1 FROM visit_master
+                  WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)})::text, 3, '0'),
+           DATE ${lit(IMPORT_VISIT_DATE)}, p.branch_code, ${doctor}, ${lit(IMPORT_VISIT_TITLE)}
+      FROM patient p
+     WHERE p.clinic_code = ${c} AND p."HN" = ${hn}
+       AND coalesce(p.branch_code, '') <> ''
+       AND NOT EXISTS (${dup})
+    RETURNING id
+), ph AS (
+    INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
+                        thumb_path, file_size, consent_given, note, doctor_code, created_by,
+                        taken_at, annotations, legacy_import, created_at, updated_at)
+    SELECT ${c}, ${hn},
+           (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
+           (SELECT id FROM v),
+           ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, ${lit(kindOf(f))},
+           ${lit(f.target_path)}, ${m.thumb ? lit(m.thumb.target_path) : "NULL"},
+           ${size}, true, ${nullLit(f.note)}, ${doctor}, ${intOrNull(f.created_by)}, ${taken},
+           '[]'::jsonb, true, now(), now()
+     WHERE NOT EXISTS (${dup})
+    RETURNING id, visit_id
+)
+INSERT INTO face_chart (clinic_code, "HN", visit_id, base_type, doctor_code, strokes,
+                        version, created_at, updated_at)
+SELECT ${c}, ${hn}, ph.visit_id, 'photo:' || ph.id::text, ${doctor},
+       jsonb_build_array(jsonb_build_object('page', true, 'view', 'photo:' || ph.id::text)),
+       1, now(), now()
+  FROM ph
+ WHERE ph.visit_id IS NOT NULL
+ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
     );
     out.push("");
   }
+
+  // Visits and charts that actually landed, against the number of images. A shortfall is not
+  // an error by itself: it is exactly the images whose HN has no `patient` row yet, and
+  // saying so with a number is the only way to tell that apart from a run that went wrong.
+  out.push("-- visit + ผังหน้า ที่เกิดขึ้นจริงหลังรัน (1 ใบต่อ 1 รูป)");
+  out.push("DO $visits$");
+  out.push("DECLARE");
+  out.push("    visits    bigint;");
+  out.push("    charts    bigint;");
+  out.push("    pages     bigint;");
+  out.push("    noPatient bigint;");
+  out.push("    noBranch  bigint;");
+  out.push("BEGIN");
+  out.push("    SELECT count(*) INTO visits");
+  out.push("      FROM visit_master");
+  out.push(`     WHERE clinic_code = ${lit(clinic)} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}`);
+  out.push(`       AND title = ${lit(IMPORT_VISIT_TITLE)};`);
+  out.push("    SELECT count(*), coalesce(sum(jsonb_array_length(fc.strokes)), 0)");
+  out.push("      INTO charts, pages");
+  out.push("      FROM face_chart fc");
+  out.push("      JOIN visit_master vm ON vm.id = fc.visit_id");
+  out.push(`     WHERE fc.clinic_code = ${lit(clinic)}`);
+  out.push(`       AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}`);
+  out.push(`       AND vm.title = ${lit(IMPORT_VISIT_TITLE)};`);
+  out.push("    SELECT count(*) FILTER (WHERE p.id IS NULL),");
+  out.push("           count(*) FILTER (WHERE p.id IS NOT NULL AND coalesce(p.branch_code, '') = '')");
+  out.push("      INTO noPatient, noBranch");
+  out.push("      FROM photos ph");
+  out.push('      LEFT JOIN patient p ON p.clinic_code = ph.clinic_code AND p."HN" = ph.hn');
+  out.push(`     WHERE ph.clinic_code = ${lit(clinic)} AND ph.legacy_import AND ph.visit_id IS NULL;`);
+  out.push(`    IF visits < ${pairs.length} THEN`);
+  out.push(
+    `        RAISE NOTICE 'visit: มี % ใบ จากรูป ${pairs.length} ใบ — รูปที่ไม่ได้ใบแยกเป็น ` +
+      "[HN ไม่มีในตาราง patient: %, คนไข้ไม่มีสาขา: %] · รูปเข้าฐานแล้วแต่จะไม่โผล่ในโมดัลก่อน-หลัง', " +
+      "visits, noPatient, noBranch;",
+  );
+  out.push("    ELSE");
+  out.push("        RAISE NOTICE 'visit: มีครบ % ใบ = จำนวนรูปที่นำเข้า', visits;");
+  out.push("    END IF;");
+  out.push("    IF noBranch > 0 THEN");
+  out.push(
+    "        RAISE NOTICE 'visit: ข้ามรูปของคนไข้ที่ไม่มีสาขา % รูป — visit_master.branch_code " +
+      "ห้ามว่าง จึงไม่สร้างใบให้ แทนที่จะล้มทั้งการนำเข้า · เลขนี้ควรเป็น 0 เพราะตาราง patient เองก็มี " +
+      "CHECK ห้ามสาขาว่าง ถ้าไม่ใช่ 0 แปลว่า constraint นั้นถูกถอดไปแล้ว', noBranch;",
+  );
+  out.push("    END IF;");
+  out.push(
+    "    RAISE NOTICE 'face_chart: % ใบ · หน้ารูปรวม % หน้า (นำเข้าใหม่ต้องได้ 1 หน้าต่อ 1 ใบ" +
+      " · ใบที่หมอวาดทับแล้วจะนับรอยวาดรวมมาด้วย)', charts, pages;",
+  );
+  out.push("    IF charts <> visits THEN");
+  out.push(
+    "        RAISE NOTICE 'face_chart: ผังหน้า % ใบ ไม่เท่ากับ visit % ใบ — ส่วนต่างคือใบที่มีผังของหมอ " +
+      "อยู่ก่อนแล้ว จึงถูก ON CONFLICT DO NOTHING ข้ามไปเพื่อไม่ทับภาพวาด', charts, visits;",
+  );
+  out.push("    END IF;");
+  out.push("END $visits$;");
+  out.push("");
 
   // How many rows ended up with no branch. Raised rather than left to be noticed later: a
   // photos-only run into a clinic whose patients have not been imported yet resolves NOTHING,
@@ -865,112 +926,6 @@ WHERE NOT EXISTS (
   out.push("END $branch$;");
   out.push("");
 
-  // ── face_chart: ทำให้รูปที่นำเข้าเป็น "หน้า" ที่วาดทับได้ ─────────────────────────
-  //
-  // WHY THIS IS NOT AN INVENTION
-  //
-  // base_type = 'photo:<photos.id>' and a strokes element {"page":true,"view":"photo:<id>"}
-  // are the app's OWN convention, not something devised here. Verified against rows the
-  // running app wrote: 8 of 8 face_chart rows whose base_type looks like photo:<n> point at
-  // a photos.id that exists and belongs to the SAME clinic, HN and visit, and
-  // normalizeFaceView (clinicalengine/service.go) accepts photo:<positive int> as a page —
-  // there is a test pinning it (TestNormalizeFaceViewKeepsEveryPage, case "photo:42").
-  //
-  // SHAPE FORCED BY THE SCHEMA
-  //
-  // face_chart is UNIQUE (clinic_code, visit_id) — one row per visit. The import files every
-  // page of a patient under ONE visit, so a patient gets ONE chart whose strokes array lists
-  // every imported page. base_type holds a single value, so it names one page: the NEWEST
-  // (owner's decision, 15 Sep 2026), while the pages themselves stay in chronological order.
-  //
-  // Everything is computed in SQL, deliberately: photos.id is generated by the database
-  // during the inserts above, so this side cannot know it. Reading it back is exact; carrying
-  // it across would be a guess.
-  //
-  // ON CONFLICT DO NOTHING, not DO UPDATE: if a doctor has already drawn on that visit's
-  // chart, re-running the import must not overwrite the drawing.
-  out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push("-- face_chart — ทำให้รูปที่นำเข้าเปิดเป็น \"หน้า\" ที่วาดทับได้ในผังหน้า");
-  out.push("--");
-  out.push("-- base_type = 'photo:<photos.id>' และ strokes = [{\"page\":true,\"view\":\"photo:<id>\"}]");
-  out.push("-- เป็นรูปแบบที่แอปเขียนเองอยู่แล้ว (ยืนยันจากแถวจริง 8/8 ที่ชี้ photos.id ถูกคนไข้");
-  out.push("-- ถูกคลินิก ถูก visit) และ normalizeFaceView รับ photo:<เลขบวก> เป็น page ที่ถูกต้อง");
-  out.push("--");
-  out.push("-- face_chart มี UNIQUE (clinic_code, visit_id) = 1 แถวต่อ visit ฉะนั้นคนไข้หนึ่งคน");
-  out.push("-- ได้ 1 แถว ที่ strokes ไล่ทุกหน้าของเขา · base_type ใส่ได้ค่าเดียวจึงชี้หน้าที่ใหม่สุด");
-  out.push("--");
-  out.push("-- id ของรูปถูกอ่านกลับจากฐาน ไม่ใช่ส่งมาจากฝั่งนี้ เพราะ photos.id ฐานออกให้เองตอน");
-  out.push("-- insert ข้างบน · ON CONFLICT DO NOTHING เพื่อไม่ทับภาพวาดที่หมอทำไว้แล้ว");
-  out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push("");
-
-  for (const v of plan) {
-    const c = lit(clinic);
-    const hn = lit(v.hn);
-    out.push(`-- hn ${v.hn}`);
-    out.push(
-      `INSERT INTO face_chart (clinic_code, "HN", visit_id, base_type, doctor_code, strokes,
-                        version, created_at, updated_at)
-SELECT ${c}, ${hn}, vm.id,
-       'photo:' || (SELECT p.id FROM photos p
-                     WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
-                       AND p.legacy_import AND p.deleted_at IS NULL
-                     ORDER BY p.taken_at DESC, p.id DESC
-                     LIMIT 1)::text,
-       vm.doctor_code,
-       (SELECT coalesce(jsonb_agg(jsonb_build_object('page', true, 'view', 'photo:' || p.id::text)
-                                  ORDER BY p.taken_at, p.id), '[]'::jsonb)
-          FROM photos p
-         WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
-           AND p.legacy_import AND p.deleted_at IS NULL),
-       1, now(), now()
-FROM visit_master vm
-WHERE vm.clinic_code = ${c} AND vm."HN" = ${hn}
-  AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
-  AND EXISTS (
-      SELECT 1 FROM photos p
-       WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
-         AND p.legacy_import AND p.deleted_at IS NULL
-  )
-ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
-    );
-    out.push("");
-  }
-
-  // What actually landed, and what a shortfall means. A patient with no `patient` row got no
-  // visit (see above) and therefore gets no chart — their pages are still in the record, they
-  // just cannot be opened as drawable pages. Said with a number rather than left to be found.
-  out.push("-- ผังหน้าที่สร้างได้จริง + จำนวนหน้าที่ผูกไว้ในแต่ละใบ");
-  out.push("DO $face$");
-  out.push("DECLARE");
-  out.push("    charts   bigint;");
-  out.push("    pages    bigint;");
-  out.push("    noPages  bigint;");
-  out.push("BEGIN");
-  out.push("    SELECT count(*),");
-  out.push("           coalesce(sum(jsonb_array_length(fc.strokes)), 0),");
-  out.push("           count(*) FILTER (WHERE jsonb_array_length(fc.strokes) = 0)");
-  out.push("      INTO charts, pages, noPages");
-  out.push("      FROM face_chart fc");
-  out.push("      JOIN visit_master vm ON vm.id = fc.visit_id");
-  out.push(`     WHERE fc.clinic_code = ${lit(clinic)}`);
-  out.push(`       AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)};`);
-  out.push(`    IF charts < ${plan.length} THEN`);
-  out.push(
-    `        RAISE NOTICE 'face_chart: มี % ใบ จากคนไข้ที่มีรูป ${plan.length} คน — ส่วนที่ขาดคือคนที่ยังไม่มีใน ` +
-      "ตาราง patient จึงไม่มี visit ให้ผูก · รูปยังอยู่ในแฟ้มแต่เปิดเป็นหน้าวาดทับไม่ได้', charts;",
-  );
-  out.push("    ELSE");
-  out.push("        RAISE NOTICE 'face_chart: มีครบ % ใบสำหรับคนไข้ที่มีรูป', charts;");
-  out.push("    END IF;");
-  out.push("    RAISE NOTICE 'face_chart: ผูกหน้ารูปไว้รวม % หน้า', pages;");
-  out.push("    IF noPages > 0 THEN");
-  out.push(
-    "        RAISE NOTICE 'face_chart: % ใบที่ strokes ว่าง — ไม่ควรเกิด เพราะสร้างเฉพาะใบที่มีรูปอยู่แล้ว', noPages;",
-  );
-  out.push("    END IF;");
-  out.push("END $face$;");
-  out.push("");
   out.push("COMMIT;");
   out.push("");
   return { sql: out.join("\n"), rows };

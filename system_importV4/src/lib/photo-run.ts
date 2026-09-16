@@ -256,8 +256,11 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       );
     }
 
-    // 4 · then the rows, in one transaction on the database host.
-    phase(`เขียน ${rows} แถวลง photos`);
+    // 4 · then the rows, in one transaction on the database host. Three rows per image, not
+    // one: each page gets its own visit and its own face_chart so it opens as a drawable page
+    // (see buildInsertSQL). The phase text says so, because "404 แถว" while 1,212 land is the
+    // kind of half-truth that makes a later count look like a bug.
+    phase(`เขียน ${rows} รูป → photos + visit + ผังหน้า (${rows * 3} แถว)`);
     const r = await runSSH(sshArgs(dbTarget, psqlCommand(dbTarget)), sql);
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
     const log = [trimLog, ship.log, r.stdout, r.stderr].filter(Boolean).join("\n").trim();
