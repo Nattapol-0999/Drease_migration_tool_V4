@@ -123,6 +123,16 @@ export const IMPORT_GROUPS = [
     // for nothing, and a receipt without its payment channels is money with no source.
     detail: "invoice · invoice_item · receipt · receipt_payment (ต้องมีคนไข้และแคตตาล็อกในระบบก่อน)",
   },
+  {
+    group: "loyalty",
+    label: "แต้มสะสม",
+    // The balance only. point_logs is NOT imported (owner's decision, 15 Sep 2026), so
+    // loyalty_txn stays empty and no policy row is written — the points arrive but cannot
+    // be redeemed until the clinic sets the rate on screen. Said here because a box
+    // labelled "แต้มสะสม" would otherwise promise a working scheme.
+    detail:
+      "loyalty_account (ยอดแต้มต่อคนไข้ · ไม่รวมประวัติการได้/ใช้แต้ม และยังแลกไม่ได้จนตั้งอัตราในจอ)",
+  },
 ] as const;
 
 export type ImportGroup = (typeof IMPORT_GROUPS)[number]["group"];

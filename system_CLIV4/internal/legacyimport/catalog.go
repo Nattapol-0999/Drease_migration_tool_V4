@@ -96,6 +96,13 @@ type mongoCatalog struct {
 	// and have not used yet. Mapped in coursebought.go.
 	courseBills []mongodump.Doc
 
+	// points is one balance per patient (mris.points), mapped in loyalty.go. pointLogs is
+	// the movement history behind it; it is parsed only to be COUNTED, because the clinic
+	// owner chose not to import it and a number in the report is how that omission stays
+	// visible instead of looking like the collection was never there.
+	points    []mongodump.Doc
+	pointLogs []mongodump.Doc
+
 	// courseCode is course_items _id → the code MINTED for it (CS001…). It only helps an
 	// entitlement find its course when the CATALOG was imported by this same tool; a
 	// target whose catalog came from somewhere else has different codes, which is why
@@ -145,6 +152,8 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 		bills:       byName["bills"],
 		payments:    byName["payment_summary"],
 		courseBills: byName["course_bills"],
+		points:      byName["points"],
+		pointLogs:   byName["point_logs"],
 		courseCode:  map[string]string{},
 		courseName:  map[string]string{},
 		healName:    map[string]string{},
@@ -161,8 +170,9 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 			mc.healName[id] = n
 		}
 	}
-	if len(mc.items) == 0 && len(mc.listheals) == 0 && len(mc.courseItems) == 0 && len(mc.bills) == 0 {
-		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills)")
+	if len(mc.items) == 0 && len(mc.listheals) == 0 && len(mc.courseItems) == 0 &&
+		len(mc.bills) == 0 && len(mc.points) == 0 {
+		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills, points)")
 	}
 	return mc, nil
 }

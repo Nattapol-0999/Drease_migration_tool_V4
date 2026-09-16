@@ -320,8 +320,9 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	needStock := wants(EntSlotStock)
 	needMoney := wants(EntInvoice, EntInvoiceItem, EntReceipt, EntReceiptPayment, EntInvoiceSettle)
 	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems)
+	needLoyalty := wants(EntLoyaltyAccount)
 
-	if len(in.MongoDump) > 0 && (needCatalog || needStock || needMoney || needEntitlements) {
+	if len(in.MongoDump) > 0 && (needCatalog || needStock || needMoney || needEntitlements || needLoyalty) {
 		mc, err := parseMongoCatalog(in.MongoDump)
 		if err != nil {
 			return nil, nil, money, err
@@ -379,6 +380,19 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			out[EntCourseBoughtPurge] = purge
 			out[EntCourseBought] = bought
 			out[EntCourseBoughtItems] = boughtItems
+		}
+
+		// Point balances. Independent of everything above — it reads its own collection
+		// and resolves patient_id at the target — so it is built last and refuses only
+		// when the dump has no `points` collection at all.
+		if needLoyalty {
+			if len(mc.points) == 0 {
+				return nil, nil, money, fmt.Errorf(
+					"เลือกกลุ่ม loyalty แต่ mongo dump ไม่มี collection \"points\" — ไม่มีแต้มให้นำเข้า")
+			}
+			if out[EntLoyaltyAccount], err = buildLoyalty(mc, in, rep); err != nil {
+				return nil, nil, money, err
+			}
 		}
 	}
 

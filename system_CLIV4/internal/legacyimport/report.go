@@ -34,11 +34,15 @@ const (
 // photoOrder is last and carries NO SQL: the photos entity renders a copy manifest
 // instead (see page.go). It is in this list only so the report prints it alongside the
 // rest; script.go skips any entity with no statements.
-var order = append(append(append(append(append([]string{
+// loyaltyOrder sits after the entitlements: like them it is a per-patient balance and it
+// is gated on `patient` existing, but unlike them it points at nothing the money block
+// writes — so it is last among the SQL blocks, where an added block cannot disturb the
+// order of anything already reviewed.
+var order = append(append(append(append(append(append([]string{
 	EntUsers, EntClinicUser, EntClinicStaff,
 	EntDoctor, EntRoom, EntPatient,
 }, addressOrder...), []string{EntAppointment}...),
-	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), photoOrder...)
+	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), loyaltyOrder...), photoOrder...)
 
 // EntityOrder returns a copy of the order, for callers that render entities without
 // holding a Report. A copy, not the slice: the order is policy, and a caller must not
@@ -77,6 +81,10 @@ var entityGroups = map[string][]string{
 	"entitlements": {
 		EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
 	},
+	// loyalty is one integer per patient and depends on nothing but the patients, so it
+	// is its own group: a clinic can carry the point balances over without re-running any
+	// of the money or catalog work.
+	"loyalty": {EntLoyaltyAccount},
 	// photos produces no SQL, so selecting it changes nothing in the .sql artifact — it
 	// is here so `-only photos` is not rejected as an unknown group when an operator
 	// wants the image manifest and nothing else.
@@ -99,6 +107,10 @@ var groupDependsOn = map[string][]string{
 	// entitlements resolves catalog_item_id from the MINTED course code and
 	// invoice_item_id from the sale line, so both must already be at the target.
 	"entitlements": {"patients", "catalog", "money"},
+	// loyalty is NOT advisory in effect: every account INSERT selects FROM patient, so an
+	// HN with no patient row writes nothing (and is reported). Listed so the report says
+	// so before the run rather than after.
+	"loyalty": {"patients"},
 }
 
 // GroupNames lists the selectable groups, sorted for a stable UI and help text.
