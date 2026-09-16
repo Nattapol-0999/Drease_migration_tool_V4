@@ -33,6 +33,7 @@ import {
 } from "@/lib/types";
 
 import BusyOverlay, { type BusyState } from "./BusyOverlay";
+import { GroupIcon } from "./GroupIcon";
 
 import "./target-picker.css";
 import "./flow-steps.css";
@@ -2402,7 +2403,19 @@ export default function GenerateForm() {
           (การนำเข้าทับจะเขียนค่าจากไฟล์ลงบนของเดิม)
         </div>
         {IMPORT_GROUPS.map((g) => (
-          <label key={g.group} style={{ display: "block", margin: "6px 0", color: "var(--text)" }}>
+          // flex, not the old inline flow: with an icon in the row, a wrapped detail line
+          // used to slide back under the checkbox. align-items: flex-start keeps the box and
+          // the icon on the first line while the text wraps beside them.
+          <label
+            key={g.group}
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 8,
+              margin: "6px 0",
+              color: "var(--text)",
+            }}
+          >
             <input
               type="checkbox"
               checked={groups.includes(g.group)}
@@ -2411,9 +2424,16 @@ export default function GenerateForm() {
                   e.target.checked ? [...prev, g.group] : prev.filter((x) => x !== g.group),
                 )
               }
-              style={{ marginRight: 8 }}
+              style={{ flex: "0 0 auto", marginTop: 3 }}
             />
-            {g.label} <span className="muted" style={{ fontSize: 12 }}>· {g.detail}</span>
+            {/* Decorative: the label right after it names the group, so the icon is
+                aria-hidden inside GroupIcon and carries no information of its own. */}
+            <span style={{ display: "flex", marginTop: 2, color: "var(--muted)" }}>
+              <GroupIcon group={g.group} />
+            </span>
+            <span>
+              {g.label} <span className="muted" style={{ fontSize: 12 }}>· {g.detail}</span>
+            </span>
           </label>
         ))}
         {groups.length === 0 && (

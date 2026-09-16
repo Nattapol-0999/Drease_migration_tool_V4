@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="system_importV4">
+  <!--
+    Tab icon for system_importV4.
+
+    Picked up automatically by Next 14's App Router because of the FILENAME (src/app/icon.svg)
+    — there is no metadata entry to keep in sync, which is the point: an icon declared in two
+    places drifts.
+
+    Fixed colours, not CSS variables. A favicon is rendered by the browser chrome, outside the
+    document, so it never sees the app's theme tokens or its prefers-color-scheme switch. The
+    accent below is the dark-theme --accent (#4c8bf5) because it reads on both a light and a
+    dark tab strip, and the mark keeps its own white glyph rather than inheriting anything.
+
+    The glyph is the tool's job, not a logo: an arrow moving INTO a container. Drawn rather
+    than imported so the whole icon is one 1 KB file with no build step and no dependency
+    (the alternative was a raster export that nobody can edit later).
+
+    To swap in the real Dr.Ease logo: replace this file with the logo as icon.svg, or drop a
+    512x512 icon.png beside it and delete this one. Nothing else references it.
+  -->
+  <rect width="64" height="64" rx="14" fill="#4c8bf5"/>
+  <!-- container: the target system, open at the top to receive -->
+  <path d="M18 34v9a3 3 0 0 0 3 3h22a3 3 0 0 0 3-3v-9"
+        fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>
+  <!-- the import itself: data coming down into it -->
+  <path d="M32 14v18" fill="none" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M24 25l8 8 8-8" fill="none" stroke="#fff" stroke-width="4.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
