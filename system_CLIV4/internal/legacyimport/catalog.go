@@ -615,12 +615,23 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 
 	var sCourse, sLine sqlBuilder
 	unresolved := map[string]int{}
-	skippedMed := 0
 	zeroQty := 0
 	// How many catalog_item_child edges were written beside the course lines. Counted and
 	// reported because a course whose contents are invisible on screen looks like an import
 	// that lost data, and this number is what proves the projection was written too.
 	childEdges := 0
+
+	// medicien_id → items.code, so a course med resolves to its drug SKU the same way a
+	// service line resolves through healCode. Built once per run.
+	itemCodeByID := map[string]string{}
+	for _, it := range mc.items {
+		if id := docObjectID(it, "_id"); id != "" {
+			if c := it.Text("code"); c != "" {
+				itemCodeByID[id] = c
+			}
+		}
+	}
+	medEmitted, medNoSvc, medNoItem, medZeroQty := 0, 0, 0, 0
 
 	// Service codes are off-limits when minting course codes.
 	taken := map[string]bool{}
@@ -783,12 +794,61 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 			}
 		}
 
-		// list_medicien would be line_kind='medication', which V4 requires to name the
-		// service it belongs to (parent_service_catalog_item_id NOT NULL). The export
-		// does not say which service that is, so these are reported, never guessed.
+		// list_medicien → catalog_course_line rows of kind 'medication'. Each entry
+		// DOES name its service: heal_id is the treatment the med is used under
+		// (= parent_service_catalog_item_id, which V4 requires NOT NULL for a med line),
+		// and medicien_id is the drug. Both resolve to their catalog_item by code, the
+		// same way a service line resolves through healCode. (An earlier version wrongly
+		// believed the source omitted the service and dropped every med line.)
 		if med, ok := d.Get("list_medicien"); ok {
-			if arr, isArr := med.([]any); isArr && len(arr) > 0 {
-				skippedMed += len(arr)
+			if arr, isArr := med.([]any); isArr {
+				for mi, raw := range arr {
+					line, isDoc := raw.(mongodump.Doc)
+					if !isDoc {
+						continue
+					}
+					svcCode := mc.healCode[docObjectID(line, "heal_id")]
+					childCode := itemCodeByID[docObjectID(line, "medicien_id")]
+					if svcCode == "" {
+						medNoSvc++
+						eLine.skip("ยาในคอร์ส: heal_id ไม่ตรงบริการใน listheals")
+						continue
+					}
+					if childCode == "" {
+						medNoItem++
+						eLine.skip("ยาในคอร์ส: medicien_id ไม่ตรง items ใด")
+						continue
+					}
+					qty := intLitDefault(line.Text("qty_use"), 1)
+					if q, cerr := strconv.Atoi(qty); cerr != nil || q <= 0 {
+						medZeroQty++
+						eLine.skip("ยาในคอร์ส: qty_use เป็น 0 หรือน้อยกว่า")
+						continue
+					}
+					courseID := catalogItemIDByCode(in.ClinicCode, code)
+					childID := catalogItemIDByCode(in.ClinicCode, childCode)
+					svcID := catalogItemIDByCode(in.ClinicCode, svcCode)
+					sLine.comment("%s → ยา %s ใต้บริการ %s ×%s", code, childCode, svcCode, qty)
+					sLine.addf(`INSERT INTO catalog_course_line
+    (clinic_code, course_catalog_item_id, child_catalog_item_id, line_kind,
+     parent_service_catalog_item_id, qty, sort_order, created_at, updated_at)
+SELECT %s, %s, %s, 'medication', %s, %s, %d, now(), now()
+WHERE %s IS NOT NULL AND %s IS NOT NULL AND %s IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM catalog_course_line l
+       WHERE l.clinic_code = %s
+         AND l.course_catalog_item_id = %s
+         AND l.child_catalog_item_id  = %s
+         AND l.line_kind = 'medication'
+         AND COALESCE(l.parent_service_catalog_item_id, 0) = COALESCE(%s, 0)
+  );
+
+`, lit(in.ClinicCode), courseID, childID, svcID, qty, 1000+mi,
+						courseID, childID, svcID,
+						lit(in.ClinicCode), courseID, childID, svcID)
+					eLine.SourceRows++
+					medEmitted++
+				}
 			}
 		}
 	}
@@ -810,9 +870,9 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 		rep.warnf("catalog_course_line: %d บรรทัดอ้าง heal_id ที่ไม่มีใน listheals (%d id) — ไม่ import บรรทัดนั้น คอร์สจะมีของไม่ครบ",
 			total, len(unresolved))
 	}
-	if skippedMed > 0 {
-		rep.warnf("catalog_course_line: %d รายการยาในคอร์ส (list_medicien) ไม่ถูก import — V4 บังคับว่ายาในคอร์สต้องระบุว่าอยู่ใต้บริการใด (parent_service) ซึ่งต้นทางไม่ได้บอก",
-			skippedMed)
+	if medEmitted > 0 || medNoSvc > 0 || medNoItem > 0 || medZeroQty > 0 {
+		rep.notef("catalog_course_line: เขียนยาในคอร์ส (line_kind='medication') %d บรรทัด · parent_service มาจาก heal_id ใน list_medicien · ข้าม [heal_id ไม่ตรงบริการ: %d, medicien_id ไม่ตรง items: %d, qty<=0: %d]",
+			medEmitted, medNoSvc, medNoItem, medZeroQty)
 	}
 	// Loud, because this changes what a course CONTAINS. The alternative was to write 1,
 	// which the clinic owner rejected: it would give every buyer of that course a session
