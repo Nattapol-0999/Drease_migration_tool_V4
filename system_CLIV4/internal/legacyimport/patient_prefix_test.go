@@ -138,12 +138,18 @@ func TestPatientUnknownCodeIsBlankAndReported(t *testing.T) {
 		t.Errorf("an unknown code reached the SQL\n%s", sql)
 	}
 
+	// Matched on the leading `patient: <target> ` rather than on a substring: the warning
+	// TEXT names both tables ("_prefix/_gender"), so searching for "gender" anywhere in it
+	// also matches the Prefixname warning.
 	var prefixWarn, genderWarn string
 	for _, w := range rep.Warnings {
-		if strings.Contains(w, "Prefixname") && strings.Contains(w, "ไม่ได้นิยามไว้") {
-			prefixWarn = w
+		if !strings.Contains(w, "ไม่ได้นิยามไว้") {
+			continue
 		}
-		if strings.Contains(w, "gender") && strings.Contains(w, "ไม่ได้นิยามไว้") {
+		switch {
+		case strings.HasPrefix(w, `patient: "Prefixname" `):
+			prefixWarn = w
+		case strings.HasPrefix(w, "patient: gender "):
 			genderWarn = w
 		}
 	}

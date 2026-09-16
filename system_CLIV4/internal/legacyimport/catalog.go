@@ -617,6 +617,10 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 	unresolved := map[string]int{}
 	skippedMed := 0
 	zeroQty := 0
+	// How many catalog_item_child edges were written beside the course lines. Counted and
+	// reported because a course whose contents are invisible on screen looks like an import
+	// that lost data, and this number is what proves the projection was written too.
+	childEdges := 0
 
 	// Service codes are off-limits when minting course codes.
 	taken := map[string]bool{}
@@ -731,7 +735,51 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 					catalogItemIDByCode(in.ClinicCode, childCode),
 					lit(in.ClinicCode), catalogItemIDByCode(in.ClinicCode, code),
 					catalogItemIDByCode(in.ClinicCode, childCode))
+
+				// The SAME edge, written a second time into catalog_item_child.
+				//
+				// WHY BOTH TABLES
+				//
+				// V4 keeps a course's contents in two places and the query files say which is
+				// which: catalog_course_line carries "canonical course composition identities"
+				// (course_lines.sql), catalog_item_child is "the flattened price/allocation
+				// projection" (itemtax.sql, courses.sql). Writing only the first is what left
+				// 523 imported courses looking EMPTY on screen while 545 lines sat in the
+				// database — courses.sql joins catalog_item_child, not catalog_course_line.
+				//
+				// It is not only the screen. catalog_item_child also feeds:
+				//   · course_bought.sql   — finds the service to deduct when a course is used
+				//   · itemtax.sql         — the weight each line gets when tax is allocated
+				//   · billing.sql         — what a package contains at invoice time
+				// So the omission is a billing and tax problem, not a cosmetic one.
+				//
+				// relation_kind = 'composition' (the column default, and what every existing
+				// row in the database uses for a course parent: 201 rows on the clinic
+				// imported before this, 3 on the app's own test tenant). 'bom' is the other
+				// allowed value and means a service's materials, which this is not.
+				//
+				// qty and sort_order are copied from the same source values as the line above,
+				// so the two tables cannot disagree — verified on the reference clinic, where
+				// all 201 pairs match on qty.
+				sLine.addf(`INSERT INTO catalog_item_child
+    (clinic_code, parent_item_id, child_item_id, qty, sort_order, relation_kind, created_at)
+SELECT %s, %s, %s, %s, %d, 'composition', now()
+WHERE %s IS NOT NULL AND %s IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM catalog_item_child ch
+       WHERE ch.clinic_code = %s
+         AND ch.parent_item_id = %s
+         AND ch.child_item_id  = %s
+  );
+
+`, lit(in.ClinicCode), catalogItemIDByCode(in.ClinicCode, code),
+					catalogItemIDByCode(in.ClinicCode, childCode), qty, i,
+					catalogItemIDByCode(in.ClinicCode, code),
+					catalogItemIDByCode(in.ClinicCode, childCode),
+					lit(in.ClinicCode), catalogItemIDByCode(in.ClinicCode, code),
+					catalogItemIDByCode(in.ClinicCode, childCode))
 				eLine.SourceRows++
+				childEdges++
 			}
 		}
 
@@ -750,6 +798,10 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 
 	rep.notef("catalog_item(course): ต้นทางไม่มีรหัสคอร์ส จึง mint ให้เป็น %s001.. ตามลำดับในไฟล์ (deterministic · เลี่ยงรหัสที่บริการใช้อยู่)",
 		CourseCodePrefix)
+	rep.notef("catalog_course_line: เขียน %d บรรทัดคู่กับ catalog_item_child อีก %d แถว (relation_kind='composition') — "+
+		"V4 เก็บองค์ประกอบคอร์สสองที่: catalog_course_line เป็นตัวตน ส่วน catalog_item_child เป็นตัวที่จอรายการคอร์ส "+
+		"การตัดใช้คอร์ส การกระจายภาษี และการออกบิลอ่าน · เขียนแค่ตารางแรกคอร์สจะขึ้นจอว่างเปล่าทั้งที่ข้อมูลอยู่ในฐาน",
+		childEdges, childEdges)
 	if len(unresolved) > 0 {
 		total := 0
 		for _, v := range unresolved {
