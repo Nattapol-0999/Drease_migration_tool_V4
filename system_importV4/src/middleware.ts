@@ -14,11 +14,30 @@ import { SESSION_COOKIE, verifySessionToken } from "@/lib/auth-token";
 /** Paths that must stay reachable without a session, or nobody could ever log in. */
 const PUBLIC_PATHS = new Set(["/login", "/api/login", "/api/logout"]);
 
+/**
+ * The tab icon, which the browser fetches with no session and outside any page.
+ *
+ * Next 14's App Router serves src/app/icon.svg at /icon.svg — NOT at /favicon.ico — and it
+ * appends a query when it fingerprints the file, so this matches the pathname prefix rather
+ * than a fixed string. Leaving it out is not a cosmetic bug: the request was answered with
+ * a 307 to /login, the browser got HTML where it asked for an image, and every tab kept the
+ * default globe. Same for apple-icon, which Next serves the same way if one is ever added.
+ *
+ * Nothing is exposed by letting these through: they are the icon files themselves.
+ */
+function isPublicIcon(pathname: string): boolean {
+  return (
+    pathname === "/favicon.ico" ||
+    pathname.startsWith("/icon") ||
+    pathname.startsWith("/apple-icon")
+  );
+}
+
 function isPublic(pathname: string): boolean {
   if (PUBLIC_PATHS.has(pathname)) return true;
   // The login page's own stylesheet and Next's client bundles.
   if (pathname.startsWith("/_next/")) return true;
-  if (pathname === "/favicon.ico") return true;
+  if (isPublicIcon(pathname)) return true;
   return false;
 }
 
