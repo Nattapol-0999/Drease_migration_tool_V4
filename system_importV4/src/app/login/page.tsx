@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import Logo from "@/components/Logo";
 import ThemeToggle from "@/components/ThemeToggle";
 
 import "./login.css";
@@ -59,7 +60,9 @@ export default function LoginPage() {
           have to log in through a dark page first to be allowed to change it. */}
       <ThemeToggle corner />
       <form className="login-card" onSubmit={submit}>
-        <h1>system_importV4</h1>
+        <h1>
+          <Logo />
+        </h1>
         <p className="login-sub">เครื่องมือย้ายข้อมูล Dr.Ease V2 → V4 · ต้องเข้าสู่ระบบก่อนใช้งาน</p>
 
         {error ? (

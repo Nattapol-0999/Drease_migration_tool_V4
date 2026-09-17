@@ -1,6 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="system_importV4">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="System ImportV4">
   <!--
-    Tab icon for system_importV4.
+    Tab icon for System ImportV4.
+
+    THE SAME GLYPH IS DRAWN AGAIN IN src/components/Logo.tsx, on purpose. That one is the
+    header/login mark; this one is the tab icon. They cannot share a source: Next's App Router
+    serves this file to the browser chrome by FILENAME, while the header's copy is inlined into
+    the document so it can read var(--accent) and follow the light/dark switch. Change one and
+    change the other — if the real Dr.Ease logo arrives, both are replaced together.
 
     Picked up automatically by Next 14's App Router because of the FILENAME (src/app/icon.svg)
     — there is no metadata entry to keep in sync, which is the point: an icon declared in two

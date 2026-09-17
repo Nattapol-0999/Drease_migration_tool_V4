@@ -1,0 +1,30 @@
+/* The product mark. One file, one place: the home header and the login card both render
+   <Logo />, so there is nothing to keep in sync between them. */
+
+/* inline-flex, not flex.
+ *
+ * The logo sits inside an <h1> that is itself a flex item of .page-head, and that row
+ * aligns on `baseline`. A block-level flex container has no text baseline to offer — the
+ * row would fall back to its bottom edge and the sign-out button would drift out of line
+ * with the title. inline-flex keeps a real baseline, taken from the wordmark. */
+.logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45em;
+}
+
+/* Everything is sized in em so one rule serves both places it appears: 20px in the page
+   header and 18px inside the login card (globals.css / login.css). A px height here would
+   need a second rule the day either heading changes size. */
+.logo-mark {
+  width: 1.35em;
+  height: 1.35em;
+  flex: none;
+  display: block;
+}
+
+.logo-text {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}

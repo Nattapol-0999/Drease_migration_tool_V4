@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "system_importV4",
+  title: "System ImportV4",
   description: "นำเข้าข้อมูลคลินิกจากไฟล์ dump เข้า V4 (inspect → map → plan → run)",
 };
 
