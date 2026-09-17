@@ -39,6 +39,40 @@ import "./target-picker.css";
 import "./flow-steps.css";
 
 /**
+ * LOG_BOX is every output panel on this page: psql's own chatter, the CLI's report, what the
+ * far side printed, the head of the generated file.
+ *
+ * TEN LINES AND A SCROLLBAR, by the owner's decision on 16 Sep 2026.
+ *
+ * These panels used to have no height at all, so a psql run that prints one `INSERT 0 1` per
+ * statement — and a real import prints thousands — pushed the rest of the page, including the
+ * next button the operator needs, an unreachable distance down. The box is now the same height
+ * whatever lands in it, and the content is scrolled rather than truncated: a log that hides its
+ * own tail is worse than a long one, because the line that says what went wrong is usually the
+ * last one.
+ *
+ * lineHeight is pinned rather than inherited so "ten lines" is a real measurement:
+ * 10 × 18px + 24px of padding. Leaving it to the theme would make the height drift with the
+ * font.
+ *
+ * No auto-scroll to the bottom, deliberately: none of these panels stream. Each is written
+ * once, when its step finishes, so scrolling for the operator would only take the top of the
+ * output away from them.
+ */
+const LOG_BOX: React.CSSProperties = {
+  background: "var(--panel-2)",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  padding: 12,
+  overflowX: "auto",
+  overflowY: "auto",
+  fontSize: 12,
+  lineHeight: "18px",
+  whiteSpace: "pre-wrap",
+  maxHeight: 10 * 18 + 24,
+};
+
+/**
  * postFormWithProgress posts a FormData and reports how many bytes have left the browser.
  *
  * fetch() cannot do this — no browser implements an upload-progress event for it — so a
@@ -1742,19 +1776,7 @@ export default function GenerateForm() {
                 {pullLog && pullLog.length > 0 && (
                   <>
                     <h3>ผลจากเครื่องต้นทาง</h3>
-                    <pre
-                      style={{
-                        background: "var(--panel-2)",
-                        border: "1px solid var(--border)",
-                        borderRadius: 6,
-                        padding: 12,
-                        overflowX: "auto",
-                        fontSize: 12,
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
-                      {pullLog.join("\n")}
-                    </pre>
+                    <pre style={LOG_BOX}>{pullLog.join("\n")}</pre>
                   </>
                 )}
               </>
@@ -2054,37 +2076,13 @@ export default function GenerateForm() {
                   {photoSurvey?.report && (
                     <>
                       <h3>รายงานจาก CLI (รูป)</h3>
-                      <pre
-                        style={{
-                          background: "var(--panel-2)",
-                          border: "1px solid var(--border)",
-                          borderRadius: 6,
-                          padding: 12,
-                          overflowX: "auto",
-                          fontSize: 12,
-                          whiteSpace: "pre-wrap",
-                        }}
-                      >
-                        {photoSurvey.report}
-                      </pre>
+                      <pre style={LOG_BOX}>{photoSurvey.report}</pre>
                     </>
                   )}
                   {photoLog && (
                     <>
                       <h3>ผลจากเครื่องปลายทาง</h3>
-                      <pre
-                        style={{
-                          background: "var(--panel-2)",
-                          border: "1px solid var(--border)",
-                          borderRadius: 6,
-                          padding: 12,
-                          overflowX: "auto",
-                          fontSize: 12,
-                          whiteSpace: "pre-wrap",
-                        }}
-                      >
-                        {photoLog}
-                      </pre>
+                      <pre style={LOG_BOX}>{photoLog}</pre>
                     </>
                   )}
             </>
@@ -2498,20 +2496,7 @@ export default function GenerateForm() {
             {result.preview && (
               <>
                 <h3>หัวไฟล์ (8 KB แรก)</h3>
-                <pre
-                  style={{
-                    background: "var(--panel-2)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: 12,
-                    overflowX: "auto",
-                    fontSize: 12,
-                    whiteSpace: "pre-wrap",
-                    maxHeight: 260,
-                  }}
-                >
-                  {result.preview}
-                </pre>
+                <pre style={LOG_BOX}>{result.preview}</pre>
               </>
             )}
 
@@ -2599,19 +2584,7 @@ export default function GenerateForm() {
                 {importLog && (
                   <>
                     <h3>ผลจาก psql</h3>
-                    <pre
-                      style={{
-                        background: "var(--panel-2)",
-                        border: "1px solid var(--border)",
-                        borderRadius: 6,
-                        padding: 12,
-                        overflowX: "auto",
-                        fontSize: 12,
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
-                      {importLog}
-                    </pre>
+                    <pre style={LOG_BOX}>{importLog}</pre>
                   </>
                 )}
               </>
@@ -2619,36 +2592,12 @@ export default function GenerateForm() {
             {result.log.length > 0 && (
               <>
                 <h3>สิ่งที่เซิร์ฟเวอร์ทำก่อนเรียก CLI</h3>
-                <pre
-                  style={{
-                    background: "var(--panel-2)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: 12,
-                    overflowX: "auto",
-                    fontSize: 12,
-                    whiteSpace: "pre-wrap",
-                  }}
-                >
-                  {result.log.join("\n")}
-                </pre>
+                <pre style={LOG_BOX}>{result.log.join("\n")}</pre>
               </>
             )}
 
             <h3>รายงานจาก CLI</h3>
-            <pre
-              style={{
-                background: "var(--panel-2)",
-                border: "1px solid var(--border)",
-                borderRadius: 6,
-                padding: 12,
-                overflowX: "auto",
-                fontSize: 12,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {result.report}
-            </pre>
+            <pre style={LOG_BOX}>{result.report}</pre>
           </>
         )}
     </div>
