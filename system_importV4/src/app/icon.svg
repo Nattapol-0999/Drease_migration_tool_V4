@@ -1,24 +1,39 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="System ImportV4">
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="System ImportV4">
   <!--
     Tab icon for System ImportV4.
+
+    NEVER WRITE TWO HYPHENS IN A ROW ANYWHERE IN THIS COMMENT.
+
+    XML forbids the sequence inside a comment, so the whole file stops being well formed and
+    the browser renders nothing but a parse error - the tab falls back to the generic globe.
+    This happened for real: an earlier version of this comment mentioned the CSS custom
+    property by its literal name, which begins with two hyphens, and the icon never appeared
+    once. It cost two rounds of chasing the wrong causes (a middleware redirect, an nginx 403
+    that turned out to be Cloudflare enforcement hitting a direct curl) because every layer
+    reported success: the file was served with the right content type, and the HTML carried the
+    right link. Refer to those tokens by name in prose instead, as below.
 
     THE SAME GLYPH IS DRAWN AGAIN IN src/components/Logo.tsx, on purpose. That one is the
     header/login mark; this one is the tab icon. They cannot share a source: Next's App Router
     serves this file to the browser chrome by FILENAME, while the header's copy is inlined into
-    the document so it can read var(--accent) and follow the light/dark switch. Change one and
-    change the other — if the real Dr.Ease logo arrives, both are replaced together.
+    the document so it can read the accent token and follow the light/dark switch. Change one
+    and change the other. If the real Dr.Ease logo arrives, both are replaced together.
 
-    Picked up automatically by Next 14's App Router because of the FILENAME (src/app/icon.svg)
-    — there is no metadata entry to keep in sync, which is the point: an icon declared in two
+    Picked up automatically by Next 14's App Router because of the FILENAME (src/app/icon.svg).
+    There is no metadata entry to keep in sync, which is the point: an icon declared in two
     places drifts.
 
     Fixed colours, not CSS variables. A favicon is rendered by the browser chrome, outside the
     document, so it never sees the app's theme tokens or its prefers-color-scheme switch. The
-    accent below is the dark-theme --accent (#4c8bf5) because it reads on both a light and a
-    dark tab strip, and the mark keeps its own white glyph rather than inheriting anything.
+    accent below is the dark theme's accent value (#4c8bf5) because it reads on both a light and
+    a dark tab strip, and the mark keeps its own white glyph rather than inheriting anything.
+
+    width and height are set as well as viewBox. A favicon is sized by the browser chrome
+    rather than by a stylesheet, and a bitmap-less image with no intrinsic size is one more
+    thing a chrome can decline to draw.
 
     The glyph is the tool's job, not a logo: an arrow moving INTO a container. Drawn rather
-    than imported so the whole icon is one 1 KB file with no build step and no dependency
+    than imported so the whole icon is one small file with no build step and no dependency
     (the alternative was a raster export that nobody can edit later).
 
     To swap in the real Dr.Ease logo: replace this file with the logo as icon.svg, or drop a
