@@ -34,10 +34,29 @@ export interface LegacySource {
   /** Empty disables the Mongo half (the pull then returns the .sql only). */
   mongoDatabase: string;
   mongoCollections: string[];
+  /**
+   * Empty means the Mongo half connects with no credentials, which is what every box this
+   * tab saw before one of them turned authorisation on: `listCollections requires
+   * authentication`, code 13, and the catalog silently came back empty. Both halves of the
+   * credential are optional together so an unauthenticated box behaves exactly as before.
+   */
+  mongoUser: string;
+  mongoPassword: string;
+  /** Where that user is defined. Mongo's own convention is `admin`. */
+  mongoAuthDb: string;
   /** Empty means any syntactically valid host is accepted. */
   allowedHosts: string[];
   /** Empty means the host key is accepted and reported instead of pinned. */
   fingerprints: string[];
+  /**
+   * Where the page images live on the source, split so the archive's member paths come out
+   * right. The CLI locates an image at nas-doctorease/mris_images/page/<url> INSIDE the
+   * archive (system_CLIV4 internal/legacyimport/page.go), so the tar has to be rooted one
+   * level above nas-doctorease and name the subtree explicitly. Getting this pair wrong does
+   * not fail loudly: the survey reports every single image as missing.
+   */
+  imageBase: string;
+  imageMember: string;
   connectTimeoutMs: number;
   commandTimeoutMs: number;
 }
@@ -115,6 +134,15 @@ export function readLegacySource(): { source: LegacySource | null; missing: stri
     mysqlTables: csv(env("LEGACY_MYSQL_TABLES") || DEFAULT_TABLES),
     mongoDatabase: env("LEGACY_MONGO_DB"),
     mongoCollections: csv(env("LEGACY_MONGO_COLLECTIONS") || DEFAULT_COLLECTIONS),
+    mongoUser: env("LEGACY_MONGO_USER"),
+    mongoPassword: env("LEGACY_MONGO_PASSWORD"),
+    mongoAuthDb: env("LEGACY_MONGO_AUTH_DB") || "admin",
+    // Defaults measured on the source, not guessed: mris_images/page is 1.1 GB over 2,548
+    // files and mris_images/thumb 22 MB over 2,522. Naming mris_images rather than the whole
+    // nas-doctorease folder also leaves out oldhn-newhn.zip, which is 2.1 GB of already
+    // compressed archive that holds no page image.
+    imageBase: env("LEGACY_IMAGE_BASE") || "/var/www/html/doctoreasetemporary/public",
+    imageMember: env("LEGACY_IMAGE_MEMBER") || "nas-doctorease/mris_images",
     allowedHosts: csv(env("LEGACY_HOSTS_ALLOWED")),
     fingerprints: csv(env("LEGACY_SSH_FINGERPRINT")),
     connectTimeoutMs: 15_000,
@@ -132,8 +160,9 @@ export function readLegacySource(): { source: LegacySource | null; missing: stri
 
 /** A short, non-secret description for the UI. */
 export function describeSource(s: LegacySource): string {
+  const auth = s.mongoUser ? ` · ล็อกอิน ${s.mongoUser}@${s.mongoAuthDb}` : " · ไม่ล็อกอิน";
   const mongo = s.mongoDatabase
-    ? `mongo ${s.mongoDatabase} (${s.mongoCollections.length} collection)`
+    ? `mongo ${s.mongoDatabase} (${s.mongoCollections.length} collection)${auth}`
     : "mongo ปิดอยู่ (ไม่ได้ตั้ง LEGACY_MONGO_DB)";
   return `${s.sshUser}@<ip>:${s.sshPort} · mysql ${s.mysqlDatabase} (${s.mysqlTables.length} ตาราง) · ${mongo}`;
 }
@@ -331,6 +360,26 @@ function remoteFail(what: string, r: RemoteResult): Error {
 }
 
 /**
+ * secretFileScript wraps a remote command so a secret can reach it without ever appearing
+ * in a command line.
+ *
+ * The secret arrives on stdin, lands in a 0600 temp file, and the file is removed when the
+ * shell exits however it exits. sshd runs the remote command through a shell, so anything
+ * in the command string is visible in `ps` to every account on that box — and these boxes
+ * have other accounts on them. mysqldumpScript below has always done this; the Mongo half
+ * now does too.
+ */
+function secretFileScript(command: string): string {
+  return [
+    "umask 077",
+    "f=$(mktemp) || exit 90",
+    `trap 'rm -f "$f"' EXIT`,
+    `cat > "$f" || exit 91`,
+    command,
+  ].join("\n");
+}
+
+/**
  * mysqlDefaultsFile is the content handed to the remote mysqldump on STDIN and written
  * to a 0600 temp file there. A password in argv shows up in `ps` for every user on the
  * box; in the environment it shows up in /proc. A defaults file shows up in neither.
@@ -354,9 +403,16 @@ function mysqldumpScript(s: LegacySource, withCreds: boolean): string {
   for (const t of s.mysqlTables) validIdent("ชื่อตาราง", t);
 
   const args = [s.mysqlDatabase, ...s.mysqlTables].map(shellQuote).join(" ");
+  // --complete-insert is not a preference. The CLI's dump reader locates rows by searching
+  // for ") VALUES", i.e. it requires the column list (internal/legacydump/dump.go), and
+  // mysqldump omits that list by default. Without the flag the pull produced a dump the CLI
+  // parsed as EMPTY while reporting success: has_branch_table=false, total_patients=0 and
+  // branches=null on a 6.3 MB file that plainly contained 947 patients. The dumps this tab
+  // was built against were exported by hand with column names, which is why nothing caught
+  // it until a dump came from here.
   const flags =
-    "--single-transaction --skip-lock-tables --no-tablespaces --skip-dump-date " +
-    "--default-character-set=utf8mb4";
+    "--complete-insert --single-transaction --skip-lock-tables --no-tablespaces " +
+    "--skip-dump-date --default-character-set=utf8mb4";
   const guard = `command -v mysqldump >/dev/null 2>&1 || { echo 'ไม่พบคำสั่ง mysqldump บนเครื่องนี้' >&2; exit 92; }`;
 
   if (!withCreds) {
@@ -426,11 +482,28 @@ async function collectionStatement(
   validIdent("ชื่อ collection", collection);
   validIdent("ชื่อฐานข้อมูล Mongo", s.mongoDatabase);
 
+  // Both halves of the credential, or neither. A box with authorisation off keeps the exact
+  // command it had before, so nothing changes for the sources that already worked.
+  const useAuth = s.mongoUser !== "" && s.mongoPassword !== "";
+  if (useAuth) validIdent("ชื่อฐานข้อมูลที่ใช้ล็อกอิน Mongo", s.mongoAuthDb);
+
   if (tool === "mongoexport") {
-    const cmd =
+    const base =
       `mongoexport --quiet --db ${shellQuote(s.mongoDatabase)} ` +
       `--collection ${shellQuote(collection)} --jsonArray`;
-    const r = await execRemote(conn, cmd, { timeoutMs: s.commandTimeoutMs });
+    // --config is mongoexport's own answer to this (4.2+): a file it reads the password out
+    // of itself, so --password never appears. JSON.stringify produces a double-quoted YAML
+    // scalar, which keeps a password containing ':' or '#' from breaking the parse.
+    const cmd = useAuth
+      ? secretFileScript(
+          `${base} --username ${shellQuote(s.mongoUser)} ` +
+            `--authenticationDatabase ${shellQuote(s.mongoAuthDb)} --config "$f"`,
+        )
+      : base;
+    const r = await execRemote(conn, cmd, {
+      timeoutMs: s.commandTimeoutMs,
+      stdin: useAuth ? `password: ${JSON.stringify(s.mongoPassword)}\n` : undefined,
+    });
     if (r.code !== 0) throw remoteFail(`mongoexport ${collection}`, r);
     const body = r.stdout.toString("utf8").trim();
     if (body === "" || body === "[]") return null;
@@ -448,8 +521,17 @@ async function collectionStatement(
       ? `db.getCollection("${collection}").find().forEach(function(d){print('db.getCollection("${collection}").insert(' + EJSON.stringify(d) + ');')})`
       : `db.getCollection("${collection}").find().forEach(function(d){print('db.getCollection("${collection}").insert(' + tojson(d) + ');')})`;
 
-  const cmd = `${tool} --quiet ${shellQuote(s.mongoDatabase)} --eval ${shellQuote(printer)}`;
-  const r = await execRemote(conn, cmd, { timeoutMs: s.commandTimeoutMs });
+  // With credentials the script goes in through stdin as a FILE the shell then runs, because
+  // the alternative is db.auth(user, password) inside --eval, and --eval is a command line.
+  const cmd = useAuth
+    ? secretFileScript(`${tool} --quiet ${shellQuote(s.mongoDatabase)} "$f"`)
+    : `${tool} --quiet ${shellQuote(s.mongoDatabase)} --eval ${shellQuote(printer)}`;
+  const r = await execRemote(conn, cmd, {
+    timeoutMs: s.commandTimeoutMs,
+    stdin: useAuth
+      ? `db.getSiblingDB(${JSON.stringify(s.mongoAuthDb)}).auth(${JSON.stringify(s.mongoUser)}, ${JSON.stringify(s.mongoPassword)});\n${printer}\n`
+      : undefined,
+  });
   if (r.code !== 0) throw remoteFail(`${tool} ${collection}`, r);
   const body = r.stdout.toString("utf8").trim();
   if (body === "") return null;
@@ -514,6 +596,117 @@ function kb(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** What a finished image pull produced. */
+export interface ImagePullResult {
+  host: string;
+  fingerprint: string;
+  bytes: number;
+  /** The tar's own member prefix, so a mismatch with the CLI is visible in the log. */
+  member: string;
+  log: string[];
+}
+
+/**
+ * pullImagesToFile streams the page-image tree off the source and writes it STRAIGHT TO DISK
+ * on this machine.
+ *
+ * WHY NOT execRemote LIKE EVERYTHING ELSE HERE
+ *
+ * execRemote buffers stdout in memory and caps it at MAX_FILE_BYTES. This archive is 1.12 GB
+ * on the source that was measured, and the browser is not in the path at all: a base64 body
+ * would be 1.5 GB of JSON in a tab, on a server with 908 MB of RAM. So the bytes go from the
+ * ssh channel to a file descriptor and nowhere else.
+ *
+ * WHY THE TAR IS NOT WRITTEN ON THE SOURCE FIRST
+ *
+ * Because there is no room for it: that box is at 98% with 597 MB free, and the archive is
+ * bigger than the free space. Writing it there would fill the root filesystem of a machine
+ * running the clinic's MySQL, Mongo and web server — not a risk, an outcome. `tar -czf -`
+ * sends it to stdout instead, so nothing is created on the source and nothing has to be
+ * cleaned up if this fails half way.
+ */
+export async function pullImagesToFile(
+  s: LegacySource,
+  host: string,
+  destPath: string,
+): Promise<ImagePullResult> {
+  const { createWriteStream } = await import("node:fs");
+  const { conn, fingerprint } = await connect(s, host);
+  const log: string[] = [];
+
+  try {
+    log.push(`ssh ${s.sshUser}@${host}:${s.sshPort} — host key ${fingerprint}`);
+
+    // -C then the member name, in that order, is what puts "nas-doctorease/mris_images/…" at
+    // the front of every path in the archive. The CLI looks for exactly that prefix.
+    const cmd =
+      `cd ${shellQuote(s.imageBase)} && ` +
+      `test -d ${shellQuote(s.imageMember)} && ` +
+      `tar -czf - -C ${shellQuote(s.imageBase)} ${shellQuote(s.imageMember)}`;
+    log.push(`tar -czf - -C ${s.imageBase} ${s.imageMember} (สตรีมออกมา ไม่เขียนไฟล์บนเครื่องต้นทาง)`);
+
+    const bytes = await new Promise<number>((resolve, reject) => {
+      conn.exec(cmd, (err, stream) => {
+        if (err) {
+          reject(new Error(`เปิด session บนเครื่องปลายทางไม่ได้: ${err.message}`));
+          return;
+        }
+        const file = createWriteStream(destPath);
+        let written = 0;
+        let stderr = "";
+        let failed: Error | null = null;
+
+        file.on("error", (e) => {
+          failed = new Error(`เขียนไฟล์ที่ ${destPath} ไม่ได้: ${e.message}`);
+          stream.close();
+        });
+        stream.on("data", (d: Buffer) => {
+          written += d.length;
+          // Backpressure is honoured rather than ignored: without it a fast tunnel outruns
+          // the disk and the difference is held in memory on a 908 MB box.
+          if (!file.write(d)) {
+            stream.pause();
+            file.once("drain", () => stream.resume());
+          }
+        });
+        stream.stderr.on("data", (d: Buffer) => {
+          if (stderr.length < MAX_STDERR_CHARS) stderr += d.toString("utf8");
+        });
+        stream.on("close", (code: number | null) => {
+          file.end(() => {
+            if (failed) {
+              reject(failed);
+              return;
+            }
+            if (code !== 0) {
+              // tar exits non-zero for a missing directory and for a read error alike, and
+              // the stderr is the only thing that tells them apart.
+              reject(
+                new Error(
+                  `ดึงไฟล์รูปไม่สำเร็จ (exit ${code})` +
+                    (stderr.trim() ? ` — ปลายทางบอกว่า: ${stderr.trim().slice(0, 400)}` : ""),
+                ),
+              );
+              return;
+            }
+            if (written === 0) {
+              reject(new Error("ดึงไฟล์รูปได้ 0 ไบต์ — ตรวจ LEGACY_IMAGE_BASE / LEGACY_IMAGE_MEMBER"));
+              return;
+            }
+            resolve(written);
+          });
+        });
+        stream.end("");
+      });
+    });
+
+    log.push(`ได้ไฟล์รูป ${kb(bytes)} → ${destPath}`);
+    return { host, fingerprint, bytes, member: s.imageMember, log };
+  } finally {
+    conn.end();
+  }
 }
 
 /**

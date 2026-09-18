@@ -18,6 +18,7 @@ import {
   type JobView,
   type ImportGroup,
   type LegacySourceStatus,
+  type VpnResponse,
   type ProvisionBranchInput,
   type PullResponse,
   type SurveyBranchesResponse,
@@ -293,6 +294,13 @@ export default function GenerateForm() {
   const [pulling, setPulling] = useState(false);
   const [pullErr, setPullErr] = useState<string | null>(null);
   const [pullLog, setPullLog] = useState<string[] | null>(null);
+  /**
+   * Whether this pull goes through the VPN. Default "no", so the tab behaves exactly as it
+   * did before this existed: the target that is reachable without a tunnel stays a one-click
+   * pull, and nobody has to opt out of something they do not need.
+   */
+  const [useVpn, setUseVpn] = useState<"vpn" | "no">("no");
+  const [vpn, setVpn] = useState<VpnResponse | null>(null);
   const [pullWarnings, setPullWarnings] = useState<string[]>([]);
   const [pulledFrom, setPulledFrom] = useState<string | null>(null);
   const [pulledFields, setPulledFields] = useState<CliInputField[]>([]);
@@ -345,6 +353,20 @@ export default function GenerateForm() {
   // one attachment, two things read out of it. Only the archive of image bytes is its
   // own input, because that is not a dump and cannot come from the same place.
   const [imgFile, setImgFile] = useState<File | null>(null);
+  /**
+   * The image archive when it was PULLED instead of attached.
+   *
+   * It is not a File and cannot be: the measured archive is 1.12 GB, so it never enters the
+   * browser — /api/pull-images streams it from the legacy box straight into the staging
+   * directory. What the page holds is the session it landed in and how big it was, which is
+   * everything the photo step needs to run without an operator choosing a file.
+   */
+  const [pulledImages, setPulledImages] = useState<{
+    sessionId: string;
+    name: string;
+    bytes: number;
+  } | null>(null);
+
   const [photoBusy, setPhotoBusy] = useState<"" | "survey" | "apply">("");
   const [photoSurvey, setPhotoSurvey] = useState<PhotoImportResponse | null>(null);
   const [photoErr, setPhotoErr] = useState<string | null>(null);
@@ -368,6 +390,12 @@ export default function GenerateForm() {
       .then((r) => r.json())
       .then(setLegacy)
       .catch(() => setLegacy({ configured: false }));
+    // Read-only: GET only reports whether the tunnel is up. Nothing is started by loading
+    // the page — a page load must not change the host's networking.
+    fetch("/api/vpn")
+      .then((r) => r.json() as Promise<VpnResponse>)
+      .then(setVpn)
+      .catch(() => setVpn({ ok: false, configured: false }));
     // Probes each backend; read-only, and the probe deliberately sends an invalid code so
     // it cannot create anything.
     fetch("/api/clinic-api-status")
@@ -747,15 +775,21 @@ export default function GenerateForm() {
   // name — the exact confusion the survey reset exists to prevent.
   const mongoName = files.mongo?.name ?? "";
   const mongoSize = files.mongo?.size ?? 0;
-  const imgName = imgFile?.name ?? "";
-  const imgSize = imgFile?.size ?? 0;
+  // A pulled archive counts as the attached file for this purpose: swapping it also has to
+  // invalidate the survey. Its identity is the session it landed in plus its size, which
+  // changes on every fresh pull, so the same reset applies without a File to look at.
+  const imgName = imgFile?.name ?? pulledImages?.name ?? "";
+  const imgSize = imgFile?.size ?? pulledImages?.bytes ?? 0;
+  const imgSession = pulledImages?.sessionId ?? "";
   useEffect(() => {
     setPhotoSurvey(null);
     setPhotoDone(null);
     setPhotoErr(null);
     setPhotoLog(null);
-    setPhotoSessionId("");
-  }, [mongoName, mongoSize, imgName, imgSize]);
+    // A pulled archive is ALREADY in a session, and that session is the only copy — dropping
+    // it here would throw away a 1.12 GB transfer and leave the photo step with nothing.
+    setPhotoSessionId(imgSession);
+  }, [mongoName, mongoSize, imgName, imgSize, imgSession]);
 
   /**
    * runPhotoImport calls the one route in either mode.
@@ -781,13 +815,34 @@ export default function GenerateForm() {
    * A session already built for these exact files is reused, so a survey followed by an
    * apply sends the bytes once. The effect above drops it the moment either file changes.
    */
-  async function uploadPhotoInputs(dump: File, images: File): Promise<string> {
+  async function uploadPhotoInputs(dump: File, images: File | null): Promise<string> {
+    // A pulled archive is already in its session; only the dump has to follow it there. The
+    // early return below cannot cover that case, because on the first call the session holds
+    // `images` and not yet `mongo`.
+    // A pulled session is already COMPLETE: /api/pull-server writes the Mongo dump into it
+    // beside the archive, precisely so the photo step never has to depend on the browser
+    // still holding a file the generate step may have consumed.
+    if (pulledImages) {
+      setPhotoSessionId(pulledImages.sessionId);
+      return pulledImages.sessionId;
+    }
     if (photoSessionId) return photoSessionId;
+    if (!images) throw new Error("ยังไม่มีไฟล์รูป — แนบไฟล์ .tar.gz หรือกด pull data ก่อน");
 
     const parts: { field: StagedField; file: File }[] = [
       { field: "mongo", file: dump },
       { field: "images", file: images },
     ];
+    const sid = await uploadParts(parts, "");
+    setPhotoSessionId(sid);
+    return sid;
+  }
+
+  /** uploadParts sends the given files to one staging session in CHUNK_BYTES slices. */
+  async function uploadParts(
+    parts: { field: StagedField; file: File }[],
+    intoSession: string,
+  ): Promise<string> {
     const totalBytes = parts.reduce((n, p) => n + p.file.size, 0);
     const chunkCount = parts.reduce((n, p) => n + Math.ceil(p.file.size / CHUNK_BYTES), 0);
 
@@ -800,7 +855,8 @@ export default function GenerateForm() {
       note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้ — ไฟล์กำลังส่งอยู่",
     });
 
-    let sid = "";
+    // Starting from intoSession is what lets the dump join an archive that is already there.
+    let sid = intoSession;
     let sentBytes = 0;
     let chunkNo = 0;
     try {
@@ -829,13 +885,12 @@ export default function GenerateForm() {
       setBusyState(null);
     }
 
-    setPhotoSessionId(sid);
     return sid;
   }
 
   async function runPhotoImport(mode: "survey" | "apply") {
     const dump = files.mongo;
-    if (!dump || !imgFile) return;
+    if (!dump || !(imgFile || pulledImages)) return;
     setPhotoErr(null);
     setPhotoLog(null);
     if (mode === "survey") {
@@ -1053,7 +1108,43 @@ export default function GenerateForm() {
       return;
     }
     setPulling(true);
+    // percent stays null for the whole pull: the server answers once, at the end, so there is
+    // no measured progress to show and a bar sitting at 0 would read as stuck. The phase text
+    // carries the information instead.
+    setBusyState({
+      title: "ดึงข้อมูลจากเซิร์ฟเวอร์ระบบเก่า",
+      phase:
+        useVpn === "vpn"
+          ? "กำลังเปิด VPN แล้วดึง MySQL + MongoDB + ไฟล์รูป"
+          : "กำลังดึง MySQL + MongoDB + ไฟล์รูป",
+      percent: null,
+      startedAt: Date.now(),
+      note: "ไฟล์รูปหลายร้อย MB โอนอยู่เบื้องหลัง — ห้ามปิดแท็บหรือกดรีเฟรช",
+    });
     try {
+      // The tunnel goes up BEFORE the pull and only when asked for, and a failure to bring
+      // it up stops here rather than letting the pull run: ssh to a private address over a
+      // tunnel that is not there fails with a connect timeout, which points the operator at
+      // the far side's firewall instead of at the VPN.
+      if (useVpn === "vpn") {
+        setPullLog(["ขอเปิด VPN ก่อนดึงข้อมูล…"]);
+        const vr = await fetch("/api/vpn", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ want: "up" }),
+        });
+        const vj = (await vr.json()) as VpnResponse;
+        setVpn(vj);
+        if (!vj.ok) {
+          setPullErr(`เปิด VPN ไม่สำเร็จ — ยังไม่ได้ดึงข้อมูล: ${vj.error ?? "ไม่ทราบสาเหตุ"}`);
+          setPullLog(vj.detail ? vj.detail.split("\n") : null);
+          return;
+        }
+        setPullLog([
+          `VPN ขึ้นแล้ว${vj.lan ? ` · เส้นทางที่เปิดให้: ${vj.lan}` : ""}`,
+          "กำลังดึงข้อมูล…",
+        ]);
+      }
       const res = await fetch("/api/pull-server", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1075,10 +1166,33 @@ export default function GenerateForm() {
       setPullWarnings(json.warnings);
       // A fresh source invalidates the artifact built from the previous one.
       setResult(null);
+
+      // The archive rode along in the SAME answer (owner's decision, 17 Sep 2026: one button,
+      // one request). It is not in `files` and carries no bytes here — it went from the legacy
+      // box straight into the staging directory on the server, and what came back is the
+      // session it landed in. A failure left `images` null and put the reason in `warnings`,
+      // so the two dumps survive it.
+      setPulledImages(
+        json.images
+          ? {
+              sessionId: json.images.sessionId,
+              name: json.images.name,
+              bytes: json.images.bytes,
+            }
+          : null,
+      );
     } catch (e) {
-      setPullErr(e instanceof Error ? e.message : String(e));
+      // A request that runs past the proxy's 100-second ceiling lands here as a network
+      // error, and the archive may in fact have arrived. Say so, because the alternative is
+      // an operator concluding the source is unreachable when the transfer was simply long.
+      const msg = e instanceof Error ? e.message : String(e);
+      setPullErr(
+        `${msg}\n\nถ้าไฟล์รูปใหญ่มาก การเชื่อมต่ออาจถูกตัดที่ 100 วินาทีทั้งที่ฝั่งเซิร์ฟเวอร์โอนเสร็จแล้ว — ` +
+          "กด pull data อีกครั้งได้ (ดึงใหม่ทั้งชุด) หรือแนบไฟล์รูปเองแล้วทำต่อ",
+      );
     } finally {
       setPulling(false);
+      setBusyState(null);
     }
   }
 
@@ -1172,7 +1286,10 @@ export default function GenerateForm() {
     // 2ข applies only when there is no archive at all: that is a legitimate choice, but a
     // silent one is how a tenant ends up with no images and nobody noticing for a week.
     let photoSession = photoSessionId;
-    if (!imgFile) {
+    // A pulled archive counts as having one. Without this the combined import would ask
+    // "ยังไม่ได้แนบไฟล์รูป" about a 1.12 GB archive already sitting in the session.
+    const haveImages = imgFile !== null || pulledImages !== null;
+    if (!haveImages) {
       if (
         !window.confirm(
           "ยังไม่ได้แนบไฟล์รูป (public_img.tar.gz)\n\n" +
@@ -1182,6 +1299,9 @@ export default function GenerateForm() {
       ) {
         return;
       }
+    } else if (pulledImages) {
+      // Nothing to send: the pull already put the archive AND the dump in this session.
+      photoSession = pulledImages.sessionId;
     } else if (!photoSession) {
       // The dump goes up with it: the photo step reads the `page` collection out of the
       // same MongoDB file, and generate has already consumed its own copy.
@@ -1194,6 +1314,7 @@ export default function GenerateForm() {
       setImporting(true);
       try {
         photoSession = await uploadPhotoInputs(files.mongo, imgFile);
+
       } catch (e) {
         setImportErr(
           `ส่งไฟล์รูปขึ้นเซิร์ฟเวอร์ไม่สำเร็จ — ยังไม่ได้นำเข้าอะไรเลย: ${
@@ -1205,7 +1326,7 @@ export default function GenerateForm() {
         return;
       }
     }
-    const withPhotos = photoSession !== "" && imgFile !== null;
+    const withPhotos = photoSession !== "" && haveImages;
 
     setImportErr(null);
     setImportLog(null);
@@ -1717,6 +1838,58 @@ export default function GenerateForm() {
                   ) : null}
                 </div>
 
+                {/* The tunnel is opt-in per target, not a property of the box: 35.187.237.227
+                    answers on its public address, the ones on 10.0.128.0/20 only answer
+                    through the VPN. Default "no" keeps the pull that already worked
+                    one click.
+
+                    The options read "vpn" and "no" rather than "1 vpn" and "2 no": the
+                    numbers were how the two choices were described when this was specified,
+                    not labels for the operator to read. A number in front of a two-item
+                    dropdown only invites the question of what it means. */}
+                <label htmlFor="usevpn">ใช้ VPN ไหม</label>
+                <select
+                  id="usevpn"
+                  name="usevpn"
+                  value={useVpn}
+                  onChange={(e) => setUseVpn(e.target.value === "vpn" ? "vpn" : "no")}
+                >
+                  <option value="vpn">vpn</option>
+                  <option value="no">no</option>
+                </select>
+                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                  {useVpn === "vpn" ? (
+                    <>
+                      กด <b>pull data</b> แล้วระบบจะเปิดอุโมงค์ให้ก่อน แล้วจึงดึงข้อมูล — ถ้าเปิดไม่ขึ้น
+                      จะหยุดและบอกเหตุ ไม่ดึงต่อ · ใช้กับเครื่องในวง <code>10.0.128.0/20</code>
+                      {vpn?.configured === false ? (
+                        <>
+                          {" "}
+                          · <b>เครื่องนี้ยังไม่มีกลไก VPN ติดตั้งอยู่</b>
+                        </>
+                      ) : vpn?.up ? (
+                        <>
+                          {" "}
+                          · ตอนนี้อุโมงค์ <b>เปิดอยู่</b>
+                          {vpn.lan ? (
+                            <>
+                              {" "}
+                              · เส้นทางที่เปิดให้ <code>{vpn.lan}</code>
+                            </>
+                          ) : null}
+                        </>
+                      ) : (
+                        <> · ตอนนี้อุโมงค์ปิดอยู่</>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      ต่อตรงไปยัง IP ที่กรอก ไม่แตะ VPN — ใช้กับเครื่องที่เปิดให้เข้าถึงจากอินเทอร์เน็ต
+                      เช่น <code>35.187.237.227</code>
+                    </>
+                  )}
+                </div>
+
                 <label htmlFor="legacy-host">IP ของเซิร์ฟเวอร์ระบบเก่า</label>
                 <input
                   id="legacy-host"
@@ -1877,7 +2050,9 @@ export default function GenerateForm() {
                 // their bytes.
                 const need: string[] = [];
                 if (!files.mongo) need.push("MongoDB (.js)");
-                if (!imgFile) need.push("ไฟล์รูป (.tar.gz)");
+                // A pulled archive satisfies this as fully as an attached one — it is already
+                // in the staging session the import reads from.
+                if (!imgFile && !pulledImages) need.push("ไฟล์รูป (.tar.gz)");
                 return (
                   <>
                     <div className="row" style={{ marginBottom: 4 }}>
@@ -2544,10 +2719,20 @@ export default function GenerateForm() {
                     is stated here rather than left for the operator to infer — the previous
                     version gave no clue and three tenants went in with no images. */}
                 <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-                  {imgFile ? (
+                  {!imgFile && pulledImages ? (
+                  <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                    <span className="tag ok">ดึงจากเซิร์ฟเวอร์</span> <code>{pulledImages.name}</code>{" "}
+                    · {human(pulledImages.bytes)} ·{" "}
+                    <span className="muted">
+                      อยู่บนเซิร์ฟเวอร์แล้ว ไม่ได้ผ่านเบราว์เซอร์ — ไม่ต้องเลือกไฟล์
+                    </span>
+                  </div>
+                ) : null}
+                {imgFile || pulledImages ? (
                     <>
-                      รอบนี้จะนำเข้า <b>ข้อมูล + รูปหน้าเวชระเบียน</b> ({human(imgFile.size)}) ในการกดครั้งเดียว
-                      {photoSessionId ? (
+                      รอบนี้จะนำเข้า <b>ข้อมูล + รูปหน้าเวชระเบียน</b> (
+                      {human(imgFile?.size ?? pulledImages?.bytes ?? 0)}) ในการกดครั้งเดียว
+                      {photoSessionId || pulledImages ? (
                         <> · ไฟล์รูปอยู่บนเซิร์ฟเวอร์แล้ว ไม่ต้องส่งซ้ำ</>
                       ) : (
                         <> · จะส่งไฟล์รูปขึ้นเซิร์ฟเวอร์ก่อนแล้วนำเข้าให้เอง</>

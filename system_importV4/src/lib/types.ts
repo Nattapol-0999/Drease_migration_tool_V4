@@ -267,10 +267,32 @@ export interface PullOk {
   /** SHA256 host key fingerprint of the box that answered. */
   fingerprint: string;
   files: PulledFileInfo[];
+  /**
+   * The page-image archive, when it was pulled too.
+   *
+   * It is NOT in `files`, and it has no base64: the measured archives are 736 MB and 1.12 GB,
+   * so the bytes go from the legacy box straight into the staging directory on this server
+   * and never enter the browser. What comes back is the session they landed in, which is the
+   * same session /api/import-photos reads — that is what lets the photo step run without
+   * anyone choosing a file.
+   *
+   * null when the archive could not be pulled. The reason is in `warnings`: the two dumps are
+   * independently useful and are not thrown away because the images failed.
+   */
+  images: PulledImageInfo | null;
   /** What ran on the far side and what came back. */
   log: string[];
   /** Did not stop the pull, but changes what the operator got. */
   warnings: string[];
+}
+
+/** The pulled image archive, described rather than carried. */
+export interface PulledImageInfo {
+  sessionId: string;
+  name: string;
+  bytes: number;
+  /** The tar's member prefix, so a mismatch with what the CLI expects is visible. */
+  member: string;
 }
 
 export interface PullErr {
@@ -287,6 +309,27 @@ export interface LegacySourceStatus {
   missing?: string[];
   /** Empty/absent means any host may be entered. */
   hostsAllowed?: string[];
+}
+
+/**
+ * What /api/vpn answers. The status fields are optional because a rejected REQUEST (a body
+ * that is not "up" or "down") is refused before anything is read, so there is no status to
+ * report at that point.
+ *
+ * `up` is the fact the operator needs and it comes from the tunnel interface existing, not
+ * from the systemd unit being active — the unit is active as soon as the process starts,
+ * which is before openvpn has authenticated.
+ */
+export interface VpnResponse {
+  ok: boolean;
+  error?: string;
+  /** False when this host has no VPN plumbing installed at all. */
+  configured?: boolean;
+  up?: boolean;
+  /** The network the tunnel routes, e.g. 10.0.128.0/20. */
+  lan?: string;
+  /** The root helper's own words, for the log panel. */
+  detail?: string;
 }
 
 // ── ปลายทาง: test / production ────────────────────────────────────────────────
