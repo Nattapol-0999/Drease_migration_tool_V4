@@ -426,12 +426,37 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 			// generic_name/strength/dosage_form/indication/warning, and filling them
 			// from a product name would be inventing clinical text. Empty keeps the
 			// SKU in draft, which is exactly "receivable, not sellable".
+			// source_key IS DELIBERATELY NOT LISTED.
+			//
+			// This used to write 'mongo:items:'+code and it made the SECOND clinic
+			// importable-once-ever. Migration 0115 declares the column as
+			//
+			//	source_key varchar(32) NOT NULL DEFAULT md5(random()||clock_timestamp())
+			//	CREATE UNIQUE INDEX uniq_items_source_key ON items (source_key)
+			//
+			// — a globally unique opaque surrogate, unique across items/courses/listheal
+			// together, because doctor-fee rules bind a bill line to a catalog row by it and
+			// those three tables reuse the same integer ids. The V2 stock code is not that:
+			// 'ST000001' is the first SKU in EVERY V2 database. So the second tenant to
+			// import hit
+			//
+			//	ERROR: duplicate key value violates unique constraint "uniq_items_source_key"
+			//	DETAIL: Key (source_key)=(mongo:items:ST000001) already exists.
+			//
+			// on a row that belonged to a completely different clinic. Omitting the column
+			// lets the declared default mint a distinct key per row, which is the contract
+			// the index is enforcing. Provenance is not lost: items.code still holds the V2
+			// code verbatim, and the ON CONFLICT below already treats (clinic_code, code) as
+			// this row's identity.
+			//
+			// The DO UPDATE deliberately leaves source_key out too — a re-import must not
+			// re-mint the key of a row a fee rule may already point at.
 			sItems.comment("%s · %s", code, oneLine(name))
 			sItems.addf(`INSERT INTO items
     (clinic_code, code, name, name_en, category, unit, cost, price, active,
-     source_key, created_at, updated_at)
+     created_at, updated_at)
 VALUES (%s, %s, %s, NULL, %s, %s, %s, %s, %s,
-        %s, %s, now())
+        %s, now())
 ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
     name       = EXCLUDED.name,
     category   = EXCLUDED.category,
@@ -443,7 +468,7 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 `, lit(in.ClinicCode), lit(code), lit(nameLit),
 				defaultLit(catLit, "general"), defaultLit(unitLit, "ชิ้น"),
 				moneyLit(cost), moneyLit(price), boolLit(docBool(d, "active")),
-				lit("mongo:items:"+code), tsLit(d.Text("createdAt"), "now()"))
+				tsLit(d.Text("createdAt"), "now()"))
 
 			// Every SKU needs a catalog_item or it cannot be sold at all. item_type is
 			// 'drug' for the whole collection (locked decision).
