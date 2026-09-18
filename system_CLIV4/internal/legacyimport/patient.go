@@ -208,6 +208,11 @@ func buildPatient(srcCols []string, rows []legacydump.Row, in Input, rep *Report
 	prefixOut := map[string]int{}
 	genderOut := map[string]int{}
 
+	// emitted counts the patients actually WRITTEN, which is not n: rows with no HN are
+	// skipped above. The transaction boundary has to follow the written ones or the batches
+	// come out uneven and the last one can exceed the budget.
+	emitted := 0
+
 	for n, r := range rows {
 		hn := r.Get("HN")
 		if hn == "" {
@@ -261,6 +266,12 @@ func buildPatient(srcCols []string, rows []legacydump.Row, in Input, rep *Report
 		// import that left migrate_source_ref NULL; keying on the ref would miss that
 		// row and then violate the unique index on HN. Guarding on HN is idempotent
 		// whatever the earlier import did.
+		// A transaction boundary every patientsPerTransaction rows, emitted BEFORE the row
+		// rather than after so the batch never ends with an empty transaction.
+		if emitted > 0 && emitted%patientsPerTransaction == 0 {
+			s.addf("%s", patientBatchBoundary(emitted, len(rows), in.ClinicCode))
+		}
+
 		s.addf(`INSERT INTO patient (%s)
 SELECT %s
 WHERE NOT EXISTS (
@@ -268,6 +279,7 @@ WHERE NOT EXISTS (
 );
 
 `, joinCols(cols), joinCols(vals), lit(in.ClinicCode), lit(hn))
+		emitted++
 	}
 
 	// REFUSAL: rows exist but not one of them had an HN.

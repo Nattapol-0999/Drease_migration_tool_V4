@@ -64,8 +64,15 @@ func TestUserMapKeepsAFreeLoginNameExactlyAsItWas(t *testing.T) {
 	// the target. Both outcomes must be present for every row: the original when it is free,
 	// the suffixed form when it is not.
 	for _, want := range []string{
+		// TEMP is the guarantee that matters and it is unchanged: PostgreSQL drops the table
+		// when psql disconnects, so a run that dies half way leaves nothing in the database.
 		"CREATE TEMP TABLE import_user_map",
-		"ON COMMIT DROP",
+		// PRESERVE ROWS, not DROP. The script commits at every group boundary now (a single
+		// transaction over all 19 target tables exhausts max_locks_per_transaction), and
+		// ON COMMIT DROP would take this table away at the first of those commits — after
+		// which the six places that translate a person through it read a relation that no
+		// longer exists.
+		"ON COMMIT PRESERVE ROWS",
 		"legacy_email",           // kept so the renames can be counted after the database decides
 		"'admin'",                // kept when free
 		"'admin_MBU1@gmail.com'", // used when taken

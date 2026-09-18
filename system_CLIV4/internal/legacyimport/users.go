@@ -40,12 +40,28 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	// count them: whether a name is taken is a fact about the target, known only once the
 	// CASE has run. Comparing the two columns after the load gives the real number instead of
 	// a guess, and it is also what an operator needs when a staff member cannot log in.
+	// ON COMMIT PRESERVE ROWS, not ON COMMIT DROP.
+	//
+	// The script is no longer one transaction. It commits at every group boundary, because a
+	// single transaction touching all 19 target tables plus their indexes exhausts
+	// max_locks_per_transaction (64 by default) and the import dies with "out of shared
+	// memory" — measured on a 6,439-patient export against drease_temporary.
+	//
+	// With ON COMMIT DROP this table vanished at the first of those commits, and the six
+	// places that translate a person through it (patient.user_insert, doctor.user_id, the
+	// emails on clinic_user and clinic_staff) would then read a relation that no longer
+	// exists — a failure with nothing in its message about transactions.
+	//
+	// PRESERVE ROWS keeps the original guarantee that matters: it is still a TEMP table, so
+	// PostgreSQL drops it when psql disconnects and nothing is left behind in the database
+	// even if the run dies half way. The only thing that changed is that it survives a
+	// COMMIT.
 	s.addf(`CREATE TEMP TABLE import_user_map (
     legacy_id    bigint PRIMARY KEY,
     legacy_email text NOT NULL,
     email        text NOT NULL,
     new_id       bigint
-) ON COMMIT DROP;
+) ON COMMIT PRESERVE ROWS;
 
 `)
 

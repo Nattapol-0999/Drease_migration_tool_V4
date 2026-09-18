@@ -21,6 +21,67 @@ import (
 // worst kind of failure, because it looks like success. The clinic is created through
 // the normal V4 admin flow (which also gives it its subscription, settings, rules and
 // counters); this tool only verifies the result.
+/*
+patientsPerTransaction is how many patient rows share one transaction.
+
+WHY THE PATIENT GROUP IS THE ONLY ONE BATCHED BY ROW COUNT
+
+`trg_patient_privacy_hn_lock` fires per row and takes a TRANSACTION-scoped advisory lock per
+HN it is claiming — the current one, and old_hn when the patient has one (migration 0404,
+privacy_lock_patient_hn). Advisory locks live in the same shared lock table as relation locks
+and are only released at COMMIT, so they accumulate for the whole transaction.
+
+The ratio is 2 locks per patient in the worst case and it is DATA-DEPENDENT, which is the part
+that caught us out. First measurement, on agafar-clinic: 6,439 patients, 1,445 with an old_hn,
+7,884 ownership rows — 1.22 per patient, and 2,000 rows was sized against that. Then doctortony
+imported at exactly 2.00 (14,899 patients, 29,794 ownership rows) because every one of its
+patients carries an old_hn. That put a 2,000-row batch at 4,000 advisory locks plus the group's
+relation locks, against a 4,096 budget: it completed with about 1% to spare.
+
+1,000 rows is therefore the size, not 2,000 — 2,000 locks at the worst-case ratio, half the
+budget, and the margin no longer depends on how the clinic happened to renumber its patients.
+
+This is the one thing row-count batching fixes. Splitting by rows does nothing for RELATION
+locks — 500 patients lock exactly the same tables as 14,899 — which is why the group-level
+split in script.go was not enough on its own.
+*/
+const patientsPerTransaction = 1000
+
+/*
+patientBatchBoundary closes one patient batch and opens the next.
+
+It says which rows it is about, because a failure part way through 14,899 patients now leaves
+the earlier batches committed, and "which ones made it" is the first question anyone asks.
+*/
+func patientBatchBoundary(done, total int, clinicCode string) string {
+	return fmt.Sprintf(
+		"-- ── ปิดชุดที่ %d แถวแรกของคนไข้ (จาก %d) แล้วเปิดทรานแซกชันใหม่ ─────────────\n"+
+			"-- trigger ของ patient จับ advisory lock ต่อ HN ทุกแถว และปล่อยเมื่อ COMMIT เท่านั้น\n"+
+			"-- ชุดละ %d แถว ≈ %d ล็อก ซึ่งอยู่ใต้เพดาน max_locks_per_transaction\n"+
+			"COMMIT;\n\nBEGIN;\n%s",
+		done, total, patientsPerTransaction, patientsPerTransaction*122/100, sessionSettings(clinicCode))
+}
+
+/*
+sessionSettings is the pair of settings every transaction in the script has to open with.
+
+Both are SET LOCAL, which means they last exactly as long as the transaction that issued
+them. The script now commits at every group boundary (see script.go), so they are emitted
+once per transaction rather than once per file.
+
+standard_conforming_strings keeps backslashes in legacy text literal. On by default since
+PostgreSQL 9.1, stated anyway so a server configured otherwise cannot quietly mangle data.
+
+app.clinic_code is the GUC every FORCE-RLS policy reads. It is harmless when the script runs
+as the table owner and REQUIRED when it runs as the RLS-bound application role — and the
+failure it prevents is the silent kind: with the GUC unset the policies match nothing, so
+every INSERT writes zero rows and psql still reports success.
+*/
+func sessionSettings(clinicCode string) string {
+	return "SET LOCAL standard_conforming_strings = on;\n" +
+		fmt.Sprintf("SET LOCAL app.clinic_code = %s;\n\n", lit(clinicCode))
+}
+
 func buildClinicExistsGuard(clinic string) string {
 	return fmt.Sprintf(`-- GUARD: the clinic must already exist in V4.
 -- patient/appointment have no FK to clinic, so a mistyped code would import rows that

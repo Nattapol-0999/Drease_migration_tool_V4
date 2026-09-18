@@ -118,15 +118,7 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	b.WriteString("-- ══════════════════════════════════════════════════════════════════════════\n\n")
 
 	b.WriteString("BEGIN;\n\n")
-
-	// Legacy text is full of backslashes; standard_conforming_strings keeps them
-	// literal. On by default since PostgreSQL 9.1, but stated so a server configured
-	// otherwise cannot silently mangle the data.
-	b.WriteString("SET LOCAL standard_conforming_strings = on;\n")
-	// The tenant GUC every FORCE-RLS table's policy reads. Harmless when the script is
-	// run by the table owner; REQUIRED when it is run by the RLS-bound application
-	// role, which would otherwise write zero rows without erroring.
-	b.WriteString(fmt.Sprintf("SET LOCAL app.clinic_code = %s;\n\n", lit(in.ClinicCode)))
+	b.WriteString(sessionSettings(in.ClinicCode))
 
 	b.WriteString(buildClinicExistsGuard(in.ClinicCode))
 	// Gated on accounts actually being WRITTEN, not merely parsed. Since BuildAll started
@@ -180,11 +172,48 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		b.WriteString(buildMoneyPreflightGuards(in.ClinicCode, money.invoiceHN, money.receiptHN))
 	}
 
+	// One transaction PER GROUP, not one for the whole file.
+	//
+	// WHY IT HAD TO CHANGE
+	//
+	// PostgreSQL takes a lock per RELATION — every table, every index, every toast — and holds
+	// it until the transaction ends. This script writes to 19 tables and touches 7 more with
+	// UPDATE/DELETE/ANALYZE; with their indexes that is well past max_locks_per_transaction,
+	// which is 64 by default. Measured on drease_temporary with a 6,439-patient export:
+	//
+	//   ERROR: out of shared memory
+	//   HINT:  You might need to increase max_locks_per_transaction
+	//   CONTEXT: INSERT INTO privacy_patient_hn_ownership … privacy_lock_patient_hn() line 49
+	//
+	// Splitting by ROW COUNT would not have helped: 500 patients hold exactly the same
+	// relation locks as 6,439. Only cutting the number of TABLES per transaction does, and a
+	// group is the natural boundary — each one writes to a handful.
+	//
+	// WHAT IS LOST, SAID PLAINLY
+	//
+	// The file is no longer all-or-nothing. A failure in group N leaves groups 1..N-1
+	// committed, and the tenant has to be deleted before another attempt. The owner accepted
+	// that on 17 Sep 2026 in preference to raising the server setting.
+	//
+	// WHAT MUST BE REPEATED AFTER EVERY BEGIN
+	//
+	// Both settings below are LOCAL to a transaction. Forgetting to re-issue app.clinic_code
+	// would not raise anything — the RLS policies would simply match no rows and every
+	// INSERT after the first commit would write ZERO rows while psql reported success.
+	first := true
 	for _, name := range order {
 		sqlText, ok := batches[name]
 		if !ok || strings.TrimSpace(sqlText) == "" {
 			continue
 		}
+		if !first {
+			b.WriteString("-- ── ปิดทรานแซกชันของกลุ่มก่อนหน้า แล้วเปิดใหม่สำหรับกลุ่มถัดไป ──────────\n")
+			b.WriteString("-- (ล็อกของ PostgreSQL คิดต่อตาราง ไม่ใช่ต่อแถว การรวมทุกกลุ่มในทรานแซกชัน\n")
+			b.WriteString("--  เดียวจึงชน max_locks_per_transaction — ดูคอมเมนต์ใน script.go)\n")
+			b.WriteString("COMMIT;\n\nBEGIN;\n")
+			b.WriteString(sessionSettings(in.ClinicCode))
+		}
+		first = false
 		// Guard 5, immediately before the first money entity: the patient phase is above
 		// (order puts EntPatient well before EntInvoice) so this run's patients are already
 		// in the transaction, and no bill has been written yet, so refusing here still
@@ -202,8 +231,12 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		b.WriteString(analyzeAfter(name))
 	}
 
-	// After the money rows land: check what was actually written, not what was meant
-	// to be. Inside the same transaction, so a failure takes the whole file with it.
+	// After the money rows land: check what was actually written, not what was meant to be.
+	//
+	// These run in the LAST transaction, which is the money group's own, so a failure here
+	// still rolls the money back. It no longer takes the whole file with it — the groups
+	// committed before it stay. That is the trade the per-group split makes, and the guard is
+	// still the thing that stops a wrong total from being kept.
 	if writingMoney {
 		b.WriteString("-- ── ตรวจยอดเงินหลังเขียน (ด่าน 1–3) ───────────────────────────────\n")
 		b.WriteString(buildMoneyVerifyGuards(in.ClinicCode, keySet(money.invoiceHN), keySet(money.receiptHN)))
