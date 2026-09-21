@@ -749,6 +749,11 @@ export function buildInsertSQL(
   out.push("-- uniq_visit_master_clinic_day_vn บังคับให้ VN ไม่ซ้ำต่อ (คลินิก + วัน) ไม่ใช่ต่อคนไข้");
   out.push("-- ถ้าวันนั้นมีใบของระบบอยู่ก่อนแล้ว เลขจะไล่ต่อจากของเดิมแทนที่จะชนกัน");
   out.push("--");
+  out.push("-- เติมศูนย์เป็น 3 หลักได้แค่ถึง 999 — เกินจากนั้นใช้ตัวเลขตรง ๆ เพราะ lpad ของ");
+  out.push("-- PostgreSQL **ตัด** สตริงที่ยาวเกินความยาวที่สั่ง ไม่ได้แค่เติม: lpad('1000',3,'0')");
+  out.push("-- คืน '100' ซึ่งเป็น VN ของใบที่ 100 ทำให้ใบที่ 1000 ชนกับใบที่ 100 พอดี");
+  out.push("-- (เจอจริงสองรอบ 18 ก.ย. 2569 ที่ HN 016900214 ใบที่ 1000 จาก 1,533 ใบ)");
+  out.push("--");
   out.push("-- insert-only · รันซ้ำไม่เพิ่มใบซ้ำ (กันด้วย clinic_code + HN + visit_date)");
   out.push("-- ══════════════════════════════════════════════════════════════════════════");
   out.push("");
@@ -772,8 +777,9 @@ export function buildInsertSQL(
     out.push(
       `INSERT INTO visit_master (clinic_code, "HN", "VN", visit_date, branch_code, doctor_code, title)
 SELECT ${c}, ${hn},
-       lpad((SELECT count(*) + 1 FROM visit_master
-              WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)})::text, 3, '0'),
+       (SELECT CASE WHEN q.n <= 999 THEN lpad(q.n::text, 3, '0') ELSE q.n::text END
+          FROM (SELECT count(*) + 1 AS n FROM visit_master
+                 WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}) q),
        DATE ${lit(IMPORT_VISIT_DATE)}, p.branch_code,
        ${nullLit(v.doctorCode)}, ${lit(IMPORT_VISIT_TITLE)}
   FROM patient p
