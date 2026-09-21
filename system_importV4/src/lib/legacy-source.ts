@@ -57,6 +57,14 @@ export interface LegacySource {
    */
   imageBase: string;
   imageMember: string;
+  /**
+   * The two small trees under the same imageBase, pulled alongside the page archive since
+   * 18 Sep 2026: the clinic's logo and the patients' profile photos. Overridable for the same
+   * reason imageMember is — a source that keeps them elsewhere should be a config change, not
+   * a code change. Absent folders are not an error; the pull reports them as warnings.
+   */
+  logoMember: string;
+  profileMember: string;
   connectTimeoutMs: number;
   commandTimeoutMs: number;
 }
@@ -143,6 +151,10 @@ export function readLegacySource(): { source: LegacySource | null; missing: stri
     // compressed archive that holds no page image.
     imageBase: env("LEGACY_IMAGE_BASE") || "/var/www/html/doctoreasetemporary/public",
     imageMember: env("LEGACY_IMAGE_MEMBER") || "nas-doctorease/mris_images",
+    // Measured on the source: clinic-logo is 44 KB over 2 files, profile-image 556 KB over 5
+    // whose basenames ARE the HN. Both sit under the same imageBase as the page archive.
+    logoMember: env("LEGACY_LOGO_MEMBER") || "img/clinic-logo",
+    profileMember: env("LEGACY_PROFILE_MEMBER") || "img/profile-image",
     allowedHosts: csv(env("LEGACY_HOSTS_ALLOWED")),
     fingerprints: csv(env("LEGACY_SSH_FINGERPRINT")),
     connectTimeoutMs: 15_000,
@@ -473,6 +485,64 @@ async function mongoTool(conn: SSHClient, s: LegacySource): Promise<"mongoexport
  * ObjectId, ISODate and NumberDecimal distinguishable — the CLI relies on that
  * ($numberDecimal in particular, because every decimal in these dumps is money).
  */
+/**
+ * collectionCommand is collectionStatement's command builder with the execution taken out, so
+ * the same command can be streamed to a file instead of buffered into a string.
+ *
+ * `wrap` is the text that has to go around the streamed bytes. mongoexport emits a bare JSON
+ * array, so it needs insertMany(...) put around it — that wrapper used to be a template literal
+ * holding a copy of the whole export. The shell fallback prints complete statements already and
+ * needs no wrapper, which is why this is nullable rather than always a pair of strings.
+ *
+ * Kept beside collectionStatement deliberately: the two must build the SAME command, and the
+ * only way that stays true is if a change to one is obviously a change to the other.
+ */
+function collectionCommand(
+  s: LegacySource,
+  tool: "mongoexport" | "mongosh" | "mongo",
+  collection: string,
+): { cmd: string; stdin?: string; wrap: { before: string; after: string } | null } {
+  validIdent("ชื่อ collection", collection);
+  validIdent("ชื่อฐานข้อมูล Mongo", s.mongoDatabase);
+
+  const useAuth = s.mongoUser !== "" && s.mongoPassword !== "";
+  if (useAuth) validIdent("ชื่อฐานข้อมูลที่ใช้ล็อกอิน Mongo", s.mongoAuthDb);
+
+  if (tool === "mongoexport") {
+    const base =
+      `mongoexport --quiet --db ${shellQuote(s.mongoDatabase)} ` +
+      `--collection ${shellQuote(collection)} --jsonArray`;
+    return {
+      cmd: useAuth
+        ? secretFileScript(
+            `${base} --username ${shellQuote(s.mongoUser)} ` +
+              `--authenticationDatabase ${shellQuote(s.mongoAuthDb)} --config "$f"`,
+          )
+        : base,
+      stdin: useAuth ? `password: ${JSON.stringify(s.mongoPassword)}\n` : undefined,
+      wrap: {
+        before: `db.getCollection("${collection}").insertMany(`,
+        after: ");\n",
+      },
+    };
+  }
+
+  const printer =
+    tool === "mongosh"
+      ? `db.getCollection("${collection}").find().forEach(function(d){print('db.getCollection("${collection}").insert(' + EJSON.stringify(d) + ');')})`
+      : `db.getCollection("${collection}").find().forEach(function(d){print('db.getCollection("${collection}").insert(' + tojson(d) + ');')})`;
+
+  return {
+    cmd: useAuth
+      ? secretFileScript(`${tool} --quiet ${shellQuote(s.mongoDatabase)} "$f"`)
+      : `${tool} --quiet ${shellQuote(s.mongoDatabase)} --eval ${shellQuote(printer)}`,
+    stdin: useAuth
+      ? `db.getSiblingDB(${JSON.stringify(s.mongoAuthDb)}).auth(${JSON.stringify(s.mongoUser)}, ${JSON.stringify(s.mongoPassword)});\n${printer}\n`
+      : undefined,
+    wrap: null,
+  };
+}
+
 async function collectionStatement(
   conn: SSHClient,
   s: LegacySource,
@@ -626,11 +696,234 @@ export interface ImagePullResult {
  * running the clinic's MySQL, Mongo and web server — not a risk, an outcome. `tar -czf -`
  * sends it to stdout instead, so nothing is created on the source and nothing has to be
  * cleaned up if this fails half way.
+ *
+ * THE `member` ARGUMENT
+ *
+ * Defaults to s.imageMember, which is the page archive and the only thing this pulled until
+ * 18 Sep 2026. The clinic logo (img/clinic-logo) and the patients' profile photos
+ * (img/profile-image) live under the SAME imageBase and differ only in this subtree, so they
+ * reuse the whole mechanism — streaming, backpressure, the empty-result check — by passing a
+ * different member instead of growing a second copy of it.
  */
+/**
+ * streamToFile runs one remote command and writes its stdout STRAIGHT TO A FILE.
+ *
+ * WHY THIS EXISTS ALONGSIDE execRemote
+ *
+ * execRemote returns a Buffer, and for a dump that is fatal on this box. Measured 18 Sep 2026
+ * on a source whose Mongo holds bills 43.6 MB + payment_summary 30.5 MB: the pull died with
+ *
+ *   FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+ *     7: v8::Isolate::AdjustAmountOfExternalAllocatedMemory(long)
+ *
+ * against a 467 MB default heap on a 908 MB instance. The arithmetic is not close: ONE 60 MB
+ * collection becomes a 60 MB Buffer, then `.toString("utf8")` makes a V8 string that is 120 MB
+ * because V8 stores it as UTF-16, then `.trim()` copies it again, then the template literal
+ * that wraps it in insertMany(...) copies it once more. Roughly 400 MB for one collection, and
+ * the old code did that for all fourteen and then joined the results.
+ *
+ * Here the bytes never become a string and never all exist at once: chunk in, chunk to disk,
+ * with backpressure honoured so a fast tunnel cannot outrun the disk into memory.
+ *
+ * `append` is what lets the Mongo dump be built one collection at a time into one file.
+ */
+async function streamToFile(
+  conn: SSHClient,
+  cmd: string,
+  destPath: string,
+  opts: { stdin?: string; timeoutMs?: number; append?: boolean } = {},
+): Promise<{ bytes: number; code: number; stderr: string }> {
+  const { createWriteStream } = await import("node:fs");
+
+  return new Promise((resolve, reject) => {
+    conn.exec(cmd, (err, stream) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      const file = createWriteStream(destPath, opts.append ? { flags: "a" } : {});
+      let written = 0;
+      let stderr = "";
+      let failed: Error | null = null;
+      let timer: NodeJS.Timeout | null = null;
+
+      file.on("error", (e) => {
+        failed = e instanceof Error ? e : new Error(String(e));
+      });
+
+      if (opts.timeoutMs && opts.timeoutMs > 0) {
+        timer = setTimeout(() => {
+          failed = new Error(`คำสั่งบนเครื่องต้นทางใช้เวลาเกิน ${Math.round(opts.timeoutMs! / 1000)} วินาที`);
+          stream.close();
+        }, opts.timeoutMs);
+      }
+
+      stream.on("data", (d: Buffer) => {
+        written += d.length;
+        if (!file.write(d)) {
+          stream.pause();
+          file.once("drain", () => stream.resume());
+        }
+      });
+      stream.stderr.on("data", (d: Buffer) => {
+        if (stderr.length < MAX_STDERR_CHARS) stderr += d.toString("utf8");
+      });
+      stream.on("close", (code: number) => {
+        if (timer) clearTimeout(timer);
+        file.end(() => {
+          if (failed) {
+            reject(failed);
+            return;
+          }
+          resolve({ bytes: written, code: code ?? 0, stderr });
+        });
+      });
+
+      if (opts.stdin !== undefined) stream.write(opts.stdin);
+      stream.end();
+    });
+  });
+}
+
+/** Append a short piece of text to a file. Used for the wrappers around a streamed export. */
+async function appendText(destPath: string, text: string): Promise<void> {
+  const { appendFile } = await import("node:fs/promises");
+  await appendFile(destPath, text, "utf8");
+}
+
+export interface DumpPullResult {
+  host: string;
+  fingerprint: string;
+  sqlBytes: number;
+  /** null when no Mongo client was found, or no collection had anything in it. */
+  mongoBytes: number | null;
+  log: string[];
+  warnings: string[];
+}
+
+/**
+ * pullDumpsToFiles is pullFromHost with the buffers taken out: the two dumps go from the source
+ * into the staging directory and never through memory or the browser.
+ *
+ * It replaces the old route for tab 2. pullFromHost is still what the read-only connection
+ * check uses, so it stays as it is — a check reads a few kilobytes of table names and has no
+ * size problem to solve.
+ */
+export async function pullDumpsToFiles(
+  s: LegacySource,
+  host: string,
+  dest: { sql: string; mongo: string },
+): Promise<DumpPullResult> {
+  const { conn, fingerprint } = await connect(s, host);
+  const log: string[] = [];
+  const warnings: string[] = [];
+
+  try {
+    log.push(`ssh ${s.sshUser}@${host}:${s.sshPort} — host key ${fingerprint}`);
+
+    // ── MySQL ──────────────────────────────────────────────────────────────────────────
+    const withCreds = s.mysqlUser !== "" || s.mysqlPassword !== "";
+    log.push(
+      `mysqldump ${s.mysqlDatabase}: ${s.mysqlTables.join(", ")}` +
+        (withCreds ? ` (ล็อกอินเป็น ${s.mysqlUser})` : " (ใช้ credential ที่ตั้งไว้บนเครื่องปลายทาง)"),
+    );
+    const sqlRun = await streamToFile(conn, mysqldumpScript(s, withCreds), dest.sql, {
+      stdin: withCreds ? mysqlDefaultsFile(s) : undefined,
+      timeoutMs: s.commandTimeoutMs,
+    });
+    if (sqlRun.code !== 0) {
+      throw new Error(
+        `mysqldump ไม่สำเร็จ (exit ${sqlRun.code})` +
+          (sqlRun.stderr.trim() ? ` — ปลายทางบอกว่า: ${sqlRun.stderr.trim().slice(0, 400)}` : ""),
+      );
+    }
+    if (sqlRun.bytes === 0) throw new Error("mysqldump ไม่ได้ส่งข้อมูลกลับมาเลย");
+    log.push(`  ได้ ${kb(sqlRun.bytes)} → ${dest.sql}`);
+
+    // ── Mongo ──────────────────────────────────────────────────────────────────────────
+    //
+    // One collection at a time, straight into the file. The empty check is done on the byte
+    // count of a scratch file rather than by reading the export into a string, because reading
+    // it is exactly what used to run the process out of memory.
+    let mongoBytes: number | null = null;
+    const tool = await mongoTool(conn, s);
+    if (!tool) {
+      warnings.push(
+        "ไม่พบ mongoexport / mongosh / mongo บนเครื่องปลายทาง — ได้แต่ไฟล์ MySQL ส่วนแคตตาล็อกต้องแนบไฟล์ .js เอง",
+      );
+    } else {
+      log.push(`mongo: ใช้ ${tool} · ฐาน ${s.mongoDatabase}`);
+      const { rm } = await import("node:fs/promises");
+      const scratch = `${dest.mongo}.part`;
+
+      await appendText(dest.mongo, `// pulled from ${s.mongoDatabase} via ${tool} by system_importV4\n`);
+      let got = 0;
+      let total = 0;
+
+      for (const c of s.mongoCollections) {
+        const plan = collectionCommand(s, tool, c);
+        const run = await streamToFile(conn, plan.cmd, scratch, {
+          stdin: plan.stdin,
+          timeoutMs: s.commandTimeoutMs,
+        });
+        if (run.code !== 0) {
+          await rm(scratch, { force: true });
+          throw new Error(
+            `ดึง collection ${c} ไม่สำเร็จ (exit ${run.code})` +
+              (run.stderr.trim() ? ` — ${run.stderr.trim().slice(0, 300)}` : ""),
+          );
+        }
+
+        // An empty collection is "[]" from mongoexport and "" from the shell fallback. Both are
+        // tiny, so the size alone separates them from real data without reading the file.
+        if (run.bytes <= 3) {
+          log.push(`  ${c}: ว่าง/ไม่มี collection นี้ — ข้าม`);
+          await rm(scratch, { force: true });
+          continue;
+        }
+
+        if (plan.wrap) await appendText(dest.mongo, plan.wrap.before);
+        await concatFile(scratch, dest.mongo);
+        if (plan.wrap) await appendText(dest.mongo, plan.wrap.after);
+        else await appendText(dest.mongo, "\n");
+
+        await rm(scratch, { force: true });
+        got++;
+        total += run.bytes;
+        log.push(`  ${c}: ${kb(run.bytes)}`);
+      }
+
+      if (got === 0) {
+        warnings.push(
+          `ไม่มี collection ใดใน ${s.mongoDatabase} ที่ดึงได้เลย (${s.mongoCollections.join(", ")}) — ` +
+            "ตรวจ LEGACY_MONGO_DB / LEGACY_MONGO_COLLECTIONS",
+        );
+        await rm(dest.mongo, { force: true });
+      } else {
+        const { stat } = await import("node:fs/promises");
+        mongoBytes = (await stat(dest.mongo)).size;
+        log.push(`  รวม ${got} collection · ${kb(total)} → ${dest.mongo}`);
+      }
+    }
+
+    return { host, fingerprint, sqlBytes: sqlRun.bytes, mongoBytes, log, warnings };
+  } finally {
+    conn.end();
+  }
+}
+
+/** Append the whole of one file onto another, by stream. Nothing is read into a string. */
+async function concatFile(from: string, to: string): Promise<void> {
+  const { createReadStream, createWriteStream } = await import("node:fs");
+  const { pipeline } = await import("node:stream/promises");
+  await pipeline(createReadStream(from), createWriteStream(to, { flags: "a" }));
+}
+
 export async function pullImagesToFile(
   s: LegacySource,
   host: string,
   destPath: string,
+  member: string = s.imageMember,
 ): Promise<ImagePullResult> {
   const { createWriteStream } = await import("node:fs");
   const { conn, fingerprint } = await connect(s, host);
@@ -643,9 +936,9 @@ export async function pullImagesToFile(
     // the front of every path in the archive. The CLI looks for exactly that prefix.
     const cmd =
       `cd ${shellQuote(s.imageBase)} && ` +
-      `test -d ${shellQuote(s.imageMember)} && ` +
-      `tar -czf - -C ${shellQuote(s.imageBase)} ${shellQuote(s.imageMember)}`;
-    log.push(`tar -czf - -C ${s.imageBase} ${s.imageMember} (สตรีมออกมา ไม่เขียนไฟล์บนเครื่องต้นทาง)`);
+      `test -d ${shellQuote(member)} && ` +
+      `tar -czf - -C ${shellQuote(s.imageBase)} ${shellQuote(member)}`;
+    log.push(`tar -czf - -C ${s.imageBase} ${member} (สตรีมออกมา ไม่เขียนไฟล์บนเครื่องต้นทาง)`);
 
     const bytes = await new Promise<number>((resolve, reject) => {
       conn.exec(cmd, (err, stream) => {
@@ -703,7 +996,9 @@ export async function pullImagesToFile(
     });
 
     log.push(`ได้ไฟล์รูป ${kb(bytes)} → ${destPath}`);
-    return { host, fingerprint, bytes, member: s.imageMember, log };
+    // `member`, not s.imageMember: the caller has to see which subtree these bytes came from,
+    // otherwise a logo pull reports itself as the page archive in the log and the counters.
+    return { host, fingerprint, bytes, member, log };
   } finally {
     conn.end();
   }

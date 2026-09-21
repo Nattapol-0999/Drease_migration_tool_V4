@@ -281,8 +281,22 @@ export interface PulledFileInfo {
   /** Suggested file name, e.g. dms_doctoreasetemporary.sql */
   name: string;
   bytes: number;
-  /** The dump itself, base64 — bytes survive a schema with latin1 columns intact. */
-  base64: string;
+  /*
+   * NO base64 ANY MORE.
+   *
+   * This used to carry the dump itself, which meant the bytes were held in memory on the
+   * server, base64'd (×1.33), stringified into JSON, sent to the browser, turned back into a
+   * File and uploaded again into a second staging session. The same bytes crossed the wire
+   * twice and existed in memory several times over.
+   *
+   * On 18 Sep 2026 that killed the process: a source with bills 43.6 MB + payment_summary
+   * 30.5 MB in Mongo went past the 467 MB V8 heap on a 908 MB box, and the browser was handed
+   * nginx's 502 HTML page, which surfaced as "Unexpected token '<' … is not valid JSON".
+   *
+   * The dumps now stream from the source straight into the staging session named by
+   * PullOk.sessionId, and this record only describes them. Anything that needs the bytes reads
+   * them from staging, which is where /api/generate has always read them from anyway.
+   */
 }
 
 export interface PullOk {
@@ -290,6 +304,12 @@ export interface PullOk {
   host: string;
   /** SHA256 host key fingerprint of the box that answered. */
   fingerprint: string;
+  /**
+   * The staging session everything this pull produced now lives in: both dumps, the image
+   * archive, the logo and the profile photos. Top level rather than inside `images`, because
+   * the dumps are there even when the archive failed.
+   */
+  sessionId: string;
   files: PulledFileInfo[];
   /**
    * The page-image archive, when it was pulled too.
@@ -304,6 +324,12 @@ export interface PullOk {
    * independently useful and are not thrown away because the images failed.
    */
   images: PulledImageInfo | null;
+  /**
+   * The clinic logo and the patient profile photos, when the source had them. Empty array is
+   * a normal outcome, not a failure: these folders do not exist on every V2 box. Anything
+   * that went wrong per tree is in `warnings`.
+   */
+  extras: PulledExtraInfo[];
   /** What ran on the far side and what came back. */
   log: string[];
   /** Did not stop the pull, but changes what the operator got. */
