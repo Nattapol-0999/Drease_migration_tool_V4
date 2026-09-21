@@ -27,6 +27,8 @@ import {
   type ClinicAPIStatusResponse,
   type CreateClinicResponse,
   type PhotoImportResponse,
+  type PulledExtraInfo,
+  type PulledFileInfo,
   type ProvisionedClinic,
   type TargetId,
   type TargetInfo,
@@ -34,6 +36,7 @@ import {
 } from "@/lib/types";
 
 import BusyOverlay, { type BusyState } from "./BusyOverlay";
+import DoneOverlay, { type DoneState } from "./DoneOverlay";
 import { GroupIcon } from "./GroupIcon";
 
 import "./target-picker.css";
@@ -192,12 +195,17 @@ async function waitForJob(jobId: string, onTick: (job: JobView) => void): Promis
   }
 }
 
-/** base64 → bytes, so a pulled dump becomes a File with its bytes intact. */
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+/**
+ * appLink is where to go and look at what was just imported.
+ *
+ * Only the two import targets get one. A pull put files on THIS server and a script build
+ * produced a file to download — neither has anything to open in the clinic app yet, and a link
+ * offered there would send someone to look for data that is not in it.
+ */
+function appLink(target: TargetId): { href: string; label: string } {
+  return target === "production"
+    ? { href: "https://app.drease.co/", label: "เปิด app.drease.co" }
+    : { href: "https://v4demo.drease.co/", label: "เปิด v4demo.drease.co" };
 }
 
 function human(bytes: number): string {
@@ -274,6 +282,11 @@ export default function GenerateForm() {
   const [busy, setBusy] = useState(false);
   // Non-null while "สร้างไฟล์ .sql" is in flight; drives the full-screen overlay.
   const [busyState, setBusyState] = useState<BusyState | null>(null);
+  /**
+   * The success card. Set at every point that already computed a success message, from the same
+   * strings, so the card cannot say something the inline message does not.
+   */
+  const [doneState, setDoneState] = useState<DoneState | null>(null);
   const [err, setErr] = useState<string | null>(null);
   // The generated script stays on the server: it can be hundreds of megabytes, so the
   // browser holds only its identity, size and head.
@@ -367,6 +380,32 @@ export default function GenerateForm() {
     bytes: number;
   } | null>(null);
 
+  /**
+   * The clinic logo and the patient profile photos, when the source had them. Held separately
+   * from pulledImages because either can be absent from a perfectly good pull, so they must not
+   * be able to make the archive itself look missing.
+   */
+  const [pulledExtras, setPulledExtras] = useState<PulledExtraInfo[]>([]);
+
+  /**
+   * The staging session a pull put everything in, and what it says is in there.
+   *
+   * Empty string on the tab-1 path, always. Every branch that reads these first checks that it
+   * is non-empty, so attaching files by hand behaves exactly as it did before.
+   */
+  /**
+   * Whether to pull the page-image archive. On by default — the normal clinic wants its images.
+   *
+   * It exists because one source held 15 GB of them over 29,247 files, and that does not fit in
+   * either budget: the proxy closes the request at 100 seconds, and this server's whole disk is
+   * 28 GB while the import needs the archive and its extracted copy at once. Unticking it takes
+   * the clinic's data now and leaves the images for a route that is not this one.
+   */
+  const [withImages, setWithImages] = useState(true);
+
+  const [pulledSession, setPulledSession] = useState("");
+  const [pulledDumps, setPulledDumps] = useState<PulledFileInfo[]>([]);
+
   const [photoBusy, setPhotoBusy] = useState<"" | "survey" | "apply">("");
   const [photoSurvey, setPhotoSurvey] = useState<PhotoImportResponse | null>(null);
   const [photoErr, setPhotoErr] = useState<string | null>(null);
@@ -404,8 +443,28 @@ export default function GenerateForm() {
       .catch(() => setClinicApi([]));
   }, []);
 
+  /**
+   * A pulled dump is NOT a File. It streamed from the source into a staging session on the
+   * server and never came to the browser, so `files` cannot represent it and `chosen` must not
+   * be the only test for "is this input present".
+   *
+   * Tab 1 is untouched by this: it never sets pulledSession, so every check below falls through
+   * to the `files` it has always used.
+   */
+  const pulledHas = (field: CliInputField): boolean =>
+    pulledSession !== "" && pulledDumps.some((f) => f.field === field);
+  const haveInput = (field: CliInputField): boolean => Boolean(files[field]) || pulledHas(field);
+
   const chosen = CLI_INPUTS.filter((i) => files[i.field]);
   const chosenBytes = chosen.reduce((n, i) => n + (files[i.field]?.size ?? 0), 0);
+  /** True when there is something to import, attached by hand OR already staged by a pull. */
+  const haveAnyInput = chosen.length > 0 || (pulledSession !== "" && pulledDumps.length > 0);
+  /**
+   * How many bytes of input there are, wherever they came from. chosenBytes alone reads 0 on the
+   * pulled path — the files never entered the browser — and a modal saying "sent 0 B" about a
+   * 114 MB dump that is sitting on the server is worse than saying nothing.
+   */
+  const inputBytes = chosen.length > 0 ? chosenBytes : pulledDumps.reduce((n, f) => n + f.bytes, 0);
   const tooBig = chosenBytes > MAX_UPLOAD_BYTES;
   const selected = targets?.find((t) => t.id === targetId) ?? null;
   const onProduction = selected?.isProduction === true;
@@ -451,6 +510,34 @@ export default function GenerateForm() {
    * where the file currently ends, which is what makes a scrambled dump impossible.
    */
   async function uploadAll(title: string): Promise<string> {
+    // Nothing to upload when the dumps were pulled: they are already in this session on the
+    // server. Returning it here is what removes the second trip across the wire — the bytes used
+    // to come down as base64 and go straight back up as chunks.
+    //
+    // Guarded on chosen.length === 0 so a manual attach still wins if someone pulls and then
+    // picks a file by hand: in that case the files are uploaded as usual into a new session.
+    //
+    // THE setBusyState IS NOT OPTIONAL. Every caller's next step is
+    //
+    //	setBusyState((s) => (s ? { ...s, phase: … } : s))
+    //
+    // which updates a modal but never opens one. Returning early without opening it left the
+    // whole generate step with no modal at all — the button said "กำลังสร้าง…" and nothing else
+    // appeared, which is what it looked like on 18 Sep 2026. So the pulled path opens the modal
+    // itself, with no percentage: there is no transfer to measure, and inventing a number here
+    // would be a progress bar for work that is not happening.
+    if (pulledSession !== "" && chosen.length === 0) {
+      setBusyState({
+        title,
+        phase: "ไฟล์อยู่บนเซิร์ฟเวอร์แล้วจากการดึงข้อมูล — ไม่ต้องส่งซ้ำ",
+        percent: null,
+        detail: `บนเซิร์ฟเวอร์แล้ว ${human(inputBytes)}`,
+        startedAt: Date.now(),
+        note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้",
+      });
+      return pulledSession;
+    }
+
     const totalBytes = chosenBytes;
     const chunkCount = chosen.reduce(
       (n, i) => n + Math.ceil((files[i.field]?.size ?? 0) / CHUNK_BYTES),
@@ -517,11 +604,11 @@ export default function GenerateForm() {
     setSurveyErr(null);
     setSurvey(null);
     setResult(null);
-    if (chosen.length === 0) {
+    if (!haveAnyInput) {
       setSurveyErr("เลือกไฟล์ dump อย่างน้อยหนึ่งไฟล์ก่อน");
       return;
     }
-    if (!files.sql) {
+    if (!haveInput("sql")) {
       setSurveyErr(
         "ตารางสาขา (branch) อยู่ในไฟล์ MySQL — ต้องแนบช่อง MySQL (.sql) ก่อน จะอ่านสาขาจากไฟล์ MongoDB ไม่ได้",
       );
@@ -544,7 +631,7 @@ export default function GenerateForm() {
               ...s,
               phase: "กำลังอ่านตาราง branch จากไฟล์ MySQL",
               percent: null,
-              detail: `ส่งครบแล้ว ${human(chosenBytes)}`,
+              detail: `ส่งครบแล้ว ${human(inputBytes)}`,
               note: "อ่านอย่างเดียว ไม่เขียนอะไรทั้งที่นี่และที่ปลายทาง",
             }
           : s,
@@ -604,6 +691,16 @@ export default function GenerateForm() {
 
       setSurvey(json.survey);
       setSurveySeconds(done.seconds);
+      // No link: this read the dump and wrote nothing anywhere.
+      setDoneState({
+        title: "อ่านสาขาจาก dump สำเร็จ",
+        lines: [
+          `พบสาขา ${(json.survey.branches ?? []).length} สาขา`,
+          `คนไข้ในไฟล์ ${json.survey.total_patients ?? 0} คน`,
+          `ใช้เวลา ${done.seconds ?? "-"} วินาที`,
+          "อ่านอย่างเดียว ไม่ได้เขียนอะไรทั้งที่นี่และที่ปลายทาง",
+        ],
+      });
 
       // EVERY branch the registry lists is ticked. The tenant's branches are a fact about
       // the tenant, and a branch left out has its patients, rooms and bills land on some
@@ -941,6 +1038,16 @@ export default function GenerateForm() {
         `นำเข้าแล้ว · คัดลอก ${json.filesSent} ไฟล์ (${(json.bytesSent / 1024 / 1024).toFixed(1)} MB) → ${json.uploads} · เขียน ${json.rows} แถว → ${json.target} (${json.seconds}s)`,
       );
       setPhotoLog(json.log);
+      setDoneState({
+        title: "นำเข้ารูปหน้าเวชระเบียนสำเร็จ",
+        lines: [
+          `คลินิก ${clinic.trim()}`,
+          `คัดลอก ${json.filesSent} ไฟล์ (${(json.bytesSent / 1024 / 1024).toFixed(1)} MB) → ${json.uploads}`,
+          `เขียน ${json.rows} แถว → ${json.target}`,
+          `ใช้เวลา ${json.seconds} วินาที`,
+        ],
+        link: appLink(targetId),
+      });
     } catch (e) {
       setPhotoErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -955,11 +1062,11 @@ export default function GenerateForm() {
       setErr("กรอก clinic_code ก่อน (ต้องเป็นคลินิกที่สร้างไว้ในระบบแล้ว)");
       return;
     }
-    if (chosen.length === 0) {
+    if (!haveAnyInput) {
       setErr("เลือกไฟล์ dump อย่างน้อยหนึ่งไฟล์");
       return;
     }
-    if (files.sql && !owner.trim()) {
+    if (haveInput("sql") && !owner.trim()) {
       setErr("ไฟล์ SQL มีตาราง users → ต้องระบุ owner_username");
       return;
     }
@@ -999,7 +1106,7 @@ export default function GenerateForm() {
           title: "สร้างไฟล์ .sql",
           phase: "ใช้ไฟล์ที่อัปโหลดไว้แล้วตอนอ่านสาขา — ไม่ต้องส่งซ้ำ",
           percent: null,
-          detail: `บนเซิร์ฟเวอร์แล้ว ${human(uploadedBytes || totalBytes)}`,
+          detail: `บนเซิร์ฟเวอร์แล้ว ${human(uploadedBytes || inputBytes)}`,
           startedAt: Date.now(),
           note: "ห้ามปิดแท็บหรือกดรีเฟรชระหว่างนี้",
         });
@@ -1013,7 +1120,7 @@ export default function GenerateForm() {
               ...s,
               phase: "เซิร์ฟเวอร์กำลังกรอง collection ที่ไม่ใช้ออก แล้วสร้างสคริปต์ด้วย CLI",
               percent: null,
-              detail: `ไฟล์บนเซิร์ฟเวอร์ ${human(uploadedBytes || totalBytes)}`,
+              detail: `ไฟล์บนเซิร์ฟเวอร์ ${human(uploadedBytes || inputBytes)}`,
               note: "ขั้นนี้ไม่มีเปอร์เซ็นต์ — การกรองและ CLI ไม่รายงานความคืบหน้าออกมา ตัวเลขที่ปลอมขึ้นมาจะหลอกตัวเอง",
             }
           : s,
@@ -1077,6 +1184,17 @@ export default function GenerateForm() {
         preview: done.preview ?? "",
         report: done.report ?? "",
         log: done.log,
+      });
+      // No link: the script exists on this server and nothing has been written to a clinic
+      // database yet. Pointing at the app here would invite someone to go and check for data
+      // that the next button is what puts there.
+      setDoneState({
+        title: "สร้างสคริปต์สำเร็จ",
+        lines: [
+          `คลินิก ${clinic.trim()}`,
+          `ไฟล์ ${done.filename ?? `import_${clinic.trim()}.sql`} · ${human(done.sqlBytes ?? 0)}`,
+          "ยังไม่ได้เขียนอะไรลงฐานข้อมูล — ขั้นต่อไปคือ import to test",
+        ],
       });
       // The server deletes the staging session once the CLI has run, so the id it held is
       // no longer usable. Forgetting it here means a second attempt uploads again instead
@@ -1148,18 +1266,26 @@ export default function GenerateForm() {
       const res = await fetch("/api/pull-server", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ host: host.trim() }),
+        body: JSON.stringify({ host: host.trim(), withImages }),
       });
       const json = (await res.json()) as PullResponse;
       if (!json.ok) {
         setPullErr(json.error);
         return;
       }
-      const next: Partial<Record<CliInputField, File>> = {};
-      for (const f of json.files) {
-        next[f.field] = new File([base64ToBytes(f.base64)], f.name, { type: "text/plain" });
-      }
-      setFiles((prev) => ({ ...prev, ...next }));
+      // The dumps are NOT turned into Files any more. They are already on the server, in the
+      // session named here, so there is nothing to hold and nothing to upload back.
+      //
+      // Any File left in a slot from an earlier manual attach is cleared, because leaving it
+      // would mean two candidate sources for the same input and no rule saying which wins.
+      setPulledSession(json.sessionId);
+      setPulledDumps(json.files);
+      setFiles((prev) => {
+        const next = { ...prev };
+        for (const f of json.files) delete next[f.field];
+        return next;
+      });
+      setSessionId("");
       setPulledFields((prev) => Array.from(new Set([...prev, ...json.files.map((f) => f.field)])));
       setPulledFrom(json.host);
       setPullLog(json.log);
@@ -1181,6 +1307,25 @@ export default function GenerateForm() {
             }
           : null,
       );
+      // The logo and the profile photos came in the same answer and live in the same session.
+      // An empty array is a normal result — not every V2 box has those folders — so it must not
+      // be treated as a failed pull. Anything that went wrong per tree is already in `warnings`.
+      setPulledExtras(json.extras ?? []);
+
+      // No link: this put files on THIS server, not into a clinic database.
+      setDoneState({
+        title: "ดึงข้อมูลจากเซิร์ฟเวอร์สำเร็จ",
+        lines: [
+          `ต้นทาง ${json.host}`,
+          ...json.files.map((f) => `${f.name} · ${human(f.bytes)}`),
+          ...(json.images ? [`${json.images.name} · ${human(json.images.bytes)}`] : []),
+          ...(json.extras ?? []).map(
+            (x) => `${x.field === "logo" ? "โลโก้คลินิก" : "รูปโปรไฟล์คนไข้"} · ${human(x.bytes)}`,
+          ),
+          ...(json.warnings.length > 0 ? [`มีคำเตือน ${json.warnings.length} ข้อ — ดูด้านล่าง`] : []),
+          "ไฟล์อยู่บนเซิร์ฟเวอร์แล้ว ไม่ต้องแนบเอง — ขั้นต่อไปคือสร้างสคริปต์",
+        ],
+      });
     } catch (e) {
       // A request that runs past the proxy's 100-second ceiling lands here as a network
       // error, and the archive may in fact have arrived. Say so, because the alternative is
@@ -1203,6 +1348,13 @@ export default function GenerateForm() {
       return next;
     });
     setPulledFields((prev) => prev.filter((f) => f !== field));
+    // A pulled input has to be forgotten here too, or clearing the slot would empty the visible
+    // File while the staged copy went on being used by the next import.
+    setPulledDumps((prev) => {
+      const next = prev.filter((f) => f.field !== field);
+      if (next.length === 0) setPulledSession("");
+      return next;
+    });
   }
 
   /**
@@ -1302,6 +1454,11 @@ export default function GenerateForm() {
     } else if (pulledImages) {
       // Nothing to send: the pull already put the archive AND the dump in this session.
       photoSession = pulledImages.sessionId;
+    } else if (pulledSession) {
+      // The dumps were pulled but the archive was not. Same session all the same, so the photo
+      // step can look for itself and say what is missing — better than this telling the operator
+      // to attach a .js file that is already on the server.
+      photoSession = pulledSession;
     } else if (!photoSession) {
       // The dump goes up with it: the photo step reads the `page` collection out of the
       // same MongoDB file, and generate has already consumed its own copy.
@@ -1386,14 +1543,42 @@ export default function GenerateForm() {
         parts.push(
           `รูป: คัดลอก ${photo.filesSent} ไฟล์ (${human(photo.bytesSent ?? 0)}) · เขียน ${photo.rows} แถว`,
         );
+        // The logo and the profile photos, as their OWN part of the sentence. They are not
+        // added into the counts above because those are medical-record images and these write
+        // no rows at all — one number covering both would be unverifiable against the tables.
+        if (photo.logoFound !== undefined) {
+          parts.push(photo.logoFound ? "โลโก้: ได้" : "โลโก้: ไม่พบไฟล์ที่ตั้งไว้");
+        }
+        if (photo.profilesCandidates !== undefined) {
+          parts.push(
+            `รูปโปรไฟล์: ${photo.profilesSent ?? 0}/${photo.profilesCandidates}` +
+              ((photo.profilesSkipped ?? 0) > 0 ? ` (ข้าม ${photo.profilesSkipped} ไม่มี HN)` : ""),
+          );
+        }
         // The upload was consumed by the server; a later press would find nothing.
         setPhotoSessionId("");
       }
       setImportLog([done.psqlLog, photo?.log].filter(Boolean).join("\n").trim() || null);
       setImportDone(parts.join(" · "));
+      // Same facts as the inline line, one per row, plus the link to go and look. `parts` is
+      // reused rather than rebuilt so the card and the line can never disagree.
+      setDoneState({
+        title: "นำเข้าข้อมูลสำเร็จ",
+        lines: [`คลินิก ${clinic.trim()}`, ...parts],
+        link: appLink(targetId),
+      });
 
       // Data in, images not: say so where the operator is looking, and point at the retry
       // instead of leaving them to work out that the tenant does not need deleting.
+      // The extras failing is not the import failing, so it goes in the warning list rather
+      // than the error box: the data and the medical-record images are already in.
+      if (photo?.extrasError) {
+        setPullWarnings((w) => [
+          ...w,
+          `โลโก้/รูปโปรไฟล์ไม่สำเร็จ (ข้อมูลและรูปหน้าเวชระเบียนเข้าครบแล้ว): ${photo.extrasError}`,
+        ]);
+      }
+
       if (photo && !photo.ok) {
         setImportErr(
           `ข้อมูลเข้าฐานเรียบร้อยแล้ว แต่รูปไม่เข้า: ${photo.message ?? "ไม่ทราบสาเหตุ"}` +
@@ -1769,7 +1954,15 @@ export default function GenerateForm() {
               </thead>
               <tbody>
                 {CLI_INPUTS.map((i) => {
-                  const loaded = files[i.field];
+                  // A pulled input has no File — it went from the source into the staging
+                  // session without passing through the browser. Show it from its descriptor so
+                  // the slot does not read as empty for something that is ready to import.
+                  const staged = pulledDumps.find((f) => f.field === i.field);
+                  const loaded = files[i.field]
+                    ? { name: files[i.field]!.name, size: files[i.field]!.size, pulled: false }
+                    : pulledSession !== "" && staged
+                      ? { name: staged.name, size: staged.bytes, pulled: true }
+                      : null;
                   return (
                     <tr key={i.field}>
                       <td>
@@ -1790,8 +1983,8 @@ export default function GenerateForm() {
                         />
                         {loaded && (
                           <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-                            {pulledFields.includes(i.field) ? (
-                              <span className="tag ok">ดึงจาก {pulledFrom}</span>
+                            {loaded.pulled ? (
+                              <span className="tag ok">อยู่บนเซิร์ฟเวอร์แล้ว · ดึงจาก {pulledFrom}</span>
                             ) : (
                               <span className="tag">แนบเอง</span>
                             )}{" "}
@@ -1911,6 +2104,27 @@ export default function GenerateForm() {
                   </div>
                 )}
 
+                {/* Ticked by default: a clinic normally wants its images. Untick when the
+                    archive is too big to come through this route — see the note below it. */}
+                <label
+                  style={{ display: "flex", alignItems: "flex-start", gap: 8, marginTop: 12 }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={withImages}
+                    onChange={(e) => setWithImages(e.target.checked)}
+                    style={{ marginTop: 3 }}
+                  />
+                  <span>
+                    ดึงไฟล์รูปหน้าเวชระเบียนด้วย
+                    <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
+                      ไม่ติ๊ก = ได้ข้อมูล + โลโก้ + รูปโปรไฟล์ แต่ไม่ได้รูปหน้าเวชระเบียน ·
+                      ใช้เมื่อรูปใหญ่เกินจะดึงผ่านทางนี้ (เจอจริง 15 GB / 29,247 ไฟล์ —
+                      request ถูกตัดที่ 100 วินาที และดิสก์เครื่องนี้ทั้งก้อน 28 GB)
+                    </div>
+                  </span>
+                </label>
+
                 <div className="row" style={{ marginTop: 12 }}>
                   <button type="button" onClick={pullData} disabled={pulling || !host.trim()}>
                     {pulling ? "กำลังดึงข้อมูล…" : "pull data"}
@@ -1920,6 +2134,9 @@ export default function GenerateForm() {
                       กำลังรัน mysqldump บน {host.trim()} — ไฟล์ใหญ่ใช้เวลาสักครู่
                     </span>
                   )}
+                  {!withImages && !pulling && (
+                    <span className="muted">ข้ามรูปหน้าเวชระเบียน — จะได้เฉพาะข้อมูล</span>
+                  )}
                 </div>
 
                 {pullErr && <div className="msg error">{pullErr}</div>}
@@ -1928,15 +2145,25 @@ export default function GenerateForm() {
                   <div className="msg ok">
                     ดึงจาก <code>{pulledFrom}</code> แล้ว — ไฟล์เข้าไปอยู่ในช่องเดียวกับการแนบเอง
                     <ul className="tight">
-                      {CLI_INPUTS.filter((i) => pulledFields.includes(i.field)).map((i) => {
-                        const f = files[i.field];
+                      {pulledDumps.map((f) => {
+                        const label = CLI_INPUTS.find((i) => i.field === f.field)?.label ?? f.field;
                         return (
-                          <li key={i.field}>
-                            <code>{i.label}</code> — {f ? `${f.name} · ${human(f.size)}` : "—"}
+                          <li key={f.field}>
+                            <code>{label}</code> — {f.name} · {human(f.bytes)}
                           </li>
                         );
                       })}
                     </ul>
+                    {pulledExtras.length > 0 && (
+                      <ul className="tight">
+                        {pulledExtras.map((x) => (
+                          <li key={x.field}>
+                            <code>{x.field === "logo" ? "โลโก้คลินิก" : "รูปโปรไฟล์คนไข้"}</code> —{" "}
+                            {x.member} · {human(x.bytes)}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
 
@@ -2049,7 +2276,7 @@ export default function GenerateForm() {
                 // explanation. Both are needed: the dump names the images, the archive holds
                 // their bytes.
                 const need: string[] = [];
-                if (!files.mongo) need.push("MongoDB (.js)");
+                if (!haveInput("mongo")) need.push("MongoDB (.js)");
                 // A pulled archive satisfies this as fully as an attached one — it is already
                 // in the staging session the import reads from.
                 if (!imgFile && !pulledImages) need.push("ไฟล์รูป (.tar.gz)");
@@ -2281,14 +2508,14 @@ export default function GenerateForm() {
         <button
           type="button"
           onClick={uploadAndSurvey}
-          disabled={surveying || busy || chosen.length === 0 || !files.sql || tooBig}
+          disabled={surveying || busy || !haveAnyInput || !haveInput("sql") || tooBig}
         >
           {surveying ? "กำลังอ่าน…" : sessionId ? "อ่านสาขาอีกครั้ง" : "อัปโหลด + อ่านสาขา"}
         </button>
         <span className="muted" style={{ fontSize: 12 }}>
-          {chosen.length === 0
+          {!haveAnyInput
             ? "ยังไม่ได้แนบไฟล์ในกล่อง 1"
-            : !files.sql
+            : !haveInput("sql")
               ? "ยังไม่ได้แนบช่อง MySQL (.sql) — ตารางสาขาอยู่ในไฟล์นี้"
               : sessionId
                 ? `ไฟล์อยู่บนเซิร์ฟเวอร์แล้ว ${human(uploadedBytes)} — ขั้นสร้างสคริปต์จะใช้ไฟล์เดิม ไม่ส่งซ้ำ`
@@ -2844,6 +3071,13 @@ export default function GenerateForm() {
       {/* Covers the page while a request is running: the button that started it is at the
           bottom of a long form, where "กำลังสร้าง…" is easy to miss. */}
       <BusyOverlay state={busyState} />
+      {/* The outcome, in the same place the progress card was. Stays until dismissed.
+       *
+       * Suppressed while something is running rather than cleared by each handler. Both cards
+       * share a z-index and this one renders second, so an undismissed success card would paint
+       * over the progress of the NEXT action — and remembering to clear it in every handler is
+       * exactly the kind of thing that gets forgotten when a handler is added. */}
+      <DoneOverlay state={busyState ? null : doneState} onClose={() => setDoneState(null)} />
 
       <div className="flow">
         {steps.map((s, i) => {

@@ -114,3 +114,45 @@
     backdrop-filter: none;
   }
 }
+
+/* ── DoneOverlay: the same card after the work finished ──────────────────────────────────
+ *
+ * Shares .busy-overlay and .busy-card on purpose. The success card appears exactly where the
+ * progress card just was, so the eye does not have to go looking for the outcome.
+ */
+.done-lines {
+  margin: 14px 0 18px;
+  padding-left: 18px;
+  line-height: 1.7;
+  font-size: 14px;
+}
+.done-lines li {
+  margin: 0;
+}
+.done-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+/* Styled as a button because it is the action the operator came for, but it stays an <a> so
+ * middle-click, "open in new tab" and the status-bar URL preview all keep working. */
+.done-link {
+  display: inline-block;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.done-link:hover {
+  filter: brightness(1.08);
+}
+.done-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
