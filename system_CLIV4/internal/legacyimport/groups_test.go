@@ -54,9 +54,23 @@ func TestUnselectedGroupCannotFailTheRun(t *testing.T) {
 	}
 }
 
-func TestSelectingThatGroupStillRefuses(t *testing.T) {
-	// The refusal itself is the behaviour the clinic owner chose. Narrowing its blast radius
-	// must not have turned it off.
+func TestCollidingLoginsAreRenamedRatherThanRefusing(t *testing.T) {
+	// THIS TEST REPLACED TestSelectingThatGroupStillRefuses.
+	//
+	// The old behaviour was to refuse the whole clinic, citing users_email_key. The owner
+	// reversed that on 18 Sep 2026 after a real source turned up with
+	//
+	//	id 405  email "Nuch"   status 1
+	//	id 423  email "nuch"   status 0
+	//
+	// the same person twice on a utf8_bin column. Two reasons the refusal was wrong: V4's
+	// users_email_key is a plain UNIQUE (email) under C.UTF-8, so it does not fold case and had
+	// no objection to that pair at all; and refusing costs the clinic its entire import over two
+	// staff rows. Skipping the second row was rejected too — a switched-off account can still be
+	// the recorded author of a note or a bill.
+	//
+	// The fixture's two rows share an email EXACTLY, which is the case the old index message was
+	// actually right about, so this covers both shapes.
 	in := Input{
 		ClinicCode:    "C0TEST1",
 		Groups:        []string{"people"},
@@ -64,10 +78,38 @@ func TestSelectingThatGroupStillRefuses(t *testing.T) {
 		UsersDump:     []byte(usersDumpWithDuplicateEmails),
 	}
 	rep := NewReport(in.ClinicCode)
-	if _, _, _, err := BuildAll(in, rep); err == nil {
-		t.Fatal("people was selected and the emails collide, so this had to be refused")
-	} else if !strings.Contains(err.Error(), "duplicate email") {
-		t.Errorf("refused for the wrong reason: %v", err)
+	batches, _, _, err := BuildAll(in, rep)
+	if err != nil {
+		t.Fatalf("colliding logins must be renamed, not refused: %v", err)
+	}
+
+	// Both people survive. Losing one silently is the outcome this whole change exists to avoid.
+	if n := strings.Count(batches[EntUsers], "INSERT INTO users "); n != 2 {
+		t.Errorf("wrote %d user INSERTs, want 2 — both accounts have to be imported",
+			strings.Count(batches[EntUsers], "INSERT INTO users "))
+	}
+
+	// The names themselves are decided in import_user_map, which Script() writes and BuildAll
+	// does not return, so the decision is checked where it is made.
+	mapSQL, _, mapRep := buildUsersSQL(t, in)
+
+	// First row in the dump keeps the name. That is dump order, which is how the account that
+	// has been logging in with it goes on doing so.
+	if !strings.Contains(mapSQL, "'Chayuda'") {
+		t.Errorf("the first claimant lost its login name — the earlier account should keep it:\n%s", mapSQL)
+	}
+	// The second is disambiguated by its legacy id, not by a counter: the id is unique in the
+	// dump by definition and it is what an operator can look up in the old system.
+	if !strings.Contains(mapSQL, "'Chayuda_400@gmail.com'") {
+		t.Errorf("the second claimant was not renamed to its id-suffixed form:\n%s", mapSQL)
+	}
+
+	// And it must be SAID. A login name changed; somebody has to be told which.
+	if !hasText(mapRep.Warnings, "Chayuda_400@gmail.com") {
+		t.Errorf("the rename was not reported, so nobody could tell that person: %v", mapRep.Warnings)
+	}
+	if !hasText(mapRep.Warnings, "id=400") {
+		t.Errorf("the report does not name the row that changed: %v", mapRep.Warnings)
 	}
 }
 

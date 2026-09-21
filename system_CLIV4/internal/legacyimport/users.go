@@ -67,6 +67,11 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 
 	tr := truncations{}
 	values := make([]string, 0, len(rows))
+	// Folded login name → the legacy id that got there first. Case-folded because two names
+	// differing only in case are the trap this is here to close, and the dump can contain them:
+	// a utf8_bin column keeps "Nuch" and "nuch" apart, and one real source had exactly that.
+	claimed := map[string]string{}
+	var renamed []string
 	for _, r := range rows {
 		id := r.Get("id")
 		email := r.Get("email")
@@ -78,6 +83,18 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 		// truncation that never happened and let the untruncated form into the map.
 		email, cut := clip(email, 255)
 		tr.note("email", cut)
+
+		// Second claim on the same name loses it. FIRST ROW WINS, and that is a real choice:
+		// the rows arrive in dump order, which is id order, so the older account keeps the name
+		// it has been logging in with and the newer one is the one that changes.
+		if first, taken := claimed[strings.ToLower(email)]; taken {
+			was := email
+			email, cut = clip(dedupedEmail(was, id), 255)
+			tr.note("email (รูปที่กันซ้ำกันเองในไฟล์)", cut)
+			renamed = append(renamed, fmt.Sprintf("%s (id=%s) → %s [ชนกับ id=%s]", was, id, email, first))
+		}
+		claimed[strings.ToLower(email)] = id
+
 		suffixed, cut := clip(suffixedEmail(email, in.ClinicCode), 255)
 		tr.note("email (รูปที่เติมรหัสคลินิก)", cut)
 		// Free name → keep it. Taken name → the suffixed form. Decided per row, at load time.
@@ -102,6 +119,16 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	// script, after the database has decided.
 	rep.notef("users: ชื่อล็อกอินที่ซ้ำกับคลินิกอื่นจะถูกเปลี่ยนเป็น <ชื่อ>_%s@gmail.com เฉพาะตัวที่ซ้ำจริง "+
 		"— ตัวที่ไม่ซ้ำใช้ค่าเดิมทุกตัว · รายชื่อที่ถูกเปลี่ยนจริงจะขึ้นเป็น NOTICE ตอนรันสคริปต์", in.ClinicCode)
+
+	// A WARNING, not a note: somebody's login name changed. Unlike the cross-clinic case above,
+	// this one is decided here in Go and the exact list is known, so it is printed in full
+	// rather than deferred to a NOTICE — the operator has to be able to tell that person.
+	if len(renamed) > 0 {
+		rep.warnf("users: ชื่อล็อกอิน %d บัญชีซ้ำกันเองในไฟล์ต้นทาง (ต่างกันแค่ตัวพิมพ์ก็นับว่าซ้ำ) "+
+			"ตัวที่มาทีหลังถูกเปลี่ยนเป็น <ชื่อ>_<id เดิม>@gmail.com: %s "+
+			"· บัญชีที่ถูกเปลี่ยนต้องใช้ชื่อใหม่นี้ล็อกอิน รหัสผ่านเดิมยังใช้ได้",
+			len(renamed), strings.Join(renamed, ", "))
+	}
 	return s.String(), nil
 }
 
@@ -208,6 +235,37 @@ func suffixedEmail(email, clinic string) string {
 	return fmt.Sprintf("%s_%s@gmail.com", local, clinic)
 }
 
+/*
+dedupedEmail disambiguates a login that ANOTHER ROW OF THE SAME DUMP already claimed.
+
+Different problem from suffixedEmail, same shape of answer. suffixedEmail settles a clash with
+a DIFFERENT clinic, so the clinic code is what makes the name unique. Here both rows belong to
+this clinic, so the discriminator has to be the legacy id — it is unique within the dump by
+definition, `users.id` being the source primary key, and it stays traceable: an operator asked
+"where did nuch_423@gmail.com come from" can look up id 423 in the old system.
+
+MEASURED CASE, 18 Sep 2026. A source whose users.email is utf8_bin — case sensitive — held
+
+	id 405  email "Nuch"  Pobporn Ahmsa-ard  status 1
+	id 423  email "nuch"  พบพร อ่ำสอาด        status 0
+
+the same person twice, one account switched off. MySQL keeps them apart; V4's users_email_key
+is a plain UNIQUE (email) under C.UTF-8, so it would ALSO keep them apart and both would load.
+The import refused anyway, because the guard folded case before comparing and reported that
+"users_email_key would reject it" — which was not true of that index.
+
+Renaming rather than allowing both, on the owner's decision: two logins differing only in
+letter case is a trap for the person typing one. Renaming rather than skipping the row, because
+a switched-off account can still be the recorded author of a note or a bill.
+*/
+func dedupedEmail(email, legacyID string) string {
+	local := email
+	if at := strings.IndexByte(email, '@'); at > 0 {
+		local = email[:at]
+	}
+	return fmt.Sprintf("%s_%s@gmail.com", local, legacyID)
+}
+
 // buildUsers maps the legacy `users` table onto V4 `public.users`.
 //
 // The id is NOT carried over — see buildUserMap. Rows take the email the map decided, so a
@@ -229,7 +287,6 @@ func buildUsers(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 
 	var s sqlBuilder
 	var minID, maxID int64
-	seenEmail := map[string]bool{}
 	seenID := map[string]bool{}
 
 	for n, r := range rows {
@@ -245,11 +302,18 @@ func buildUsers(rows []legacydump.Row, in Input, rep *Report) (string, error) {
 		if email == "" {
 			return "", fmt.Errorf("users row %d (id=%s): empty email, but users.email is NOT NULL UNIQUE", n+1, id)
 		}
-		if key := strings.ToLower(email); seenEmail[key] {
-			return "", fmt.Errorf("users: duplicate email %q in the dump — users_email_key would reject it", email)
-		} else {
-			seenEmail[key] = true
-		}
+		// NO DUPLICATE-EMAIL GUARD HERE ANY MORE.
+		//
+		// It used to refuse the whole clinic when two rows folded to the same login, citing
+		// users_email_key. Two things were wrong with that. The index is a plain UNIQUE (email)
+		// under a C.UTF-8 collation, so it does not fold case and would not have rejected
+		// "Nuch" alongside "nuch" — the message named a constraint that had no objection. And
+		// this is the wrong place to decide it: the email that reaches the column comes from
+		// import_user_map, not from this row, so a rule applied here would be judging a value
+		// that is not the one being written.
+		//
+		// buildUserMap now renames the second claimant (see dedupedEmail) and reports it. By the
+		// time these INSERTs run, every m.email is distinct, so there is nothing left to check.
 		if v, err := strconv.ParseInt(id, 10, 64); err == nil {
 			if minID == 0 || v < minID {
 				minID = v
