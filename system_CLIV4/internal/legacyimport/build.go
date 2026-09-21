@@ -335,6 +335,10 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			if out[EntCatalogCourse], out[EntCatalogCourseLine], err = buildCourses(mc, in, rep); err != nil {
 				return nil, nil, money, err
 			}
+			// Publishing comes AFTER both builders, and is set-based rather than per row: it
+			// selects the catalog_item rows those two just wrote. Ordering is not a style
+			// choice here — the ids it needs are issued by the INSERTs above.
+			out[EntCatalogPublish] = buildCatalogPublish(in, rep)
 		}
 		// items, catalog_item(drug) and slot_stock come out of ONE pass over the items
 		// collection, so catalog and stock cannot be built independently of each other.

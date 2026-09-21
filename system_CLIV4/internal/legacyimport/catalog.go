@@ -40,6 +40,7 @@ const (
 	EntCatalogService    = "catalog_item(service)"
 	EntCatalogCourse     = "catalog_item(course)"
 	EntCatalogCourseLine = "catalog_course_line"
+	EntCatalogPublish    = "catalog_item_channel"
 )
 
 var catalogOrder = []string{
@@ -50,6 +51,8 @@ var catalogOrder = []string{
 	EntSlotStock,
 	EntCatalogCourse,
 	EntCatalogCourseLine,
+	// Last on purpose: it reads back the ids of the catalog_item rows everything above wrote.
+	EntCatalogPublish,
 }
 
 // V4 catalog_item.status (internal/controller/catalog/status.go).
@@ -990,4 +993,113 @@ func joinName(name1, name2 string) string {
 		return a
 	}
 	return a + " " + b
+}
+
+/*
+buildCatalogPublish turns the storefront switch ON for the services and courses just imported.
+
+# WHAT THE SWITCH IS
+
+The "หน้าร้าน" column on the catalog screen is catalog_item_channel.published for the clinic's
+`online` channel (migration 0263). Before this, every imported item showed it OFF, and not
+because anything was set to false: THE ROWS DID NOT EXIST. Measured on agafar-clinic —
+
+	catalog_channel rows       0
+	catalog_item_channel rows  0
+
+— so the screen was rendering the column default. 0263 created the `online` channel only for
+clinics that already had catalog_item rows when it ran, which no clinic imported afterwards did.
+That is why the channel is created here too, not just the publish rows.
+
+SCOPE: SERVICE AND COURSE ONLY
+
+Owner's decision, 18 Sep 2026 (option A of three). Drugs are deliberately left unpublished —
+`drug` is 398 rows on that same clinic of which 128 are draft, and a pharmacy line on a public
+page is a different conversation from a treatment or a package.
+
+Status is NOT filtered. A draft row (status 2) that is published still does not sell, because
+draft is what withholds selling; filtering here would mean the operator turning a draft into
+an active item silently gets a different storefront answer than the one they set.
+
+⚠️ TAX IS EMPTY ON EVERY ROW THIS PUBLISHES
+
+Measured: tax_treatment and tax_item_kind are blank on 703/703 services and 523/523 courses —
+which is the "ยังไม่ระบุภาษี" badge on screen. Publishing puts those prices in front of a
+customer who can buy them, and the receipt that follows is built from tax fields nobody has
+filled in. The owner was asked directly and chose to publish; the count is reported on EVERY
+import instead of being written into a comment nobody reads.
+*/
+func buildCatalogPublish(in Input, rep *Report) string {
+	e := rep.entity(EntCatalogPublish)
+	var s sqlBuilder
+	c := lit(in.ClinicCode)
+
+	s.comment("เปิดหน้าร้านออนไลน์ให้บริการและคอร์สที่นำเข้า (owner เคาะ 18 ก.ย. 2569)")
+	s.comment("ยาไม่ถูกเปิด — เป็นการตัดสินใจแยก")
+
+	// The channel first. ON CONFLICT keyed on (clinic_code, channel_key) makes a re-import a
+	// no-op rather than a duplicate-key failure, and it also covers the clinic that migration
+	// 0263 did create one for.
+	s.addf(`INSERT INTO catalog_channel (clinic_code, channel_key, label)
+VALUES (%s, 'online', 'หน้าร้านออนไลน์')
+ON CONFLICT (clinic_code, channel_key) DO NOTHING;
+
+`, c)
+
+	// One statement for the whole catalog rather than one per item. 1,226 rows on the clinic
+	// measured, and a per-row form would also have to resolve the id it does not know yet.
+	//
+	// ON CONFLICT (item_id, channel_id) DO NOTHING, not DO UPDATE: if a row is already there,
+	// somebody has since decided its publish state on screen, and an import must not overrule
+	// a human who has touched it.
+	s.addf(`INSERT INTO catalog_item_channel (clinic_code, item_id, channel_id, published, published_at)
+SELECT ci.clinic_code, ci.id, ch.id, true, now()
+  FROM catalog_item ci
+  JOIN catalog_channel ch
+    ON ch.clinic_code = ci.clinic_code AND ch.channel_key = 'online'
+ WHERE ci.clinic_code = %s
+   AND ci.item_type IN ('service', 'course')
+ON CONFLICT (item_id, channel_id) DO NOTHING;
+
+`, c)
+
+	// Said by the database after the fact, not guessed in Go: how many went up, and how many of
+	// them have no tax answer. The generator cannot know either number — the rows are selected
+	// at load time — so this is a NOTICE rather than a report line.
+	s.addf(`DO $publish$
+DECLARE
+    n_pub int;
+    n_notax int;
+BEGIN
+    SELECT count(*) INTO n_pub
+      FROM catalog_item_channel cic
+      JOIN catalog_item ci ON ci.id = cic.item_id
+      JOIN catalog_channel ch ON ch.id = cic.channel_id AND ch.channel_key = 'online'
+     WHERE cic.clinic_code = %s AND cic.published
+       AND ci.item_type IN ('service', 'course');
+
+    SELECT count(*) INTO n_notax
+      FROM catalog_item_channel cic
+      JOIN catalog_item ci ON ci.id = cic.item_id
+      JOIN catalog_channel ch ON ch.id = cic.channel_id AND ch.channel_key = 'online'
+     WHERE cic.clinic_code = %s AND cic.published
+       AND ci.item_type IN ('service', 'course')
+       AND (coalesce(ci.tax_treatment, '') = '' OR coalesce(ci.tax_item_kind, '') = '');
+
+    -- The doubled percent below is Go's escape for a literal one. Postgres then sees a single
+    -- percent and treats it as its own RAISE placeholder; without the doubling, go vet reads
+    -- it as a bad format verb and the package will not build.
+    RAISE NOTICE 'หน้าร้าน: เปิดขายออนไลน์ %% รายการ (บริการ+คอร์ส)', n_pub;
+    IF n_notax > 0 THEN
+        RAISE NOTICE 'หน้าร้าน: ⚠ %% รายการยังไม่ระบุภาษี แต่ถูกเปิดขายแล้ว — ต้องกรอกภาษีก่อนออกใบกำกับ', n_notax;
+    END IF;
+END $publish$;
+
+`, c, c)
+
+	e.Statements = s.stmts
+	rep.warnf("หน้าร้าน: บริการและคอร์สที่นำเข้าจะถูกเปิดขายออนไลน์ทันที (owner เคาะ) · " +
+		"ยาไม่ถูกเปิด · ข้อมูลภาษีของรายการที่นำเข้าว่างทั้งหมด ต้องกรอกก่อนออกใบกำกับภาษี — " +
+		"จำนวนจริงจะขึ้นเป็น NOTICE ตอนรันสคริปต์")
+	return s.String()
 }
