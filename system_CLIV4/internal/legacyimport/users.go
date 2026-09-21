@@ -72,6 +72,9 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	// a utf8_bin column keeps "Nuch" and "nuch" apart, and one real source had exactly that.
 	claimed := map[string]string{}
 	var renamed []string
+	// Resolved once for the whole run, not per row: it describes the CLINIC, and computing it
+	// inside the loop would re-parse the branch table for every account.
+	suffix, suffixWhy := loginSuffix(in)
 	for _, r := range rows {
 		id := r.Get("id")
 		email := r.Get("email")
@@ -95,14 +98,12 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 		}
 		claimed[strings.ToLower(email)] = id
 
-		suffixed, cut := clip(suffixedEmail(email, in.ClinicCode), 255)
-		tr.note("email (รูปที่เติมรหัสคลินิก)", cut)
-		// Free name → keep it. Taken name → the suffixed form. Decided per row, at load time.
-		values = append(values, fmt.Sprintf(
-			"    (%s, %s, CASE WHEN EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = lower(%s)\n"+
-				"                                 AND COALESCE(u.clinic_code, '') <> %s)\n"+
-				"                  THEN %s ELSE %s END)",
-			id, lit(email), lit(email), lit(in.ClinicCode), lit(suffixed), lit(email)))
+		suffixed, cut := suffixedEmail(email, suffix)
+		tr.note("email (รูปที่เติมชื่อคลินิก)", cut)
+		// Free name → keep it. Held by another clinic → the renamed form, or the first free
+		// rung above it. Every one of those answers comes from the target, at load time.
+		values = append(values, fmt.Sprintf("    (%s, %s, %s)",
+			id, lit(email), emailLadderSQL(email, suffixed, in.ClinicCode)))
 	}
 	if len(values) == 0 {
 		return "", nil
@@ -117,8 +118,14 @@ func buildUserMap(rows []legacydump.Row, in Input, rep *Report) (string, error) 
 	// always the row count — every account has a suffixed form available, so comparing the two
 	// forms in Go said nothing about collisions. The real list is raised as a NOTICE by the
 	// script, after the database has decided.
-	rep.notef("users: ชื่อล็อกอินที่ซ้ำกับคลินิกอื่นจะถูกเปลี่ยนเป็น <ชื่อ>_%s@gmail.com เฉพาะตัวที่ซ้ำจริง "+
-		"— ตัวที่ไม่ซ้ำใช้ค่าเดิมทุกตัว · รายชื่อที่ถูกเปลี่ยนจริงจะขึ้นเป็น NOTICE ตอนรันสคริปต์", in.ClinicCode)
+	rep.notef("users: ชื่อล็อกอินที่ซ้ำกับคลินิกอื่นจะถูกเปลี่ยนเป็น <ชื่อ>.%s@gmail.com เฉพาะตัวที่ซ้ำจริง "+
+		"— ตัวที่ไม่ซ้ำใช้ค่าเดิมทุกตัว · ถ้ารูปนั้นเป็นของคลินิกอื่นอยู่แล้วจะไล่เป็น .2 ถึง .%d "+
+		"· รายชื่อที่ถูกเปลี่ยนจริงจะขึ้นเป็น NOTICE ตอนรันสคริปต์", suffix, loginRungMax)
+	// A fallback is not an error, but it changes what people will type to log in, so it is a
+	// WARNING with the reason in it rather than a note nobody reads.
+	if suffixWhy != "" {
+		rep.warnf("users: %s", suffixWhy)
+	}
 
 	// A WARNING, not a note: somebody's login name changed. Unlike the cross-clinic case above,
 	// this one is decided here in Go and the exact list is known, so it is printed in full
@@ -220,19 +227,151 @@ func userIDByLegacy(legacyID string) string {
 	return fmt.Sprintf("(SELECT m.new_id FROM import_user_map m WHERE m.legacy_id = %s)", legacyID)
 }
 
-// suffixedEmail folds the clinic code into a login name so it can coexist with another
+// loginNameMax is users.email's declared width, varchar(255).
+const loginNameMax = 255
+
+// loginRungMax is the highest ".N" the script will try when even the suffixed form is taken
+// by another clinic. Nine is not a guess about scale, it is a statement about what is real:
+// reaching .9 needs NINE tenants whose branch_name slug AND login name are both identical.
+// Past that the collision guard refuses the run by name instead of the import quietly
+// skipping an account, which is the failure this ladder exists to avoid.
+const loginRungMax = 9
+
+/*
+slugForLogin turns a clinic's own name into something an email local part can hold.
+
+`The Gloss Clinic. CCO` → `the-gloss-clinic-cco`. Lower-cased, every run of characters that
+is not a-z or 0-9 becomes ONE hyphen, and hyphens at either end are dropped.
+
+Capped at 24 characters because the result has to fit beside the login name, the domain and a
+possible ".9" inside varchar(255) — and because a login nobody can type is its own problem.
+The cut is re-trimmed so a name cannot end on the hyphen the truncation created.
+
+Returns "" when nothing survives, which is the normal case for a Thai-only clinic name. The
+caller falls back to the clinic code; this function does not invent a transliteration, because
+a made-up romanisation is a login nobody was told about.
+*/
+func slugForLogin(name string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			dash = false
+		default:
+			// Leading separators are dropped rather than collapsed: a name starting with a
+			// symbol should not produce a login starting with a hyphen.
+			if !dash && b.Len() > 0 {
+				b.WriteByte('-')
+				dash = true
+			}
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if len(s) > 24 {
+		s = strings.Trim(s[:24], "-")
+	}
+	return s
+}
+
+/*
+loginSuffix is what gets folded into a login name that another clinic already holds.
+
+Owner's decision, 21 Sep 2026: the clinic's own name from `branch.branch_name` (see
+firstBranchName), slugged, so a staff member who has to change logins gets something that
+reads like where they work instead of a generated clinic code.
+
+`why` is empty on success and carries the reason on every fallback. It is a RETURN VALUE and
+not a log line inside this function because two callers need the same answer — buildUserMap,
+which reports it once, and buildUsersCollisionGuard, which must not report it a second time —
+and because a fallback that happens silently is a login nobody can explain later.
+
+The fallback is the clinic code, which is what this always used before: unique by
+construction, and it keeps the import working on an export that has no branch table.
+*/
+func loginSuffix(in Input) (suffix, why string) {
+	name, err := firstBranchName(in)
+	if err != nil {
+		return in.ClinicCode, fmt.Sprintf("%v — ต่อท้ายชื่อล็อกอินด้วยรหัสคลินิก %s แทน", err, in.ClinicCode)
+	}
+	if strings.TrimSpace(name) == "" {
+		return in.ClinicCode, fmt.Sprintf(
+			"ไม่พบชื่อคลินิกใน branch.branch_name (ไม่ได้ส่งตาราง branch มา หรือค่าว่าง) — ต่อท้ายชื่อล็อกอินด้วยรหัสคลินิก %s แทน",
+			in.ClinicCode)
+	}
+	s := slugForLogin(name)
+	if s == "" {
+		return in.ClinicCode, fmt.Sprintf(
+			"ชื่อคลินิก %q ไม่มีตัวอักษร a-z หรือเลขที่ใช้ในอีเมลได้ — ต่อท้ายชื่อล็อกอินด้วยรหัสคลินิก %s แทน",
+			name, in.ClinicCode)
+	}
+	return s, ""
+}
+
+// suffixedEmail folds the clinic's name into a login name so it can coexist with another
 // tenant's identical one.
 //
-// `admin` → `admin_C8B173E@gmail.com`. A value that already looks like an address keeps its
-// local part and gains the code the same way, so `a@b.com` → `a_C8B173E@gmail.com` — the
-// domain is replaced deliberately: if the original address were usable it would not have
-// collided in a way anyone wanted to keep.
-func suffixedEmail(email, clinic string) string {
+// `admin` + `the-gloss-clinic-cco` → `admin.the-gloss-clinic-cco@gmail.com`. A value that
+// already looks like an address keeps its local part and loses its domain, so
+// `a@b.com` → `a.the-gloss-clinic-cco@gmail.com` — replacing the domain is deliberate: if the
+// original address were usable it would not have collided in a way anyone wanted to keep.
+//
+// The separator is a dot and the domain stays gmail.com, both chosen by the owner on
+// 21 Sep 2026 with the consequence stated: Gmail ignores dots in a local part, so this
+// address shares a mailbox with the dotless spelling, which somebody outside the clinic may
+// hold. v4 does send to users.email (verify-email and password reset), so the risk accepted
+// is that a reset link for a renamed account could arrive in a stranger's inbox.
+//
+// The local part is trimmed to leave room for the suffix, the domain AND a ".9" rung, so a
+// long login cannot produce a candidate that overflows varchar(255) halfway up the ladder.
+// Returns whether it had to trim, which the caller reports as a truncation.
+func suffixedEmail(email, suffix string) (string, bool) {
 	local := email
 	if at := strings.IndexByte(email, '@'); at > 0 {
 		local = email[:at]
 	}
-	return fmt.Sprintf("%s_%s@gmail.com", local, clinic)
+	tail := "." + suffix + "@gmail.com"
+	budget := loginNameMax - len(tail) - len(".9")
+	if budget < 1 {
+		budget = 1
+	}
+	local, cut := clip(local, budget)
+	return local + tail, cut
+}
+
+/*
+emailLadderSQL picks the login this account will actually get, at load time.
+
+	rung 0  the name as it is in the source        — kept whenever it is free
+	rung 1  <name>.<clinic slug>@gmail.com        — the owner's rename
+	rung 2+ <name>.<clinic slug>.N@gmail.com      — only if another clinic holds rung 1 too
+
+Everything is decided against `users` in the target, because whether a name is taken is a
+fact about the destination and cannot be known while the script is being written.
+
+"Taken" means HELD BY ANOTHER CLINIC. A row belonging to THIS clinic is a re-import of the
+same person and must resolve to the same login it resolved to last time — scoping this to all
+clinics would walk up the ladder on every re-run and mint a second account for one person.
+
+Yields NULL when every rung is taken. That would break the NOT NULL on import_user_map.email
+with a message about a temp table, so buildUsersCollisionGuard runs the same ladder up front
+and refuses by name before anything is written.
+*/
+func emailLadderSQL(bare, suffixed, clinic string) string {
+	prefix := strings.TrimSuffix(suffixed, "@gmail.com")
+	return fmt.Sprintf(`(SELECT cand.c
+                    FROM (           SELECT 0 AS n, %s::text AS c
+                          UNION ALL  SELECT 1, %s
+                          UNION ALL  SELECT g, %s || '.' || g || '@gmail.com'
+                                       FROM generate_series(2, %d) AS g
+                         ) AS cand
+                   WHERE NOT EXISTS (SELECT 1 FROM users u
+                                      WHERE lower(u.email) = lower(cand.c)
+                                        AND COALESCE(u.clinic_code, '') <> %s)
+                   ORDER BY cand.n
+                   LIMIT 1)`,
+		lit(bare), lit(suffixed), lit(prefix), loginRungMax, lit(clinic))
 }
 
 /*

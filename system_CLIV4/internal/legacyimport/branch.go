@@ -211,3 +211,58 @@ func knowsBranch(in Input, legacy string) bool {
 	_, ok := in.BranchMap[strings.TrimSpace(legacy)]
 	return ok
 }
+
+/*
+firstBranchName is the tenant's OWN name for itself, used to build a login name that can
+coexist with another clinic's identical one.
+
+WHY `branch` AND NOT `clinic`
+
+The legacy table called `clinic` is the ROOM master — its rows are `Room 1` / `ห้องตรวจ 1`
+and V4 reads it as `room`. The tenant's name for itself is in `branch.branch_name`
+("The Gloss Clinic. CCO"), which is the only place in the whole export that holds it.
+Confirmed against the source on 21 Sep 2026 by reading both tables: `clinic` has no
+clinic_name column at all, and `branch` has branch_name / branch_name_th / branch_name_en.
+
+Owner chose branch_name (21 Sep 2026). Not branch_name_th, which is free to be Thai and
+would leave nothing usable in an email local part.
+
+# WHY THE FIRST BRANCH AND NOT THE DEFAULT ONE
+
+Owner's decision, same day. An account belongs to the CLINIC, not to a branch, so any
+per-branch choice would be arbitrary — and worse, unstable: -default-branch differs between
+the sites of one tenant, so the same person would get a different login depending on which
+site was being imported. The first branch_code is the same answer for every run.
+
+Sorted by branch_code, not by file order: a dump is written in id order, and a branch added
+later can sit before an older one once someone has edited the row.
+
+A missing branch table is not an error here — it yields "" and the caller falls back to the
+clinic code. This decides a NAME, and refusing an import over a cosmetic string would be the
+wrong trade. A branch table that is present but unparsable IS returned as an error, because
+that says the export is not what it claims to be.
+*/
+func firstBranchName(in Input) (string, error) {
+	if len(in.BranchDump) == 0 {
+		return "", nil
+	}
+	_, rows, err := legacydump.Parse(string(in.BranchDump), "branch")
+	if err != nil {
+		return "", fmt.Errorf("อ่านตาราง branch เพื่อหาชื่อคลินิกไม่ได้: %w", err)
+	}
+	type br struct{ code, name string }
+	list := make([]br, 0, len(rows))
+	for _, r := range rows {
+		code := strings.TrimSpace(r.Get("branch_code"))
+		name := strings.TrimSpace(r.Get("branch_name"))
+		if code == "" || name == "" {
+			continue
+		}
+		list = append(list, br{code: code, name: name})
+	}
+	if len(list) == 0 {
+		return "", nil
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].code < list[j].code })
+	return list[0].name, nil
+}

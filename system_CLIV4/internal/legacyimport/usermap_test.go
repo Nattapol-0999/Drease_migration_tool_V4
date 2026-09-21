@@ -75,9 +75,9 @@ func TestUserMapKeepsAFreeLoginNameExactlyAsItWas(t *testing.T) {
 		"ON COMMIT PRESERVE ROWS",
 		"legacy_email",           // kept so the renames can be counted after the database decides
 		"'admin'",                // kept when free
-		"'admin_MBU1@gmail.com'", // used when taken
+		"'admin.MBU1@gmail.com'", // used when taken — no branch table here, so the clinic code
 		"'nurse@clinic.com'",     // a real address is left alone when free
-		"'nurse_MBU1@gmail.com'", // and still gets the same treatment when taken
+		"'nurse.MBU1@gmail.com'", // and still gets the same treatment when taken
 	} {
 		if !strings.Contains(mapSQL, want) {
 			t.Errorf("map is missing %q:\n%s", want, mapSQL)
@@ -91,17 +91,36 @@ func TestUserMapKeepsAFreeLoginNameExactlyAsItWas(t *testing.T) {
 }
 
 func TestSuffixedEmailShape(t *testing.T) {
-	// The shape the clinic owner chose on 11 Sep 2026: <name>_<CLINIC>@gmail.com.
-	for _, c := range []struct{ in, clinic, want string }{
-		{"admin", "C8B173E", "admin_C8B173E@gmail.com"},
-		{"beer", "C8B173E", "beer_C8B173E@gmail.com"},
+	// The shape the clinic owner chose on 21 Sep 2026: <name>.<clinic slug>@gmail.com, replacing
+	// the <name>_<CLINIC CODE> form chosen on 11 Sep. Both the dot and keeping gmail.com are the
+	// owner's call, taken with the consequence on the record: Gmail ignores dots in a local
+	// part, so this address shares a mailbox with its dotless spelling.
+	for _, c := range []struct{ in, suffix, want string }{
+		{"admin", "the-gloss-clinic-cco", "admin.the-gloss-clinic-cco@gmail.com"},
+		{"beer", "the-gloss-clinic-cco", "beer.the-gloss-clinic-cco@gmail.com"},
+		// The fallback suffix is the clinic code, so that shape has to keep working too.
+		{"admin", "C8B173E", "admin.C8B173E@gmail.com"},
 		// An address keeps its local part and loses its domain: if the original had been
 		// usable, it would not have collided in a way worth preserving.
-		{"a@b.com", "MBU1", "a_MBU1@gmail.com"},
+		{"a@b.com", "MBU1", "a.MBU1@gmail.com"},
 	} {
-		if got := suffixedEmail(c.in, c.clinic); got != c.want {
-			t.Errorf("suffixedEmail(%q, %q) = %q, want %q", c.in, c.clinic, got, c.want)
+		got, cut := suffixedEmail(c.in, c.suffix)
+		if got != c.want {
+			t.Errorf("suffixedEmail(%q, %q) = %q, want %q", c.in, c.suffix, got, c.want)
 		}
+		if cut {
+			t.Errorf("suffixedEmail(%q, %q) reported a trim on a name that fits", c.in, c.suffix)
+		}
+	}
+
+	// The local part is trimmed to leave room for the suffix, the domain AND the ".9" rung, so
+	// no candidate on the ladder can overflow varchar(255) halfway up.
+	got, cut := suffixedEmail(strings.Repeat("x", 300), "the-gloss-clinic-cco")
+	if !cut {
+		t.Error("a 300-character login was not reported as trimmed")
+	}
+	if len(got)+len(".9") > loginNameMax {
+		t.Errorf("no room left for the .9 rung: len=%d", len(got))
 	}
 }
 
@@ -214,27 +233,35 @@ func TestUnresolvedAccountRefusesTheScriptWhenThisRunWroteThem(t *testing.T) {
 
 func TestCollisionGuardOnlyRefusesWhenBothEmailFormsAreTaken(t *testing.T) {
 	rows := parseUsers(t, usersFixture())
-	g := buildUsersCollisionGuard(rows, "MBU1")
+	g := buildUsersCollisionGuard(rows, Input{ClinicCode: "MBU1", UsersDump: usersFixture()})
 
-	// Both forms have to appear, PAIRED: the guard's question is "is the fallback also gone",
-	// which needs to know which fallback belongs to which name.
-	if !strings.Contains(strings.ToLower(g), "('admin', 'admin_mbu1@gmail.com')") {
-		t.Errorf("the two forms are not paired, so the guard cannot ask about the fallback:\n%s", g)
+	// The whole ladder has to appear per account: the bare name, the renamed form, and the
+	// prefix the .2 … .9 rungs are built from. Without the prefix this could only ask about two
+	// of the places the map is willing to put the account.
+	if !strings.Contains(strings.ToLower(g), "('admin', 'admin.mbu1@gmail.com', 'admin.mbu1')") {
+		t.Errorf("the ladder is not carried per account, so the guard asks about fewer forms "+
+			"than the map tries:\n%s", g)
+	}
+	if !strings.Contains(g, "generate_series(2, 9)") {
+		t.Errorf("guard does not walk the same .2-.9 rungs the map does:\n%s", g)
 	}
 
-	// THE REGRESSION THIS TEST EXISTS FOR. Listing both forms and refusing if either was taken
-	// rejected the whole 112-account import against the real database, because `admin` and
-	// `beer` belong to another clinic -- which is precisely why the fallback exists. The bare
-	// name being taken must only SELECT the row for checking, never condemn it.
+	// THE REGRESSION THIS TEST EXISTS FOR. Listing the forms and refusing if ANY of them was
+	// taken rejected the whole 112-account import against the real database, because `admin` and
+	// `beer` belong to another clinic -- which is precisely why the rename exists. Refusing has
+	// to require every rung to be gone.
 	if strings.Contains(g, "= ANY (ARRAY[") {
-		t.Errorf("guard is back to refusing on either form, which blocks every run the "+
-			"fallback was added to allow:\n%s", g)
+		t.Errorf("guard is back to refusing on a single form, which blocks every run the "+
+			"rename was added to allow:\n%s", g)
 	}
-	if !strings.Contains(g, "lower(u.email) = w.bare") || !strings.Contains(g, "lower(u.email) = w.suffixed") {
-		t.Errorf("guard does not test the bare name and its fallback separately:\n%s", g)
+	if !strings.Contains(g, "unnest(ARRAY[w.bare, w.suffixed]") {
+		t.Errorf("guard does not ask whether ANY rung is still free:\n%s", g)
 	}
-	if !strings.Contains(g, "w.taken_by IS NOT NULL") {
-		t.Errorf("guard does not require the fallback to ALSO be taken before refusing:\n%s", g)
+
+	// The same scope as the map, or the two disagree: a row of THIS clinic is a re-import, not
+	// the name being taken, and counting it would make a re-run refuse itself.
+	if !strings.Contains(g, "COALESCE(u.clinic_code, '') <> 'MBU1'") {
+		t.Errorf("guard is not scoped to other clinics:\n%s", g)
 	}
 
 	// Checking the legacy id would refuse most runs against a shared database over numbers

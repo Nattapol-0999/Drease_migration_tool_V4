@@ -132,7 +132,7 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 			keys = append(keys, RoleKeyDoctor)
 		}
 		b.WriteString(buildRolePresetsGuard(keys...))
-		b.WriteString(buildUsersCollisionGuard(userRows, in.ClinicCode))
+		b.WriteString(buildUsersCollisionGuard(userRows, in))
 	}
 
 	// The legacy-id → V4-id map, before anything that resolves a person through it.

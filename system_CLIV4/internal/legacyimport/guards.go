@@ -107,8 +107,9 @@ END $guard$;
 //
 // WHAT IT STILL CHECKS, AND WHY THE CONDITION IS A PAIR AND NOT AN "OR"
 // email is UNIQUE across the whole table, so a name another tenant holds cannot be written.
-// buildUserMap already answers that by falling back to <name>_<CLINIC>@gmail.com, which means
-// the bare name being taken is NORMAL — it is the trigger for the fallback, not a failure.
+// buildUserMap already answers that by renaming to <name>.<clinic slug>@gmail.com, and by
+// walking up .2 … .9 if that form is taken too — so the bare name being taken is NORMAL: it is
+// the trigger for the rename, not a failure.
 //
 // An earlier version listed both forms and refused if EITHER was taken. That refused exactly
 // the runs the fallback exists to allow: measured against the shared test database, `admin`
@@ -121,66 +122,73 @@ END $guard$;
 // naming the accounts, before a single row is written.
 //
 // A collision with the SAME clinic is a re-run and is left to the insert-only statements.
-func buildUsersCollisionGuard(rows []legacydump.Row, clinic string) string {
-	// Pairs, not a flat set: which form a row ends up with depends on the other one.
-	type pair struct{ bare, suffixed string }
+func buildUsersCollisionGuard(rows []legacydump.Row, in Input) string {
+	clinic := in.ClinicCode
+	// Resolved from the same Input, the same way, as buildUserMap resolves it — so this guard
+	// can never ask about a form the map would not have tried. The reason for a fallback is
+	// dropped here on purpose: buildUserMap reports it once, and repeating it would read like
+	// two separate problems.
+	suffix, _ := loginSuffix(in)
+
+	// Rungs, not a flat set: which form a row ends up with depends on which ones above it are
+	// free, so the guard has to carry the whole ladder for each account.
+	type rungs struct{ bare, suffixed, prefix string }
 	seen := map[string]bool{}
-	pairs := make([]pair, 0, len(rows))
+	list := make([]rungs, 0, len(rows))
 	for _, r := range rows {
 		e := strings.ToLower(strings.TrimSpace(r.Get("email")))
 		if e == "" || seen[e] {
 			continue
 		}
 		seen[e] = true
-		pairs = append(pairs, pair{e, strings.ToLower(suffixedEmail(e, clinic))})
+		s, _ := suffixedEmail(e, suffix)
+		s = strings.ToLower(s)
+		list = append(list, rungs{bare: e, suffixed: s, prefix: strings.TrimSuffix(s, "@gmail.com")})
 	}
-	if len(pairs) == 0 {
+	if len(list) == 0 {
 		return ""
 	}
 
-	values := make([]string, 0, len(pairs))
-	for _, p := range pairs {
-		values = append(values, fmt.Sprintf("        (%s, %s)", lit(p.bare), lit(p.suffixed)))
+	values := make([]string, 0, len(list))
+	for _, p := range list {
+		values = append(values, fmt.Sprintf("        (%s, %s, %s)", lit(p.bare), lit(p.suffixed), lit(p.prefix)))
 	}
 
 	return fmt.Sprintf(`-- GUARD: refuse only when an account has NOWHERE to land.
 -- users.email is UNIQUE across the whole table, not per clinic. A name another tenant holds
--- is handled by falling back to <name>_%s@gmail.com, so the bare name being taken is the
--- NORMAL case, not an error. What cannot be handled is both forms being taken: the insert
--- would be skipped and the account would never exist. That is what this refuses, by name,
--- before anything is written.
+-- is handled by renaming to <name>.%s@gmail.com, and if that form is taken as well by walking
+-- up .2 … .%d — so the bare name being taken is the NORMAL case, not an error. What cannot be
+-- handled is EVERY rung being taken: the insert would be skipped and the account would never
+-- exist. That is what this refuses, by name, before anything is written.
 -- users.id is deliberately NOT checked: V4 issues every id now, so a legacy number colliding
 -- says nothing about the account.
--- A collision with THIS clinic is a re-run and is skipped by the insert-only statements.
+-- A row belonging to THIS clinic is a re-import, not a clash: the ladder ignores it, lands on
+-- the same login as last time, and the insert-only statements skip it.
 DO $guard$
 DECLARE
     clash text;
 BEGIN
-    SELECT string_agg(format('%%s (รูปสำรอง %%s ก็เป็นของ clinic %%s)', w.bare, w.suffixed, w.taken_by), '; ')
+    SELECT string_agg(format('%%s (ทั้ง %%s และ .2-.%d ก็เป็นของคลินิกอื่นหมด)', w.bare, w.suffixed), '; ')
       INTO clash
-      FROM (
-          SELECT w.bare, w.suffixed,
-                 (SELECT COALESCE(NULLIF(u.clinic_code, ''), '(ไม่มี clinic_code)')
-                    FROM users u
-                   WHERE lower(u.email) = w.suffixed
-                     AND COALESCE(u.clinic_code, '') <> %s
-                   LIMIT 1) AS taken_by
-            FROM (VALUES
+      FROM (VALUES
 %s
-                 ) AS w(bare, suffixed)
-           -- only rows that will actually need the fallback
-           WHERE EXISTS (SELECT 1 FROM users u
-                          WHERE lower(u.email) = w.bare
-                            AND COALESCE(u.clinic_code, '') <> %s)
-      ) w
-     WHERE w.taken_by IS NOT NULL;
+           ) AS w(bare, suffixed, prefix)
+     WHERE NOT EXISTS (
+               SELECT 1
+                 FROM unnest(ARRAY[w.bare, w.suffixed]
+                             || ARRAY(SELECT w.prefix || '.' || g || '@gmail.com'
+                                        FROM generate_series(2, %d) AS g)) AS cand(c)
+                WHERE NOT EXISTS (SELECT 1 FROM users u
+                                   WHERE lower(u.email) = lower(cand.c)
+                                     AND COALESCE(u.clinic_code, '') <> %s)
+           );
 
     IF clash IS NOT NULL THEN
-        RAISE EXCEPTION 'users: ชื่อล็อกอินเป็นของคลินิกอื่น และรูปสำรองก็ถูกใช้ไปแล้ว จึงไม่มีที่ให้บัญชีนี้ลง — ปฏิเสธทั้งสคริปต์: %%', clash;
+        RAISE EXCEPTION 'users: ชื่อล็อกอินเป็นของคลินิกอื่น และทุกรูปสำรองก็ถูกใช้ไปแล้ว จึงไม่มีที่ให้บัญชีนี้ลง — ปฏิเสธทั้งสคริปต์: %%', clash;
     END IF;
 END $guard$;
 
-`, clinic, lit(clinic), strings.Join(values, ",\n"), lit(clinic))
+`, suffix, loginRungMax, loginRungMax, strings.Join(values, ",\n"), loginRungMax, lit(clinic))
 }
 
 // buildRolePresetsGuard refuses to run when the built-in role presets this import
