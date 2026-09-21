@@ -140,7 +140,18 @@ func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Repo
 		return "", "", "", nil
 	}
 
-	purgeSQL = renderCourseBoughtPurge(in.ClinicCode)
+	// The purge is limited to the branches these plans actually write, so a second site's
+	// import cannot delete the first site's entitlements. Taken from the resolved plans
+	// rather than Input.BranchMap: what matters is where rows LAND, not what was offered.
+	seen := map[string]bool{}
+	var branches []string
+	for _, p := range plans {
+		if b := strings.TrimSpace(p.branchCode); b != "" && !seen[b] {
+			seen[b] = true
+			branches = append(branches, b)
+		}
+	}
+	purgeSQL = renderCourseBoughtPurge(in.ClinicCode, branches)
 	ePurge.Statements = 2
 	boughtSQL = renderCourseBought(plans, in, eBought)
 	itemsSQL = renderCourseBoughtItems(plans, in, eItems)
@@ -362,39 +373,87 @@ func docArray(d mongodump.Doc, path string) []mongodump.Doc {
 // written.
 //
 // This is the ONLY destructive statement this tool emits, so it says out loud what it
-// removes. It is scoped to one clinic AND to rows that carry a migrate_source_ref — a row
-// created by a HUMAN through the app has no such reference and is deliberately left alone,
-// because replacing an import is not a licence to delete somebody's work.
-func renderCourseBoughtPurge(clinic string) string {
+// removes. It is scoped to rows that carry a migrate_source_ref — a row created by a HUMAN
+// through the app has no such reference and is deliberately left alone, because replacing
+// an import is not a licence to delete somebody's work.
+//
+// IT IS ALSO SCOPED TO THE BRANCHES THIS RUN WRITES, and that part was a real near-miss.
+// The clinic-only scope was correct while a clinic meant one site. For a multi-site tenant
+// it is not: importing site 2 would delete site 1's entitlements — measured on the-gloss,
+// a run for BR00002 (2,199 entitlements) would have wiped BR00001's 5,513 rows imported
+// hours earlier and never re-created them, because this export knows nothing about them.
+// Deleting only the branches being rewritten keeps the "replace the previous import"
+// intent without reaching into a branch this run cannot restore.
+func renderCourseBoughtPurge(clinic string, branches []string) string {
+	scope := ""
+	scopeNote := "ทั้งคลินิก (การนำเข้านี้ครอบทุกสาขา)"
+	if len(branches) > 0 {
+		scope = fmt.Sprintf("\n   AND branch_code = ANY (ARRAY[%s])", sqlTextList(branches))
+		scopeNote = "เฉพาะสาขา " + strings.Join(branches, ", ") + " (สาขาอื่นไม่ถูกแตะ)"
+	}
 	return fmt.Sprintf(`-- ⚠ ลบสิทธิ์คอร์สที่นำเข้าไว้รอบก่อน แล้วสร้างใหม่ทั้งชุด (มติเจ้าของคลินิก)
+--
+-- ขอบเขต: %s
 --
 -- ลบเฉพาะแถวที่มี migrate_source_ref = แถวที่มาจากการนำเข้า · แถวที่คนสร้างเองในระบบ
 -- (migrate_source_ref เป็น NULL) ไม่ถูกแตะ เพราะการนำเข้าใหม่ไม่ใช่ใบอนุญาตลบงานคน
 --
+-- และจำกัดที่สาขาที่รอบนี้เขียนเท่านั้น เพราะคลินิกหลายสาขาใช้ clinic_code ร่วมกัน —
+-- ถ้าลบทั้งคลินิก การนำเข้าสาขาหนึ่งจะลบสิทธิ์ของสาขาอื่นที่ไฟล์นี้ไม่มีข้อมูลจะสร้างคืน
+--
 -- ปลอดภัยเพราะ: FK ทุกตัวที่ชี้มาที่ course_bought เป็น ON DELETE CASCADE
 -- (course_bought_items · course_bought_usage · course_share · course_share_entitlement)
--- หรือ ON DELETE SET NULL (doctorbill) และตารางเหล่านั้นว่างทั้งหมดสำหรับคลินิกนี้
--- (ตรวจกับสคีมาจริงแล้ว ไม่ได้สันนิษฐาน)
+-- หรือ ON DELETE SET NULL (doctorbill)
 DO $purge$
 DECLARE
     doomed   int;
     handmade int;
+    other    int;
 BEGIN
-    SELECT count(*) FILTER (WHERE migrate_source_ref IS NOT NULL),
-           count(*) FILTER (WHERE migrate_source_ref IS NULL)
-      INTO doomed, handmade
+    SELECT count(*) FILTER (WHERE migrate_source_ref IS NOT NULL%s),
+           count(*) FILTER (WHERE migrate_source_ref IS NULL),
+           count(*) FILTER (WHERE migrate_source_ref IS NOT NULL%s)
+      INTO doomed, handmade, other
       FROM course_bought
      WHERE clinic_code = %s;
 
-    RAISE NOTICE 'course_bought: จะลบ %% แถวที่มาจากการนำเข้า · เก็บไว้ %% แถวที่คนสร้างเอง',
-                 doomed, handmade;
+    RAISE NOTICE 'course_bought: จะลบ %% แถวที่นำเข้าไว้ในสาขาที่รอบนี้เขียน · เก็บไว้ %% แถวที่คนสร้างเอง · เก็บไว้ %% แถวที่นำเข้าไว้ของสาขาอื่น',
+                 doomed, handmade, other;
 END $purge$;
 
 DELETE FROM course_bought
  WHERE clinic_code = %s
-   AND migrate_source_ref IS NOT NULL;
+   AND migrate_source_ref IS NOT NULL%s;
 
-`, lit(clinic), lit(clinic))
+`, scopeNote, purgeCountFilter(branches, true), purgeCountFilter(branches, false),
+		lit(clinic), lit(clinic), scope)
+}
+
+// purgeCountFilter renders the extra predicate that splits "rows this run replaces" from
+// "imported rows of another branch, which stay". Empty branches means the run covers
+// everything, so there is no other branch to count.
+func purgeCountFilter(branches []string, inScope bool) string {
+	if len(branches) == 0 {
+		if inScope {
+			return ""
+		}
+		return " AND false"
+	}
+	if inScope {
+		return " AND branch_code = ANY (ARRAY[" + sqlTextList(branches) + "])"
+	}
+	return " AND NOT (branch_code = ANY (ARRAY[" + sqlTextList(branches) + "]))"
+}
+
+// sqlTextList renders a sorted, quoted list for an ARRAY[...] literal.
+func sqlTextList(vals []string) string {
+	sorted := append([]string(nil), vals...)
+	sort.Strings(sorted)
+	out := make([]string, 0, len(sorted))
+	for _, v := range sorted {
+		out = append(out, lit(v))
+	}
+	return strings.Join(out, ", ")
 }
 
 // courseBoughtIDByRef resolves course_bought.id from its migration reference, which is

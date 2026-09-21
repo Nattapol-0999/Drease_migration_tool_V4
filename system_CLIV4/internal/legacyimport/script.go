@@ -239,7 +239,8 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	// still the thing that stops a wrong total from being kept.
 	if writingMoney {
 		b.WriteString("-- ── ตรวจยอดเงินหลังเขียน (ด่าน 1–3) ───────────────────────────────\n")
-		b.WriteString(buildMoneyVerifyGuards(in.ClinicCode, keySet(money.invoiceHN), keySet(money.receiptHN)))
+		b.WriteString(buildMoneyVerifyGuards(in.ClinicCode, keySet(money.invoiceHN), keySet(money.receiptHN),
+			money.overpaidInSource))
 	}
 
 	// Nothing to do to the identity sequence any more: V4 issues every users.id, so it

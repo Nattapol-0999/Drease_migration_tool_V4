@@ -84,6 +84,13 @@ type moneyBatches struct {
 	// invoiceNoByBillID is bills _id → invoice no, for entitlements that know only their
 	// bill.
 	invoiceNoByBillID map[string]string
+
+	// overpaidInSource are the invoice numbers whose SOURCE received more money than the
+	// bill was worth. They are imported that way on purpose — the cash reached the clinic
+	// and the import exists to make V4's totals equal V2's — so the post-import
+	// over-payment guard has to skip them by name instead of failing the whole run over an
+	// anomaly that was already in the source. Every one is named in the report.
+	overpaidInSource map[string]bool
 }
 
 // keySet reduces a no→hn map to the set of document numbers.
@@ -237,7 +244,9 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 
 	// A bill's discount is whatever the receipts did not collect and the patient does
 	// not still owe, so it can only be worked out once the receipts are known.
-	plans, receipts = balanceBills(plans, receipts, rep, eInv)
+	var overpaidInSource map[string]bool
+	plans, receipts, overpaidInSource = balanceBills(plans, receipts, rep, eInv)
+	out.overpaidInSource = overpaidInSource
 	if len(plans) == 0 {
 		rep.warnf("bills: ทุกบิลตกด่านตรวจยอด — ไม่มีอะไรถูกนำเข้า")
 		return out, nil
@@ -716,8 +725,14 @@ func sumExpr(amounts []string) string {
 //
 // Both are refused per bill and named, because both mean the source disagrees with
 // itself and no amount of mapping can settle it.
+// refusedBillListLimit is how many refused bills are named in the report. It is high on
+// purpose: these are the bills the clinic will not find in V4, and the operator needs the
+// whole list to act on them. The cap exists only so a pathological export cannot print a
+// megabyte of warnings.
+const refusedBillListLimit = 500
+
 func balanceBills(plans []billPlan, receipts []receiptPlan, rep *Report,
-	eInv *EntityResult) ([]billPlan, []receiptPlan) {
+	eInv *EntityResult) ([]billPlan, []receiptPlan, map[string]bool) {
 
 	paidByBill := map[string]float64{}
 	amountsByBill := map[string][]string{}
@@ -729,44 +744,110 @@ func balanceBills(plans []billPlan, receipts []receiptPlan, rep *Report,
 	bad := map[string]bool{}
 	var lineMismatch, overpaid []string
 	discounted, discountTotal := 0, 0.0
+	retotalled, staleBalance := 0, 0
+	var retotalDelta, staleAmount float64
+	sourceOverpaid := map[string]bool{}
 
 	for i := range plans {
 		p := &plans[i]
+
+		// ── repair 1: the bill total comes from the LINES when the header disagrees ──
+		//
+		// It used to refuse the bill. That was the safe answer while the two numbers were
+		// equally credible, and the export proved they are not: the disagreeing headers in
+		// this tenant are 0.00 against lines worth ฿3,999 / ฿13,000 / ฿25,500, with real
+		// receipts attached. A zero header with money received is a header that was never
+		// recalculated, not a bill worth nothing — and refusing it removed the sale, the
+		// cash and (because entitlements hang off the bill) the patient's course as well.
+		//
+		// The lines are what was sold, so they decide the value. The header is reported,
+		// never silently dropped, so the difference stays auditable.
 		if diff := p.fLineTotal - p.fPriceTotal; diff > MoneyTolerance || diff < -MoneyTolerance {
-			bad[p.no] = true
-			if len(lineMismatch) < 10 {
+			retotalled++
+			retotalDelta += diff
+			if len(lineMismatch) < refusedBillListLimit {
 				lineMismatch = append(lineMismatch,
-					fmt.Sprintf("%s (รายการรวม %.2f ≠ ยอดบิล %.2f)", p.no, p.fLineTotal, p.fPriceTotal))
+					fmt.Sprintf("%s (ยอดบิลเดิม %.2f → ใช้ผลรวมรายการ %.2f)", p.no, p.fPriceTotal, p.fLineTotal))
 			}
-			continue
+			p.priceTotal = lineSumExpr(p.lines)
+			p.fPriceTotal = p.fLineTotal
 		}
 
-		residual := p.fPriceTotal - paidByBill[p.no] - p.fBalance
+		paid := paidByBill[p.no]
+
+		// ── repair 2: ignore price_total_balance when it makes the discount negative ──
+		//
+		// discount = total − received − outstanding reconciles every well-formed bill, and
+		// those keep using it untouched. Where it goes negative the outstanding figure is
+		// stale: measured here, 42 bills whose own receipts already close them still carry
+		// an outstanding amount (bill ฿2,995 · received ฿2,995 · outstanding ฿1,000), so
+		// the field double-counts money that was paid. Dropping it from the arithmetic
+		// leaves the two numbers the clinic can verify — the bill total and the cash — and
+		// makes the remainder an ordinary unpaid balance.
+		residual := p.fPriceTotal - paid - p.fBalance
+		useBalance := true
 		if residual < -MoneyTolerance {
-			bad[p.no] = true
-			if len(overpaid) < 10 {
-				overpaid = append(overpaid, fmt.Sprintf("%s (ยอดบิล %.2f · รับ %.2f · ค้าง %.2f → ส่วนลดติดลบ %.2f)",
-					p.no, p.fPriceTotal, paidByBill[p.no], p.fBalance, residual))
+			staleBalance++
+			staleAmount += -residual
+			useBalance = false
+			residual = p.fPriceTotal - paid
+			if len(overpaid) < refusedBillListLimit {
+				overpaid = append(overpaid, fmt.Sprintf("%s (ยอดบิล %.2f · รับ %.2f · ค้างในต้นทาง %.2f → ไม่ใช้ยอดค้าง)",
+					p.no, p.fPriceTotal, paid, p.fBalance))
 			}
-			continue
+		}
+
+		// Cash above the bill's value is carried through as-is: the money reached the
+		// clinic and "ยอด V2 = ยอด V4" is the point of the import. The bill is flagged so
+		// the post-import over-payment guard can name it as a KNOWN source anomaly instead
+		// of failing a run over a number the source already contained.
+		if residual < -MoneyTolerance {
+			sourceOverpaid[p.no] = true
+			residual = 0
 		}
 		if residual > MoneyTolerance {
 			discounted++
 			discountTotal += residual
 		}
+
 		// Rendered as arithmetic over the SOURCE digits so Postgres computes it in
-		// numeric and a reviewer can see the three numbers it came from.
-		p.discountExpr = "(" + p.priceTotal + " - " + sumExpr(amountsByBill[p.no]) + " - " + p.balance + ")"
+		// numeric and a reviewer can see the numbers it came from. GREATEST keeps the
+		// column non-negative when the cash exceeded the bill.
+		expr := "GREATEST(" + p.priceTotal + " - " + sumExpr(amountsByBill[p.no])
+		if useBalance {
+			expr += " - " + p.balance
+		}
+		p.discountExpr = expr + ", 0)"
 	}
 
 	if discounted > 0 {
 		rep.notef("invoice.bill_discount: %d ใบมีส่วนลด รวม %.2f บาท — คิดจาก ยอดบิล − เงินที่รับจริง − ยอดค้าง ไม่ได้อ่านจากช่องส่วนลดของระบบเก่า เพราะระบบเก่าบันทึกส่วนลดบางส่วนไว้ในหมายเหตุเท่านั้น",
 			discounted, discountTotal)
 	}
-	if len(bad) == 0 {
-		return plans, receipts
+	if retotalled > 0 {
+		rep.warnf("invoice: %d ใบ ยอดหัวบิลในต้นทางไม่เท่ากับผลรวมรายการ — ใช้ผลรวมรายการเป็นยอดบิล (ต่างกันรวม %.2f บาท) · รายการ: %s",
+			retotalled, retotalDelta, strings.Join(lineMismatch, "; "))
+	}
+	if staleBalance > 0 {
+		rep.warnf("invoice: %d ใบ ช่องยอดค้างในต้นทางค้างค่าเก่า (นับเงินที่จ่ายแล้วซ้ำ รวม %.2f บาท) — คิดส่วนลดจาก ยอดบิล − เงินที่รับจริง เท่านั้น · รายการ: %s",
+			staleBalance, staleAmount, strings.Join(overpaid, "; "))
+	}
+	if len(sourceOverpaid) > 0 {
+		nos := make([]string, 0, len(sourceOverpaid))
+		for no := range sourceOverpaid {
+			nos = append(nos, no)
+		}
+		sort.Strings(nos)
+		rep.warnf("invoice: %d ใบ ต้นทางรับเงินมากกว่ายอดบิล — นำเข้าตามต้นทาง (paid_amount มากกว่ายอดสุทธิ) เพื่อให้ยอดเงิน V4 เท่ากับ V2 · ด่านห้ามเก็บเกินยอดจะยกเว้นใบเหล่านี้และไม่ปฏิเสธการนำเข้า · ต้องตามไปแก้ที่ต้นทางหรือออกใบลดหนี้ใน V4: %s",
+			len(sourceOverpaid), strings.Join(nos, ", "))
 	}
 
+	// Nothing is dropped any more: every importable bill is repaired rather than refused,
+	// so `bad` stays empty unless a future rule needs it. Kept as the single place a
+	// future refusal would hook into.
+	if len(bad) == 0 {
+		return plans, receipts, sourceOverpaid
+	}
 	keptPlans := make([]billPlan, 0, len(plans))
 	for _, p := range plans {
 		if bad[p.no] {
@@ -782,16 +863,22 @@ func balanceBills(plans []billPlan, receipts []receiptPlan, rep *Report,
 		}
 		keptReceipts = append(keptReceipts, r)
 	}
+	return keptPlans, keptReceipts, sourceOverpaid
+}
 
-	if len(lineMismatch) > 0 {
-		rep.warnf("invoice: ข้าม %d ใบ เพราะผลรวมรายการไม่เท่ากับยอดบิลในต้นทาง — ตัวอย่าง: %s",
-			len(lineMismatch), strings.Join(lineMismatch, "; "))
+// lineSumExpr renders Σ(price × qty) as SQL arithmetic over the line literals, so the
+// repaired bill total is computed by Postgres in `numeric` from the same digits the
+// invoice_item rows carry. Summing in Go would put money through float64 and could leave
+// the header a cent away from its own lines.
+func lineSumExpr(lines []linePlan) string {
+	if len(lines) == 0 {
+		return "0"
 	}
-	if len(overpaid) > 0 {
-		rep.warnf("invoice: ข้าม %d ใบ เพราะเงินที่รับมากกว่ายอดบิล (ส่วนลดติดลบ — น่าจะเป็นเงินมัดจำหรือบิลที่ยอดถูกแก้ทีหลัง) — ตัวอย่าง: %s",
-			len(overpaid), strings.Join(overpaid, "; "))
+	parts := make([]string, 0, len(lines))
+	for _, l := range lines {
+		parts = append(parts, "("+l.price+" * "+l.qty+")")
 	}
-	return keptPlans, keptReceipts
+	return "(" + strings.Join(parts, " + ") + ")"
 }
 
 // ── renderers ────────────────────────────────────────────────────────────────
@@ -968,17 +1055,72 @@ UPDATE invoice inv
 // billDocNo returns the document number this import writes into invoice.no.
 func billDocNo(d mongodump.Doc) string {
 	if MoneyUseBranchDocNumbers {
-		return firstNonEmpty(d.Text("invoice_branch_no"), d.Text("invoice_no"))
+		return applyDocNoBranchMarker(firstNonEmpty(d.Text("invoice_branch_no"), d.Text("invoice_no")))
 	}
-	return firstNonEmpty(d.Text("invoice_no"), d.Text("invoice_branch_no"))
+	return applyDocNoBranchMarker(firstNonEmpty(d.Text("invoice_no"), d.Text("invoice_branch_no")))
 }
 
 // receiptDocNo returns the document number this import writes into receipt.receipt_no.
 func receiptDocNo(d mongodump.Doc) string {
 	if MoneyUseBranchDocNumbers {
-		return firstNonEmpty(d.Text("receipt_branch_no"), d.Text("receipt_no"))
+		return applyDocNoBranchMarker(firstNonEmpty(d.Text("receipt_branch_no"), d.Text("receipt_no")))
 	}
-	return firstNonEmpty(d.Text("receipt_no"), d.Text("receipt_branch_no"))
+	return applyDocNoBranchMarker(firstNonEmpty(d.Text("receipt_no"), d.Text("receipt_branch_no")))
+}
+
+/**
+ * applyDocNoBranchMarker stamps a branch digit into a legacy V2 document number.
+ *
+ * WHY THIS EXISTS
+ * Every V2 instance of a multi-site tenant issues the SAME running numbers, because each
+ * site runs its own copy of V2. V4 keeps one number space per clinic
+ * (uniq_invoice_clinic_no / uniq_receipt_clinic_no), so importing a second site's
+ * documents as-is either collides with the first site's numbers or, worse, re-inserts
+ * documents that are already there under a different identity — the dedup in the
+ * generated script is `WHERE NOT EXISTS (… AND no = '<number>')`, i.e. the number IS the
+ * identity.
+ *
+ * THE RULE (the-gloss, owner K.Art, 2026-09-09)
+ * The third character of a V2 number is always '0' — the shape is YY0NNNNNN, and
+ * C-prefixed numbers (bills that spend a course) are CYY0NNNNNN. That zero becomes the
+ * branch marker, so ศรีราชา's 670017358 is written as 672017358 while ฉะเชิงเทรา keeps its
+ * original numbers. Lossless: the digit replaced carries no information. Verified
+ * collision-free against the live BR00002 rows before the first remap ran.
+ *
+ * Numbers that do NOT match the V2 shape are returned untouched — a V4-native number
+ * (INV-260917-F26F, RCP-6909-BR00002-0001) is not part of this numbering scheme and
+ * rewriting it would invent a document number that never existed.
+ *
+ * DocNoBranchMarker is "" for every clinic that does not need this, so the default
+ * behaviour — carry the source number verbatim — is unchanged.
+ */
+func applyDocNoBranchMarker(no string) string {
+	marker := strings.TrimSpace(DocNoBranchMarker)
+	if marker == "" || len(marker) != 1 || marker[0] < '1' || marker[0] > '9' {
+		return no
+	}
+	s := strings.TrimSpace(no)
+	// YY0NNNNNN  → the marker replaces index 2
+	if len(s) == 9 && isAllDigits(s) && s[2] == '0' {
+		return s[:2] + marker + s[3:]
+	}
+	// CYY0NNNNNN → the marker replaces index 3
+	if len(s) == 10 && (s[0] == 'C' || s[0] == 'c') && isAllDigits(s[1:]) && s[3] == '0' {
+		return s[:3] + marker + s[4:]
+	}
+	return no
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // NOTE: the legacy discount fields (discount.assign.qty / discount.percent.qty) are

@@ -136,7 +136,13 @@ END $guard$;
 }
 
 // buildMoneyVerifyGuards renders guards 1–3, which read the rows the script just wrote.
-func buildMoneyVerifyGuards(clinic string, invoiceNos, receiptNos map[string]bool) string {
+//
+// overpaidInSource are invoice numbers the SOURCE already recorded with more cash than the
+// bill was worth. Guard 3 excludes exactly those, by name. The alternative — dropping the
+// guard, or dropping the bills — would either stop checking 17,000 good invoices or leave
+// real money out of V4; naming the anomalies keeps both the check and the cash.
+func buildMoneyVerifyGuards(clinic string, invoiceNos, receiptNos map[string]bool,
+	overpaidInSource map[string]bool) string {
 	tol := strconv.FormatFloat(MoneyTolerance, 'f', -1, 64)
 	var b strings.Builder
 
@@ -201,6 +207,9 @@ END $guard$;
 -- GUARD 3: ห้ามเก็บเงินเกินยอดที่ต้องจ่าย
 -- ยอดสุทธิ = Σ(ราคา × จำนวน − ส่วนลดบรรทัด) − ส่วนลดท้ายบิล ตามสูตรของ V4 เอง
 -- เกินยอด = คนไข้จ่ายเกิน หรือรายการในใบหายไป ทั้งสองกรณีต้องหยุด
+--
+-- ยกเว้นใบที่ต้นทางรับเงินเกินมาตั้งแต่ต้น (ระบุชื่อไว้ในรายการยกเว้นด้านล่าง ถ้ามี) —
+-- ใบเหล่านั้นถูกนำเข้าตามต้นทางโดยเจตนา เพื่อให้ยอดเงินใน V4 เท่ากับ V2 และถูกรายงานไว้แล้ว
 DO $guard$
 DECLARE
     bad text;
@@ -216,7 +225,7 @@ BEGIN
       ) net
      WHERE inv.clinic_code = %s
        AND inv.no = ANY (ARRAY[%s])
-       AND inv.paid_amount > net.total + %s;
+       AND inv.paid_amount > net.total + %s%s;
 
     IF n > 0 THEN
         RAISE EXCEPTION 'invoice: %% ใบเก็บเงินเกินยอดสุทธิ — ปฏิเสธทั้งสคริปต์: %%', n, left(bad, 2000);
@@ -246,11 +255,30 @@ BEGIN
 END $guard$;
 
 `, lit(clinic), lit(clinic), nos, tol,
-			lit(clinic), nos, tol,
+			lit(clinic), nos, tol, overpayExclusion(overpaidInSource),
 			lit(clinic), nos))
 	}
 
 	return b.String()
+}
+
+// overpayExclusion renders the NOT-IN clause that keeps guard 3 from failing on bills the
+// source itself recorded as over-paid. Empty when there are none, so a clean export emits
+// exactly the guard it always did.
+func overpayExclusion(nos map[string]bool) string {
+	if len(nos) == 0 {
+		return ""
+	}
+	list := make([]string, 0, len(nos))
+	for no := range nos {
+		list = append(list, no)
+	}
+	sort.Strings(list)
+	quoted := make([]string, 0, len(list))
+	for _, no := range list {
+		quoted = append(quoted, lit(no))
+	}
+	return "\n       AND inv.no <> ALL (ARRAY[" + strings.Join(quoted, ", ") + "])"
 }
 
 // sqlValuesPairs renders a sorted `('a','b'), ('c','d')` list for a VALUES clause.

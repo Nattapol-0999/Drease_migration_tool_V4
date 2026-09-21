@@ -61,6 +61,11 @@ func main() {
 		defaultBranch = flag.String("default-branch", "",
 			"สาขาที่ใช้กับแถวที่ไม่มีสาขา หรือรหัสที่ไม่อยู่ใน -branch-map (เว้นว่าง = ตัวแรกของ -branch-map)")
 
+		// Per-SITE, not per-clinic: each site of a multi-site tenant runs its own V2 and
+		// issues the same running numbers, while V4 keeps one number space per clinic.
+		docNoMarker = flag.String("doc-no-branch-marker", "",
+			"เลขหลักเดียว 1-9 แทรกเป็นตัวที่ 3 ของเลขที่เอกสารเดิม (670017358 → 672017358 · C670017358 → C672017358) — ใช้เมื่อนำเข้าหลายสาขาที่ระบบเก่าออกเลขชุดเดียวกัน (เว้นว่าง = ใช้เลขเดิม)")
+
 		// Read-only mode. Writes nothing and needs no -clinic, because it answers the
 		// question that comes BEFORE a clinic exists: how many branches does this tenant
 		// have, do they belong to one company, and what would splitting them cost.
@@ -108,17 +113,18 @@ func main() {
 	}
 
 	in := legacyimport.Input{
-		ClinicCode:      strings.TrimSpace(*clinic),
-		OwnerUsername:   strings.TrimSpace(*owner),
-		Groups:          splitCSV(*only),
-		BranchMap:       parsedBranchMap,
-		DefaultBranch:   strings.TrimSpace(*defaultBranch),
-		UsersDump:       mustRead("users", *users),
-		DoctorDump:      mustRead("doctor", *doctor),
-		RoomDump:        mustRead("room", *room),
-		PatientDump:     mustRead("patient", *patient),
-		AddressDump:     mustRead("patient_address", *address),
-		AppointmentDump: mustRead("appointment", *appointment),
+		ClinicCode:        strings.TrimSpace(*clinic),
+		OwnerUsername:     strings.TrimSpace(*owner),
+		Groups:            splitCSV(*only),
+		BranchMap:         parsedBranchMap,
+		DefaultBranch:     strings.TrimSpace(*defaultBranch),
+		DocNoBranchMarker: strings.TrimSpace(*docNoMarker),
+		UsersDump:         mustRead("users", *users),
+		DoctorDump:        mustRead("doctor", *doctor),
+		RoomDump:          mustRead("room", *room),
+		PatientDump:       mustRead("patient", *patient),
+		AddressDump:       mustRead("patient_address", *address),
+		AppointmentDump:   mustRead("appointment", *appointment),
 
 		MongoDump: mustRead("mongo", *mongo),
 		PageDump:  mustRead("page", *page),

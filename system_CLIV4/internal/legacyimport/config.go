@@ -144,6 +144,8 @@ const (
 	// a distinction bought at the price of a duplicate the clinic would have to explain.
 	AddressInactiveAsOther = false
 
+	// (see the var block below for DocNoBranchMarker, which is per-run, not policy)
+
 	// AddressFillExistingRows adds a FILL-ONLY update beside each address insert.
 	//
 	// The target already holds these rows from an earlier pipeline, but incomplete: all
@@ -157,6 +159,15 @@ const (
 	// it is — including something a human edited after the earlier import.
 	AddressFillExistingRows = true
 )
+
+// DocNoBranchMarker is the one value in this file that is NOT fixed policy: it differs per
+// SITE of a multi-site tenant, so the caller sets it through Input.DocNoBranchMarker and
+// BuildAll publishes it here. It lives beside the policy constants because it changes the
+// same thing they do — what goes into invoice.no / receipt.receipt_no.
+//
+// Empty (the default) means "carry the source number verbatim", which is every
+// single-site import ever run by this tool. See applyDocNoBranchMarker in money.go.
+var DocNoBranchMarker string
 
 // billImportable decides what happens to one legacy bill, by its status. Decided by
 // the clinic owner against the real counts in the export (1,405 bills):
@@ -172,9 +183,22 @@ const (
 //
 // An UNKNOWN status is skipped, not guessed: a status this tool has never seen could
 // mean anything, and the wrong guess either invents or erases a charge.
+//
+// partially_paid / watting: added for the-gloss ฉะเชิงเทรา (BR00001) on 2026-09-09 by
+// the clinic owner (K.Art), against that export's real counts (partially_paid 334,
+// watting 18).
+//   - partially_paid → import. It is a real, meaningful status: the patient paid part of
+//     the bill. invoice.status/paid_amount are DERIVED from the receipts that get
+//     imported (renderSettle), so a partial payment lands as 'partially_paid' on its own
+//     and Guard 3 (no OVER-payment) still passes because paid < total is allowed.
+//   - watting → import. It is the source's misspelling of "waiting"; the owner confirmed
+//     these are real bills, not drafts. A watting bill that carries no line items is still
+//     dropped by the existing empty-bill skip before it can reach Guard 3b, so only ones
+//     with real lines are written. "waiting" (correctly spelled) stays a skip — the owner
+//     did not ask to import those.
 func billImportable(status string) (importIt bool, skipReason string) {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "full_paid", "send":
+	case "full_paid", "send", "partially_paid", "watting":
 		return true, ""
 	case "delete":
 		return false, "bills.status=delete (ถูกลบ/ยกเลิกในระบบเก่า)"
@@ -213,6 +237,23 @@ func paymentImportable(status string) (importIt bool, skipReason string) {
 //
 // known=false means the type is not in the export this mapping was built against;
 // the caller reports it instead of filing it under a kind that changes stock.
+//
+// "other" was added for the-gloss ศรีราชา on 2026-09-09 by the clinic owner (K.Art), and
+// the reason it had to be decided rather than left unknown is worth recording: dropping an
+// unknown LINE silently breaks its whole BILL. balanceBills refuses any bill whose line sum
+// no longer equals its header total, which is correct — but it meant 255 bills worth
+// ฿5,664,228 were refused, and with them 263 course entitlements that hung off those bills
+// (a patient then shows ฿0 purchased and no course, with nothing on screen explaining why).
+//
+// What "other" holds in this export, counted: ปากกามอนจา / ปากกาวีโก (GLP-1 pens, ~110
+// lines), ตรวจเลือด (89), NAD+, G5, ตรวจสุขภาพ. The majority are physical goods handed to
+// the patient, so 'supply' is the owner's call. The lab/checkup lines land there too and
+// are the known cost of one rule over per-name rules — a rule nobody can maintain is worse
+// than a rule that is slightly coarse.
+//
+// This does NOT move stock for the imported history: the money import writes
+// invoice/invoice_item/receipt only, never stock_movement, so kind here affects how the
+// line reads and reports, not a back-dated inventory deduction.
 func invoiceItemKind(legacyType string) (kind string, known bool) {
 	switch strings.ToLower(strings.TrimSpace(legacyType)) {
 	case "operative":
@@ -221,6 +262,8 @@ func invoiceItemKind(legacyType string) (kind string, known bool) {
 		return "supply", true
 	case "course":
 		return "course", true
+	case "other":
+		return "supply", true
 	default:
 		return "", false
 	}

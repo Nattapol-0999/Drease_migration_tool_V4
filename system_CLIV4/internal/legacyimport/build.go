@@ -93,6 +93,19 @@ type Input struct {
 	// branch_code is NOT NULL on patient, invoice, receipt, room, doctor and slot_stock.
 	DefaultBranch string
 
+	// DocNoBranchMarker is a single digit ("2".."9") stamped into the third character of
+	// every legacy V2 document number this run writes (YY0NNNNNN → YY<marker>NNNNNN, and
+	// CYY0NNNNNN → CYY<marker>NNNNNN). Empty — the default — carries the source number
+	// verbatim, which is what a single-site tenant needs.
+	//
+	// It exists because each site of a multi-site tenant runs its own copy of V2 and
+	// therefore issues the SAME running numbers, while V4 keeps one number space per
+	// clinic. The generated script also treats the number as the document's identity
+	// (dedup is `WHERE NOT EXISTS (… AND no = '<number>')`), so without a per-site marker
+	// the second site's import either collides with the first site's documents or silently
+	// re-inserts rows that are already there. See applyDocNoBranchMarker in money.go.
+	DocNoBranchMarker string
+
 	// PageDump is the mongo export of `mris.page` — the patient record pages and the
 	// images attached to them. It is a SEPARATE flag from MongoDump because it is a
 	// different database (mris, not the catalog one) and because it is the only input
@@ -134,6 +147,19 @@ type Input struct {
 func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []legacydump.Row, money moneyBatches, err error) {
 	if strings.TrimSpace(in.ClinicCode) == "" {
 		return nil, nil, money, fmt.Errorf("clinic_code is required")
+	}
+
+	// The doc-number marker is read deep inside the money mapping (billDocNo /
+	// receiptDocNo), which sees one document at a time and no Input. Publishing it once
+	// here keeps the rule in Input where the caller sets it, instead of threading it
+	// through every money helper. One run = one clinic = one marker.
+	DocNoBranchMarker = strings.TrimSpace(in.DocNoBranchMarker)
+	if DocNoBranchMarker != "" {
+		if len(DocNoBranchMarker) != 1 || DocNoBranchMarker[0] < '1' || DocNoBranchMarker[0] > '9' {
+			return nil, nil, money, fmt.Errorf("doc-no-branch-marker ต้องเป็นเลขหลักเดียว 1-9 (ได้รับ %q)", in.DocNoBranchMarker)
+		}
+		rep.notef("เลขที่เอกสารจากระบบเก่าถูกแทรกเลขสาขา %q เป็นตัวที่ 3 (YY0NNNNNN → YY%sNNNNNN · CYY0NNNNNN → CYY%sNNNNNN) — เพราะแต่ละสาขาของระบบเก่าออกเลขชุดเดียวกัน แต่ V4 ใช้เลขร่วมกันทั้งคลินิก · เลขที่ไม่ใช่รูปแบบเดิมจะไม่ถูกแตะ",
+			DocNoBranchMarker, DocNoBranchMarker, DocNoBranchMarker)
 	}
 
 	// An empty selection means everything, which is what an operator who passes no -only
