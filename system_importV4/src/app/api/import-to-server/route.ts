@@ -263,10 +263,38 @@ async function runImport(
       seconds: photo.seconds,
       uploads: photo.uploads,
       log: photo.log,
+      logoFound: photo.extras?.logo?.found,
+      profilesSent: photo.extras?.profiles?.sent,
+      profilesCandidates: photo.extras?.profiles?.candidates,
+      profilesSkipped: photo.extras?.profiles?.skippedNoPatient,
+      extrasError: photo.extrasError ?? undefined,
     });
     h.addLog(
       `นำเข้ารูปแล้ว · คัดลอก ${photo.filesSent} ไฟล์ (${((photo.bytesSent ?? 0) / 1048576).toFixed(1)} MB) → ${photo.uploads} · เขียน ${photo.rows} แถว (${photo.seconds}s)`,
     );
+    // The two decorative trees, reported on their own line so they can never be read as part
+    // of the medical-record count above.
+    if (photo.extras) {
+      const bits: string[] = [];
+      if (photo.extras.logo) {
+        bits.push(
+          photo.extras.logo.found
+            ? `โลโก้ ${photo.extras.logo.wanted}`
+            : `ไม่พบโลโก้ ${photo.extras.logo.wanted} (มีในถุง: ${photo.extras.logo.available.join(", ") || "ไม่มีไฟล์"})`,
+        );
+      }
+      if (photo.extras.profiles) {
+        const p = photo.extras.profiles;
+        bits.push(
+          `รูปโปรไฟล์ ${p.sent}/${p.candidates} ไฟล์` +
+            (p.skippedNoPatient > 0 ? ` (ข้าม ${p.skippedNoPatient} — ไม่มี HN ในตาราง patient)` : ""),
+        );
+      }
+      if (bits.length > 0) h.addLog(`เพิ่มเติม · ${bits.join(" · ")}`);
+    }
+    if (photo.extrasError) {
+      h.addLog(`โลโก้/รูปโปรไฟล์ไม่สำเร็จ (ข้อมูลและรูปเวชระเบียนเข้าครบแล้ว): ${photo.extrasError}`);
+    }
     // Only now is the upload finished with. Left until here so a photo failure keeps the
     // archive available for the standalone retry.
     await dropSession(photoSessionId);

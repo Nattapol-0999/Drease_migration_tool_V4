@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
+import { shipExtras } from "@/lib/extras-import";
 import { describeTrim, trimMongoDump } from "@/lib/mongo-trim";
 import {
   buildInsertSQL,
@@ -20,7 +21,7 @@ import {
 import type { Survey } from "@/lib/photo-import";
 import { describeTarget, psqlCommand, resolveTarget, runSSH, sshArgs } from "@/lib/server-target";
 import { sessionExists, stagedPath, stagedSize } from "@/lib/upload-staging";
-import type { TargetId } from "@/lib/types";
+import type { ExtrasResult, TargetId } from "@/lib/types";
 
 const run = promisify(execFile);
 
@@ -91,6 +92,17 @@ export interface PhotoRunResult {
   bytesSent?: number;
   seconds?: string;
   log?: string;
+  /**
+   * apply only: the clinic logo and profile photos, when the session had them staged.
+   * null means there was nothing to do, which is the normal tab-1 case.
+   */
+  extras?: ExtrasResult | null;
+  /**
+   * apply only: why the extras step failed, when it did. Separate from the run's own failure
+   * because these are decorative — the medical records were already written successfully by
+   * the time this ran, and the import must not be reported as failed over a logo.
+   */
+  extrasError?: string | null;
 }
 
 export class PhotoRunError extends Error {
@@ -296,13 +308,74 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       );
     }
 
+    // 5 · last, and only once the records are safely written: the clinic logo and the patient
+    // profile photos. Bytes only, no rows.
+    //
+    // AFTER the medical records, and non-fatal.
+    //
+    // These are a convenience — V4 has no feature that reads either one yet, so a clinic whose
+    // logo failed to copy is still a fully imported clinic. Running them first, or letting them
+    // throw, would mean a decorative file could cost an import that had already succeeded. So
+    // the failure is carried back as a message, and the caller shows it as a warning.
+    //
+    // They are absent entirely on the tab-1 (import from files) path, which stages neither.
+    let extras: ExtrasResult | null = null;
+    let extrasError: string | null = null;
+    try {
+      const logoBytes = await stagedSize(sessionId, "logo");
+      const profileBytes = await stagedSize(sessionId, "profiles");
+      if (logoBytes > 0 || profileBytes > 0) {
+        phase("คัดลอกโลโก้คลินิกและรูปโปรไฟล์คนไข้");
+        extras = await shipExtras({
+          uploads,
+          dbTarget,
+          clinic,
+          logoTar: logoBytes > 0 ? stagedPath(sessionId, "logo") : null,
+          profilesTar: profileBytes > 0 ? stagedPath(sessionId, "profiles") : null,
+        });
+        console.log(
+          JSON.stringify({
+            event: "import-extras",
+            at: new Date().toISOString(),
+            user,
+            target: targetId,
+            clinic,
+            uploads_host: uploads.sshHost,
+            session: sessionId,
+            logo_found: extras.logo?.found ?? null,
+            profiles_candidates: extras.profiles?.candidates ?? null,
+            profiles_sent: extras.profiles?.sent ?? null,
+            profiles_skipped_no_patient: extras.profiles?.skippedNoPatient ?? null,
+            files_sent: extras.filesSent,
+            bytes_sent: extras.bytesSent,
+          }),
+        );
+      }
+    } catch (e) {
+      extrasError = e instanceof Error ? e.message : String(e);
+      console.log(
+        JSON.stringify({
+          event: "import-extras-failed",
+          at: new Date().toISOString(),
+          user,
+          clinic,
+          session: sessionId,
+          error: extrasError,
+        }),
+      );
+    }
+
     return {
       ...base,
       filesSent: ship.filesSent,
       thumbsSent: ship.thumbsSent,
       bytesSent: ship.bytesSent,
       seconds,
-      log: log || "psql ไม่ได้ส่งข้อความใด (สำเร็จ)",
+      log: [log, extras?.log, extrasError ? `โลโก้/รูปโปรไฟล์: ${extrasError}` : ""]
+        .filter(Boolean)
+        .join("\n") || "psql ไม่ได้ส่งข้อความใด (สำเร็จ)",
+      extras,
+      extrasError,
     };
   } finally {
     await cleanup(extractRoot);

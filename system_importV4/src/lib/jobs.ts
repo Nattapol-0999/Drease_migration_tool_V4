@@ -73,6 +73,18 @@ interface Job {
     seconds?: string;
     uploads?: string;
     log?: string;
+    /**
+     * The clinic logo and the patient profile photos, which ride along with the photo step but
+     * write no rows. Kept OUT of filesSent on purpose: that number counts medical-record
+     * images, and mixing decorative files into it would make the count that matters
+     * unverifiable against the photos table.
+     */
+    logoFound?: boolean;
+    profilesSent?: number;
+    profilesCandidates?: number;
+    profilesSkipped?: number;
+    /** Set when they failed. The import itself still succeeded — see photo-run.ts step 5. */
+    extrasError?: string;
   };
 
   // survey

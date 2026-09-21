@@ -40,7 +40,20 @@ export type CliInputField = (typeof CLI_INPUTS)[number]["field"];
  * staging directory is what makes that size reachable — the ceiling there is
  * MAX_UPLOAD_BYTES (4 GB of disk), not a proxy's body limit.
  */
-export const STAGED_ONLY_FIELDS = ["images"] as const;
+/*
+ * `logo` and `profiles` are the two SMALL trees under the source's public/img, added 18 Sep
+ * 2026. They are separate staged files rather than extra members inside `images` on purpose:
+ * the CLI locates every page image by the exact prefix nas-doctorease/mris_images/page/… and
+ * surveyArchive stats that tree whole, so widening that archive would put unrelated files in
+ * front of code that is working in production. Kept apart, the photo path cannot see them.
+ *
+ * Both are optional. They only exist when the operator pulled from a server; tab 1 (import
+ * from files) never produces them, and a source without the folders is not an error.
+ *
+ * Sizes are measured, not assumed: clinic-logo is 44 KB over 2 files and profile-image
+ * 556 KB over 5 — together 0.08% of the 736 MB page archive, so pulling them costs nothing.
+ */
+export const STAGED_ONLY_FIELDS = ["images", "logo", "profiles"] as const;
 
 export type StagedOnlyField = (typeof STAGED_ONLY_FIELDS)[number];
 
@@ -196,6 +209,17 @@ export interface JobView {
     seconds?: string;
     uploads?: string;
     log?: string;
+    /**
+     * The clinic logo and patient profile photos that rode along, when the session had them.
+     * Counted separately from `filesSent` because those are medical-record images and these
+     * are not: adding them into one total would make the number that matters unverifiable.
+     */
+    logoFound?: boolean;
+    profilesSent?: number;
+    profilesCandidates?: number;
+    profilesSkipped?: number;
+    /** Set when the extras failed. The import itself still succeeded — see photo-run.ts. */
+    extrasError?: string;
   };
   /**
    * survey: the branch survey itself, carried in the job rather than written to a file.
@@ -293,6 +317,60 @@ export interface PulledImageInfo {
   bytes: number;
   /** The tar's member prefix, so a mismatch with what the CLI expects is visible. */
   member: string;
+}
+
+/**
+ * The two small trees pulled alongside the page archive: the clinic logo and the patients'
+ * profile photos. Reported separately from PulledImageInfo because either can be absent
+ * without the pull having failed — a source with no such folder is normal, and saying "0 KB"
+ * next to the archive that did arrive is how an operator sees which of the three came back.
+ */
+/**
+ * What became of the clinic logo on the way to the uploads host.
+ *
+ * `available` is carried even on success: the source folder holds more than one candidate (two
+ * were measured, 01.png and T-STAR-logo.png) and nothing in the V2 dump names which is the
+ * clinic's, so the choice is configuration. Printing what was in the archive is what lets an
+ * operator correct LEGACY_LOGO_FILE without going onto the source box to look.
+ */
+export interface ExtrasLogoResult {
+  wanted: string;
+  found: boolean;
+  bytes: number;
+  available: string[];
+}
+
+/**
+ * What became of the patient profile photos.
+ *
+ * Four numbers rather than one, because "sent 3 of 5" has two different causes that need
+ * different fixes: a file whose name is not an HN at all (bad export) and an HN with no patient
+ * row (that patient was not imported). Collapsing them would hide which one happened.
+ */
+export interface ExtrasProfilesResult {
+  candidates: number;
+  sent: number;
+  skippedNoPatient: number;
+  skippedBadName: number;
+  bytes: number;
+  skippedSample: string[];
+}
+
+/** The result of copying the two decorative trees. No database rows are written for either. */
+export interface ExtrasResult {
+  logo: ExtrasLogoResult | null;
+  profiles: ExtrasProfilesResult | null;
+  filesSent: number;
+  bytesSent: number;
+  log: string;
+}
+
+export interface PulledExtraInfo {
+  /** "logo" | "profiles" — the staged field it was written to. */
+  field: StagedOnlyField;
+  /** What was archived on the source, so a wrong LEGACY_* path is visible in the log. */
+  member: string;
+  bytes: number;
 }
 
 export interface PullErr {
@@ -655,6 +733,13 @@ export type PhotoImportResponse =
       bytesSent: number;
       seconds: string;
       log: string;
+      /**
+       * The clinic logo and the patient profile photos, nested exactly as the run produced
+       * them. The combined-import path flattens these into JobView.photo instead, because a
+       * job record is polled and kept small; this endpoint spreads the run result whole.
+       */
+      extras?: ExtrasResult | null;
+      extrasError?: string | null;
     })
   | (Partial<PhotoImportBase> & {
       ok: false;
