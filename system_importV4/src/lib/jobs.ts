@@ -5,6 +5,7 @@ import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { stagingRoot } from "./upload-staging";
+import type { PullDone } from "./types";
 
 /**
  * Long-running work, tracked so the browser can poll instead of holding a request open.
@@ -22,7 +23,7 @@ import { stagingRoot } from "./upload-staging";
  * child process died with it.
  */
 
-export type JobKind = "generate" | "import" | "survey";
+export type JobKind = "generate" | "import" | "survey" | "pull";
 export type JobState = "running" | "done" | "failed";
 
 interface Job {
@@ -101,6 +102,17 @@ interface Job {
   survey?: unknown;
   sqlBytesIn?: number;
   mongoBytesIn?: number;
+
+  // pull
+  //
+  // The pull became a job on 22 Sep 2026 for the reason this whole file exists: a 15 GB image
+  // archive takes about 50 minutes at the rate measured against the real source, and a
+  // proxied request dies at 100 seconds. Before this, the transfer kept running with nobody
+  // able to watch it, and the sessionId naming the files it had written was lost with the
+  // closed response — the files were on disk and unusable without going onto the box by hand.
+  pull?: PullDone;
+  /** Bytes of the image archive written so far, so the UI can show movement. No total exists. */
+  pullBytes?: number;
 }
 
 /** What the browser is allowed to see. Never carries the script itself. */
@@ -124,6 +136,8 @@ export interface JobView {
   survey?: unknown;
   sqlBytesIn?: number;
   mongoBytesIn?: number;
+  pull?: PullDone;
+  pullBytes?: number;
 }
 
 /** Finished jobs (and their artifacts) are kept this long, then swept. */
@@ -160,6 +174,8 @@ export function jobView(j: Job): JobView {
     survey: j.survey,
     sqlBytesIn: j.sqlBytesIn,
     mongoBytesIn: j.mongoBytesIn,
+    pull: j.pull,
+    pullBytes: j.pullBytes,
   };
 }
 
@@ -192,6 +208,10 @@ export interface JobHandle {
   setPhotoResult(r: NonNullable<Job["photo"]>): void;
   /** survey only: the parsed branch survey plus the sizes it was read from. */
   setSurveyResult(r: { survey: unknown; sqlBytes: number; mongoBytes: number }): void;
+  /** pull only: what landed in staging. Set once, when the pull has finished. */
+  setPullResult(r: PullDone): void;
+  /** pull only: bytes of the image archive written so far. Called while it grows. */
+  setPullBytes(n: number): void;
 }
 
 /**
@@ -251,6 +271,12 @@ export async function startJob(
       job.survey = r.survey;
       job.sqlBytesIn = r.sqlBytes;
       job.mongoBytesIn = r.mongoBytes;
+    },
+    setPullResult: (r) => {
+      job.pull = r;
+    },
+    setPullBytes: (n) => {
+      job.pullBytes = n;
     },
   };
 

@@ -1226,18 +1226,20 @@ export default function GenerateForm() {
       return;
     }
     setPulling(true);
-    // percent stays null for the whole pull: the server answers once, at the end, so there is
-    // no measured progress to show and a bar sitting at 0 would read as stuck. The phase text
-    // carries the information instead.
+    // percent stays null the whole way: the source streams a tar and never says how big it will
+    // be, so there is no total to divide by and a bar would be making one up. What moves instead
+    // is the phase text and the byte count the job reports as the file grows.
     setBusyState({
       title: "ดึงข้อมูลจากเซิร์ฟเวอร์ระบบเก่า",
       phase:
-        useVpn === "vpn"
-          ? "กำลังเปิด VPN แล้วดึง MySQL + MongoDB + ไฟล์รูป"
-          : "กำลังดึง MySQL + MongoDB + ไฟล์รูป",
+        (useVpn === "vpn" ? "กำลังเปิด VPN แล้วดึง " : "กำลังดึง ") +
+        (withImages ? "MySQL + MongoDB + ไฟล์รูป" : "MySQL + MongoDB (ไม่เอาไฟล์รูป)"),
       percent: null,
       startedAt: Date.now(),
-      note: "ไฟล์รูปหลายร้อย MB โอนอยู่เบื้องหลัง — ห้ามปิดแท็บหรือกดรีเฟรช",
+      // Honest about what closing the tab does: the job keeps running on the server, but nobody
+      // is left to receive the session id, and files that cannot be addressed are files nobody
+      // can import. That is exactly what happened on 22 Sep with 6 GB already on disk.
+      note: "งานทำอยู่บนเซิร์ฟเวอร์ · ปิดแท็บแล้วงานไม่หยุด แต่จะไม่มีใครรับผลไฟล์ที่ดึงมา — เปิดหน้านี้ไว้จนจบ",
     });
     try {
       // The tunnel goes up BEFORE the pull and only when asked for, and a failure to bring
@@ -1268,28 +1270,64 @@ export default function GenerateForm() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ host: host.trim(), withImages }),
       });
-      const json = (await res.json()) as PullResponse;
-      if (!json.ok) {
-        setPullErr(json.error);
+      const started = (await res.json()) as PullResponse;
+      if (!started.ok) {
+        setPullErr(started.error);
         return;
       }
-      // The dumps are NOT turned into Files any more. They are already on the server, in the
-      // session named here, so there is nothing to hold and nothing to upload back.
+
+      // FROM HERE THE WORK IS A JOB (22 Sep 2026).
+      //
+      // The pull used to be one long request, and that could not work: Cloudflare closes a
+      // proxied request at 100 seconds while a 15 GB image archive takes about 50 minutes at the
+      // 4.5 MB/s measured against the real source. The browser was handed the proxy's HTML error
+      // page, this modal closed, and the transfer went on running with nobody able to watch it —
+      // and when it finished, the sessionId naming 15 GB of correctly pulled files went nowhere.
+      //
+      // Polling costs a few bytes per tick, so the ceiling simply stops applying.
+      const job = await waitForJob(started.jobId, (j) => {
+        setBusyState((s) =>
+          s
+            ? {
+                ...s,
+                phase: j.phase,
+                // Bytes so far, NOT a percentage: the source streams a tar and never says how
+                // big it will be. percent stays null so nothing pretends to know the total.
+                detail: j.pullBytes ? `ไฟล์รูปบนเซิร์ฟเวอร์แล้ว ${human(j.pullBytes)}` : undefined,
+              }
+            : s,
+        );
+        // The log grows while the job runs (which sweep removed what, which dump arrived), and
+        // it is the only place a warning shows up before the job ends.
+        if (j.log.length > 0) setPullLog(j.log);
+      });
+
+      const p = job.pull;
+      if (!p) {
+        // Should not happen: the job only reaches "done" after setPullResult. Said out loud
+        // rather than crashing on a missing field, because the files may well be on disk.
+        setPullErr("งานดึงข้อมูลจบแล้วแต่ไม่มีผลลัพธ์กลับมา — ดู log ด้านล่าง");
+        setPullLog(job.log);
+        return;
+      }
+
+      // The dumps are NOT turned into Files. They are already on the server, in the session
+      // named here, so there is nothing to hold and nothing to upload back.
       //
       // Any File left in a slot from an earlier manual attach is cleared, because leaving it
       // would mean two candidate sources for the same input and no rule saying which wins.
-      setPulledSession(json.sessionId);
-      setPulledDumps(json.files);
+      setPulledSession(p.sessionId);
+      setPulledDumps(p.files);
       setFiles((prev) => {
         const next = { ...prev };
-        for (const f of json.files) delete next[f.field];
+        for (const f of p.files) delete next[f.field];
         return next;
       });
       setSessionId("");
-      setPulledFields((prev) => Array.from(new Set([...prev, ...json.files.map((f) => f.field)])));
-      setPulledFrom(json.host);
-      setPullLog(json.log);
-      setPullWarnings(json.warnings);
+      setPulledFields((prev) => Array.from(new Set([...prev, ...p.files.map((f) => f.field)])));
+      setPulledFrom(p.host);
+      setPullLog([...job.log, ...p.log]);
+      setPullWarnings(p.warnings);
       // A fresh source invalidates the artifact built from the previous one.
       setResult(null);
 
@@ -1299,41 +1337,43 @@ export default function GenerateForm() {
       // session it landed in. A failure left `images` null and put the reason in `warnings`,
       // so the two dumps survive it.
       setPulledImages(
-        json.images
+        p.images
           ? {
-              sessionId: json.images.sessionId,
-              name: json.images.name,
-              bytes: json.images.bytes,
+              sessionId: p.images.sessionId,
+              name: p.images.name,
+              bytes: p.images.bytes,
             }
           : null,
       );
-      // The logo and the profile photos came in the same answer and live in the same session.
-      // An empty array is a normal result — not every V2 box has those folders — so it must not
-      // be treated as a failed pull. Anything that went wrong per tree is already in `warnings`.
-      setPulledExtras(json.extras ?? []);
+      // The logo and the profile photos live in the same session. An empty array is a normal
+      // result — not every V2 box has those folders — so it must not be treated as a failed
+      // pull. Anything that went wrong per tree is already in `warnings`.
+      setPulledExtras(p.extras ?? []);
 
       // No link: this put files on THIS server, not into a clinic database.
       setDoneState({
         title: "ดึงข้อมูลจากเซิร์ฟเวอร์สำเร็จ",
         lines: [
-          `ต้นทาง ${json.host}`,
-          ...json.files.map((f) => `${f.name} · ${human(f.bytes)}`),
-          ...(json.images ? [`${json.images.name} · ${human(json.images.bytes)}`] : []),
-          ...(json.extras ?? []).map(
+          `ต้นทาง ${p.host}`,
+          ...p.files.map((f) => `${f.name} · ${human(f.bytes)}`),
+          ...(p.images ? [`${p.images.name} · ${human(p.images.bytes)}`] : []),
+          ...(p.extras ?? []).map(
             (x) => `${x.field === "logo" ? "โลโก้คลินิก" : "รูปโปรไฟล์คนไข้"} · ${human(x.bytes)}`,
           ),
-          ...(json.warnings.length > 0 ? [`มีคำเตือน ${json.warnings.length} ข้อ — ดูด้านล่าง`] : []),
+          ...(p.warnings.length > 0 ? [`มีคำเตือน ${p.warnings.length} ข้อ — ดูด้านล่าง`] : []),
+          `ใช้เวลา ${job.seconds} วินาที`,
           "ไฟล์อยู่บนเซิร์ฟเวอร์แล้ว ไม่ต้องแนบเอง — ขั้นต่อไปคือสร้างสคริปต์",
         ],
       });
     } catch (e) {
-      // A request that runs past the proxy's 100-second ceiling lands here as a network
-      // error, and the archive may in fact have arrived. Say so, because the alternative is
-      // an operator concluding the source is unreachable when the transfer was simply long.
+      // NOT a proxy timeout any more — every request in this path is short. What lands here is a
+      // real failure: the source refused, the transfer broke, or the service restarted while the
+      // job was running (the job store is process memory, so a restart takes in-flight jobs with
+      // it). The old advice, "press pull data again to fetch the whole lot", was written for the
+      // timeout case and would cost another 15 GB for nothing.
       const msg = e instanceof Error ? e.message : String(e);
       setPullErr(
-        `${msg}\n\nถ้าไฟล์รูปใหญ่มาก การเชื่อมต่ออาจถูกตัดที่ 100 วินาทีทั้งที่ฝั่งเซิร์ฟเวอร์โอนเสร็จแล้ว — ` +
-          "กด pull data อีกครั้งได้ (ดึงใหม่ทั้งชุด) หรือแนบไฟล์รูปเองแล้วทำต่อ",
+        `${msg}\n\nไฟล์ที่ดึงมาได้แล้วยังอยู่บนเซิร์ฟเวอร์ · ถ้าดึงใหม่ ระบบจะเก็บกวาดเซสชันที่ค้างให้เองก่อนเริ่ม`,
       );
     } finally {
       setPulling(false);

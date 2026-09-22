@@ -169,7 +169,7 @@ export type ImportGroup = (typeof IMPORT_GROUPS)[number]["group"];
  */
 export interface JobView {
   id: string;
-  kind: "generate" | "import" | "survey";
+  kind: "generate" | "import" | "survey" | "pull";
   state: "running" | "done" | "failed";
   /** What the server is doing right now, in words. */
   phase: string;
@@ -228,6 +228,20 @@ export interface JobView {
   survey?: BranchSurvey;
   sqlBytesIn?: number;
   mongoBytesIn?: number;
+  /**
+   * pull: what the finished pull produced — the staging session and what landed in it.
+   * Present only when the job has finished successfully.
+   */
+  pull?: PullDone;
+  /**
+   * pull: bytes of the image archive on disk SO FAR, read from the file while it grows.
+   *
+   * There is no total to divide it by — the source streams a tar and never says how big it
+   * will be — so this is a count, not a percentage. It exists because the alternative during
+   * a 50-minute transfer is a modal that says the same sentence for an hour, which is
+   * indistinguishable from being stuck.
+   */
+  pullBytes?: number;
 }
 
 export interface JobStartResponse {
@@ -299,8 +313,27 @@ export interface PulledFileInfo {
    */
 }
 
+/**
+ * PullOk is the reply to STARTING a pull, not its result.
+ *
+ * The pull became a job on 22 Sep 2026. It used to answer once, at the end, which could not
+ * work: Cloudflare closes a proxied request after 100 seconds and a 15 GB image archive takes
+ * 50 minutes at the measured 4.5 MB/s. The browser was handed the proxy's HTML error page
+ * ("Unexpected token '<'"), the progress modal closed, and the transfer went on running with
+ * nobody able to see it — and when it finished, the sessionId that names the files went
+ * nowhere, so the only way to use them was to go onto the box by hand.
+ *
+ * Now every request is short and the browser polls /api/job, exactly as the generate, import
+ * and survey steps already did. The result arrives as JobView.pull.
+ */
 export interface PullOk {
   ok: true;
+  /** Poll /api/job?jobId=… with this. The result is JobView.pull when it finishes. */
+  jobId: string;
+}
+
+/** Everything a finished pull produced. Carried on the job, never in the POST reply. */
+export interface PullDone {
   host: string;
   /** SHA256 host key fingerprint of the box that answered. */
   fingerprint: string;
