@@ -246,6 +246,18 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	// Nothing to do to the identity sequence any more: V4 issues every users.id, so it
 	// advances by itself. See the note where usersSequenceFix used to live.
 
+	// Running-number counters, last thing before the final COMMIT.
+	//
+	// Here and not next to the catalog batch for two reasons: it reads catalog_item back
+	// with max(), so every catalog row of this run must already be in the transaction; and
+	// it belongs to whichever transaction is still open, which has app.clinic_code set like
+	// all the others. Emitted only when this run actually wrote a catalogue — a money-only
+	// or patients-only run has no codes to advance past. See sequences.go.
+	if strings.TrimSpace(batches[EntCatalogService]) != "" ||
+		strings.TrimSpace(batches[EntCatalogCourse]) != "" {
+		b.WriteString(buildSequenceBump(in.ClinicCode))
+	}
+
 	b.WriteString("COMMIT;\n")
 	script = b.String()
 
