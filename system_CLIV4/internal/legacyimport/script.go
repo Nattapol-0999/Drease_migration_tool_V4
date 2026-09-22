@@ -258,6 +258,17 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		b.WriteString(buildSequenceBump(in.ClinicCode))
 	}
 
+	// catalog_item.sku for the rows this run wrote. Same placement and the same two
+	// reasons as the bump above, with one difference in the condition: a drug-only run
+	// writes catalog_item rows too, so EntCatalogDrug has to open the gate as well.
+	// (It is absent from the bump's condition on purpose — imported stock keeps its V2
+	// ST code and mints no CS/LH number.) See catalogsku.go.
+	if strings.TrimSpace(batches[EntCatalogService]) != "" ||
+		strings.TrimSpace(batches[EntCatalogCourse]) != "" ||
+		strings.TrimSpace(batches[EntCatalogDrug]) != "" {
+		b.WriteString(buildCatalogSKUIssue(in.ClinicCode))
+	}
+
 	b.WriteString("COMMIT;\n")
 	script = b.String()
 
