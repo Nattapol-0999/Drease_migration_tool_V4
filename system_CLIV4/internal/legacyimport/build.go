@@ -106,6 +106,33 @@ type Input struct {
 	// re-inserts rows that are already there. See applyDocNoBranchMarker in money.go.
 	DocNoBranchMarker string
 
+	/*
+		StockItemType decides what the stock collection becomes in the catalogue: "drug" or
+		"goods". Empty means "drug", which is what every import before 22 Sep 2026 did, so an
+		existing command line behaves exactly as it always has.
+
+		WHY IT IS A CHOICE AND NOT A RULE
+
+		V2 has one stock list. V4 has two kinds of sellable stock and they are not interchangeable
+		at the till: nonSellableCatalogCodes (billing/helpers.go) refuses an item_type='drug' row
+		whose five legal label fields are not all filled in, and a V2 export carries none of them —
+		measured, 0 of 1,901 items rows have generic_name_th, strength, dosage_form, indication or
+		warning. So importing the whole list as 'drug' produces a clinic that cannot sell anything
+		out of its own stock room, which is what happened to the-gloss: 365 SKUs with stock on hand
+		and 0 sellable, repaired afterwards by hand with scripts 16 and 17 that moved 331 of them
+		to 'goods'.
+
+		What it is NOT is a way to decide what counts as a medicine. That question belongs to the
+		clinic and its pharmacist, and the answer differs per row: the same list holds Botox and
+		Restylane next to cotton wool, cannulas and cleansing milk. This flag only lets the person
+		running the import say which default is less wrong for the clinic in front of them, and
+		'drug' stays the default precisely so nobody gets a sellable Botox by accident.
+
+		Whichever is chosen, stock behaves identically — both types draw from the same lots
+		through the same code. The difference is the label gate at checkout, and nothing else.
+	*/
+	StockItemType string
+
 	// PageDump is the mongo export of `mris.page` — the patient record pages and the
 	// images attached to them. It is a SEPARATE flag from MongoDump because it is a
 	// different database (mris, not the catalog one) and because it is the only input
@@ -160,6 +187,24 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 		rep.notef("เลขที่เอกสารจากระบบเก่าถูกแทรกเลขสาขา %q เป็นตัวที่ 3 (YY0NNNNNN → YY%sNNNNNN · CYY0NNNNNN → CYY%sNNNNNN) — เพราะแต่ละสาขาของระบบเก่าออกเลขชุดเดียวกัน แต่ V4 ใช้เลขร่วมกันทั้งคลินิก · เลขที่ไม่ใช่รูปแบบเดิมจะไม่ถูกแตะ",
 			DocNoBranchMarker, DocNoBranchMarker, DocNoBranchMarker)
+	}
+
+	// Validated here, next to the other per-run choice, and BEFORE any group runs: a typo has
+	// to stop the run rather than quietly produce a catalogue of the wrong kind. Rejecting an
+	// unknown value is the whole point — silently falling back to 'drug' would hand somebody a
+	// clinic that cannot sell its stock and no reason why.
+	switch strings.TrimSpace(in.StockItemType) {
+	case "", "drug":
+		in.StockItemType = "drug"
+	case "goods":
+		// Said as a WARNING, not a note. It changes what the till will accept for every SKU in
+		// the stock room, and the operator has to be able to see that they asked for it.
+		rep.warnf("รหัสสต็อกทั้งหมดถูกนำเข้าเป็น goods (สินค้า) ไม่ใช่ drug (ยา) ตามที่สั่งด้วย " +
+			"-stock-item-type=goods — ขายได้ทันทีโดยไม่ต้องกรอกฉลากยา 5 ช่อง · " +
+			"ถ้าในคลังมียาจริง ต้องเลื่อนรายการนั้นขึ้นเป็น drug แล้วกรอกฉลากก่อนจ่ายยา")
+	default:
+		return nil, nil, money, fmt.Errorf(
+			"-stock-item-type ต้องเป็น drug หรือ goods (ได้รับ %q)", in.StockItemType)
 	}
 
 	// An empty selection means everything, which is what an operator who passes no -only

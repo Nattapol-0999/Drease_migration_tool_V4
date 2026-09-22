@@ -66,6 +66,12 @@ func main() {
 		docNoMarker = flag.String("doc-no-branch-marker", "",
 			"เลขหลักเดียว 1-9 แทรกเป็นตัวที่ 3 ของเลขที่เอกสารเดิม (670017358 → 672017358 · C670017358 → C672017358) — ใช้เมื่อนำเข้าหลายสาขาที่ระบบเก่าออกเลขชุดเดียวกัน (เว้นว่าง = ใช้เลขเดิม)")
 
+		// V2 keeps one stock list; V4 has two kinds of stock and treats them differently at
+		// the till. Default stays 'drug' so no existing command line changes meaning — see
+		// Input.StockItemType for the measured reason this had to become an option.
+		stockItemType = flag.String("stock-item-type", "drug",
+			"ประเภทของรหัสในคลัง: drug (ยา ต้องมีฉลาก 5 ช่องก่อนขาย) หรือ goods (สินค้า ขายได้ทันที) — ดัมพ์ V2 ไม่มีข้อมูลฉลากเลย ถ้าคลังไม่ใช่ยาจริงให้ใช้ goods")
+
 		// Read-only mode. Writes nothing and needs no -clinic, because it answers the
 		// question that comes BEFORE a clinic exists: how many branches does this tenant
 		// have, do they belong to one company, and what would splitting them cost.
@@ -119,6 +125,7 @@ func main() {
 		BranchMap:         parsedBranchMap,
 		DefaultBranch:     strings.TrimSpace(*defaultBranch),
 		DocNoBranchMarker: strings.TrimSpace(*docNoMarker),
+		StockItemType:     strings.TrimSpace(*stockItemType),
 		UsersDump:         mustRead("users", *users),
 		DoctorDump:        mustRead("doctor", *doctor),
 		RoomDump:          mustRead("room", *room),

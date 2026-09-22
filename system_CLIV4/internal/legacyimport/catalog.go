@@ -455,6 +455,13 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 		return "", "", "", "", oerr
 	}
 
+	// One value for the whole stock collection, resolved by BuildAll (which also rejects an
+	// unknown one), so every row below agrees and the report can name it once.
+	stockType := in.StockItemType
+	if stockType == "" {
+		stockType = "drug"
+	}
+
 	var sItems, sCatalog, sSlot, sMove sqlBuilder
 	firstSeen := map[string]bool{}
 	noBranch, draft := 0, 0
@@ -572,8 +579,12 @@ UPDATE items SET
 				moneyLit(cost), moneyLit(price),
 				lit(in.ClinicCode), lit(code))
 
-			// Every SKU needs a catalog_item or it cannot be sold at all. item_type is
-			// 'drug' for the whole collection (locked decision).
+			// Every SKU needs a catalog_item or it cannot be sold at all. The whole collection
+			// gets ONE item_type, chosen per run through -stock-item-type and defaulting to
+			// 'drug' — see Input.StockItemType for why it is a choice and not a rule. It is
+			// one value for the whole list because the export offers nothing trustworthy to
+			// split it on: V2's own category calls a cannula ยา, and 258 of 645 codes at one
+			// clinic disagree with themselves across rows.
 			//
 			// STATUS FOLLOWS items.active, AND NOTHING ELSE — settled with the clinic owner
 			// on 15 Sep 2026, replacing catalogStatus("drug", price, false).
@@ -600,8 +611,8 @@ UPDATE items SET
 				status = statusDraft
 				draft++
 			}
-			sCatalog.comment("%s · %s → drug", code, oneLine(name))
-			sCatalog.addf("%s", upsertCatalogItem(in.ClinicCode, code, "drug", nameLit, "",
+			sCatalog.comment("%s · %s → %s", code, oneLine(name), stockType)
+			sCatalog.addf("%s", upsertCatalogItem(in.ClinicCode, code, stockType, nameLit, "",
 				category, price, cost, status, "items",
 				// NO `AND active` HERE. That one word cost two tenants their provenance.
 				//
