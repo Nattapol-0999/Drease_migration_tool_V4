@@ -66,7 +66,7 @@ func TestDrugStatusFollowsItemsActiveNotPrice(t *testing.T) {
 	in := Input{ClinicCode: "CTEST01", BranchMap: map[string]string{"01": "BR00001"}}
 	rep := NewReport(in.ClinicCode)
 
-	_, drugSQL, _, err := buildItems(mc, in, rep)
+	_, drugSQL, _, _, err := buildItems(mc, in, rep)
 	if err != nil {
 		t.Fatalf("buildItems: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestDrugStatusIgnoresTheLabelFieldsEntirely(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	in := Input{ClinicCode: "CTEST01", BranchMap: map[string]string{"01": "BR00001"}}
-	itemsSQL, drugSQL, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
+	itemsSQL, drugSQL, _, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
 	if err != nil {
 		t.Fatalf("buildItems: %v", err)
 	}

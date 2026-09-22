@@ -8,11 +8,20 @@ package legacyimport
 // list_medicien entry carries heal_id, the treatment the drug is consumed under, right beside
 // medicien_id, the drug itself.
 //
-// What the app does with them, and why the table matters: ListCourseMedications
-// (query/course_lines.sql) reads catalog_course_line WHERE line_kind IN ('supply','medication')
-// and joins catalog_item on item_type IN ('drug','goods') and status IN (1,2). The importer
-// writes every `items` document as item_type='drug' with status 1 or 2 (catalogStatus), so a
-// row written here is a row that screen can see.
+// What the app does with them, and why BOTH tables matter:
+//
+//   - the EDITOR reads catalog_course_line. ListCourseMedications (query/course_lines.sql)
+//     selects WHERE line_kind IN ('supply','medication') and joins catalog_item on
+//     item_type IN ('drug','goods') and status IN (1,2). The importer writes every `items`
+//     document as item_type='drug' with status 1 or 2 (catalogStatus), so a row written
+//     there is a row that screen can see — and it is the only table that records WHICH
+//     service the drug is consumed under.
+//   - the SALE reads catalog_item_child. ListCourseCatalogCompositionForPurchase
+//     (query/course_bought.sql) joins it ON relation_kind='composition' and never touches
+//     catalog_course_line; billing/service.go then maps a 'drug'/'goods' child to
+//     kind='medication' when it writes course_bought_items.
+//
+// So a drug line needs a row in each, for two different reasons.
 
 import (
 	"strings"
@@ -101,16 +110,82 @@ func TestCourseMedicationIsIdempotent(t *testing.T) {
 	}
 }
 
-// A drug used under a service is NOT a direct child of the course. catalog_item_child is the
-// flattened projection whose parent→child edge cannot express "consumed under service X", and
-// the screen that lists a course's drugs (ListCourseMedications) reads catalog_course_line
-// instead. Pinned so that adding a child row later is a decision, not an accident.
-func TestCourseMedicationWritesNoChildEdge(t *testing.T) {
+// A drug in a course gets a catalog_item_child edge too — the decision this file used to
+// pin the other way (owner, 22 Sep 2026).
+//
+// The old test asserted exactly one child row, "the service only, not the drug", and its
+// reasoning was about the course EDITOR: the edge is flat, it cannot say "consumed under
+// service X", and ListCourseMedications reads catalog_course_line. All still true.
+//
+// What it missed is the SALE. billing/service.go calls
+// ListCourseCatalogCompositionForPurchase, which joins catalog_item_child ON
+// relation_kind='composition' and never looks at catalog_course_line, then maps a child of
+// item_type 'drug'/'goods' to kind='medication' for course_bought_items. So with no child
+// row the customer pays, gets the treatments, and gets none of the drugs — and a course
+// whose only contents are drugs fails the entire payment on len(children)==0.
+func TestCourseMedicationAlsoWritesChildEdge(t *testing.T) {
 	_, lineSQL, _ := buildCoursesOne(t, courseMedSample)
-	if got := strings.Count(lineSQL, "INSERT INTO catalog_item_child"); got != 1 {
-		t.Errorf("catalog_item_child inserts = %d, want 1 (the service only, not the drug)\n%s",
+	if got := strings.Count(lineSQL, "INSERT INTO catalog_item_child"); got != 2 {
+		t.Fatalf("catalog_item_child inserts = %d, want 2 (the service AND the drug)\n%s",
 			got, lineSQL)
 	}
+
+	// The drug's own edge, found by the drug's code rather than by position.
+	edge := childEdgeFor(t, lineSQL, "'IT001'")
+	if !strings.Contains(edge, "'composition'") {
+		t.Errorf("the drug edge is not relation_kind='composition' — the sale-time query "+
+			"filters on it, so any other value is invisible to billing\n%s", edge)
+	}
+	// qty_use 2 must survive into the projection as well, or the two tables disagree about
+	// how much of the drug the course contains.
+	if !strings.Contains(edge, ", 2, 1000, 'composition', now()") {
+		t.Errorf("the drug edge does not carry qty 2 from qty_use\n%s", edge)
+	}
+	// catalog_item_child_self_chk refuses parent = child, and a 23514 here aborts the whole
+	// import — so the statement has to rule it out itself.
+	if !strings.Contains(edge, "<>") {
+		t.Errorf("the drug edge has no parent<>child guard; catalog_item_child_self_chk "+
+			"would abort the entire import on a code collision\n%s", edge)
+	}
+	// Re-running must not double a course's drugs.
+	if !strings.Contains(edge, "NOT EXISTS") {
+		t.Errorf("the drug edge has no re-run guard\n%s", edge)
+	}
+}
+
+// The count is reported: a drug that reaches catalog_course_line but not catalog_item_child
+// is paid for and never granted, which is invisible on every screen.
+func TestCourseMedicationChildEdgeIsReported(t *testing.T) {
+	_, _, rep := buildCoursesOne(t, courseMedSample)
+	var found string
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "catalog_item_child") && strings.Contains(n, "ยาในคอร์ส") {
+			found = n
+		}
+	}
+	if found == "" {
+		t.Fatalf("no note about the drug's catalog_item_child edge; notes = %v", rep.Notes)
+	}
+	if !strings.Contains(found, "1 แถว") {
+		t.Errorf("the note should count the 1 edge written: %q", found)
+	}
+}
+
+// childEdgeFor returns the catalog_item_child statement whose child lookup names code.
+// Matching inside one statement matters: the file holds two and a whole-file substring
+// search would pass on the service's.
+func childEdgeFor(t *testing.T, lineSQL, code string) string {
+	t.Helper()
+	for _, stmt := range strings.Split(lineSQL, ";") {
+		if !strings.Contains(stmt, "INSERT INTO catalog_item_child") {
+			continue
+		}
+		if strings.Contains(stmt, code) {
+			return stmt
+		}
+	}
+	t.Fatalf("no catalog_item_child statement mentions %s in:\n%s", code, lineSQL)
+	return ""
 }
 
 // Every reason a drug line is skipped has to be counted, or a course quietly loses contents.

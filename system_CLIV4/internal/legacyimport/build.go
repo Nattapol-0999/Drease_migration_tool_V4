@@ -370,7 +370,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		// collection, so catalog and stock cannot be built independently of each other.
 		// Whichever was asked for is kept; the other is dropped rather than re-parsed.
 		if needCatalog || needStock {
-			itemsSQL, drugSQL, slotSQL, ierr := buildItems(mc, in, rep)
+			itemsSQL, drugSQL, slotSQL, moveSQL, ierr := buildItems(mc, in, rep)
 			if ierr != nil {
 				return nil, nil, money, ierr
 			}
@@ -378,7 +378,11 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 				out[EntItems], out[EntCatalogDrug] = itemsSQL, drugSQL
 			}
 			if needStock {
+				// The lots and their receive ledger travel together: V4 never opens a lot
+				// without a stock_movement row, so splitting them would produce inventory
+				// with no arrival history — see buildItems.
 				out[EntSlotStock] = slotSQL
+				out[EntStockMovement] = moveSQL
 			}
 		}
 

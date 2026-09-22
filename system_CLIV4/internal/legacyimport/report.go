@@ -66,7 +66,10 @@ var entityGroups = map[string][]string{
 		EntCatalogCategory, EntCatalogService, EntItems, EntCatalogDrug,
 		EntCatalogCourse, EntCatalogCourseLine,
 	},
-	"stock": {EntSlotStock},
+	// stock is the lots AND their receive ledger, together for the same reason money is
+	// indivisible: V4 opens no lot without a stock_movement row, so importing one without
+	// the other yields inventory that never arrived.
+	"stock": {EntSlotStock, EntStockMovement},
 	// money is all-or-nothing for a reason no other group has: an invoice without its
 	// items is a bill for nothing, and a receipt without its payment channels is money
 	// with no source. Splitting it would produce financial documents that contradict

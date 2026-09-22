@@ -47,16 +47,25 @@ func tickedSeven() map[string]string {
 
 func buildLots(t *testing.T, in Input) (string, *Report) {
 	t.Helper()
+	slotSQL, _, rep := buildLotsAndMoves(t, in)
+	return slotSQL, rep
+}
+
+// buildLotsAndMoves also hands back the receive ledger, which is written from the same
+// pass over the same documents — so "every lot got a movement" can only be asserted from
+// one build, not from two.
+func buildLotsAndMoves(t *testing.T, in Input) (slotSQL, moveSQL string, rep *Report) {
+	t.Helper()
 	mc, err := parseMongoCatalog(in.MongoDump)
 	if err != nil {
 		t.Fatalf("parse mongo: %v", err)
 	}
-	rep := NewReport(in.ClinicCode)
-	_, _, slotSQL, err := buildItems(mc, in, rep)
+	rep = NewReport(in.ClinicCode)
+	_, _, slotSQL, moveSQL, err = buildItems(mc, in, rep)
 	if err != nil {
 		t.Fatalf("buildItems: %v", err)
 	}
-	return slotSQL, rep
+	return slotSQL, moveSQL, rep
 }
 
 func TestLotGoesToItsOwnBranchWhenThatBranchWasCreated(t *testing.T) {

@@ -337,9 +337,13 @@ func checkUserMapIsCreatedBeforeUse(script string) error {
 // the planner how big the table has become. That is why it is safe to emit
 // unconditionally rather than making the operator pass a flag.
 //
-// Only tables that a later phase RESOLVES are listed. slot_stock, clinic_user and
-// clinic_staff are written from literals and never looked up again, so analysing them
-// would cost time and buy nothing.
+// Only tables that a later phase RESOLVES are listed. clinic_user and clinic_staff are
+// written from literals and never looked up again, so analysing them would cost time and
+// buy nothing.
+//
+// slot_stock used to be in that sentence and no longer is: the stock_movement phase now
+// resolves every lot's id from slot_stock.mongo_id, one lookup per lot, immediately after
+// the inserts that created them.
 var analyzeTargets = map[string][]string{
 	EntUsers:   {"users"},   // clinic_user / clinic_staff resolve the account by id
 	EntRoom:    {"room"},    // validate_appointment_assignment reads it per appointment
@@ -348,6 +352,7 @@ var analyzeTargets = map[string][]string{
 	EntCatalogService: {"catalog_item"}, // catalog_course_line + invoice_item resolve by code
 	EntItems:          {"items"},        // catalog_item(drug) resolves items.id by code
 	EntCatalogDrug:    {"catalog_item"},
+	EntSlotStock:      {"slot_stock"}, // stock_movement resolves each lot by mongo_id
 	EntCatalogCourse:  {"catalog_item"},
 
 	EntInvoice:      {"invoice"},       // invoice_item, receipt, settle and course_bought all resolve it

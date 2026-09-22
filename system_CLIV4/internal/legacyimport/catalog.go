@@ -37,6 +37,7 @@ const (
 	EntItems             = "items"
 	EntCatalogDrug       = "catalog_item(drug)"
 	EntSlotStock         = "slot_stock"
+	EntStockMovement     = "stock_movement"
 	EntCatalogService    = "catalog_item(service)"
 	EntCatalogCourse     = "catalog_item(course)"
 	EntCatalogCourseLine = "catalog_course_line"
@@ -49,6 +50,8 @@ var catalogOrder = []string{
 	EntItems,
 	EntCatalogDrug,
 	EntSlotStock,
+	// After the lots, because it resolves each lot's id from slot_stock.mongo_id.
+	EntStockMovement,
 	EntCatalogCourse,
 	EntCatalogCourseLine,
 	// Last on purpose: it reads back the ids of the catalog_item rows everything above wrote.
@@ -194,12 +197,38 @@ func docObjectID(d mongodump.Doc, path string) string {
 
 // buildCatalogCategory writes the category master. Idempotent on the unique index
 // (clinic_code, lower(trim(name))) WHERE status = 1.
+//
+// # TWO SOURCES, ONE SPINE
+//
+// The export splits categories across two collections: `category` names the ones a
+// SERVICE carries, `item_types` names the ones a DRUG carries ("ยา" / "อุปกรณ์" /
+// "เวชภัณฑ์"). Only the first used to be written here, while buildItems went on passing
+// the item_types name to categoryIDByName — which is a subselect, and a subselect that
+// finds nothing is not an error. So every imported drug landed with category_id = NULL
+// and the catalogue screen had nothing to group them by, silently.
+//
+// V4 has no such split. catalog.ResolveCategoryID (internal/controller/catalog/sku.go)
+// takes whatever name the caller has, looks it up case/space-insensitively, and CREATES
+// the row when it is missing — for a drug from the stock page exactly as for a service.
+// One spine is the app's own shape, not a convenience adopted here.
+//
+// Dedupe is case/space-insensitive because the target index is on lower(btrim(name)):
+// "ยา" and "ยา " are one category there, so emitting both would waste a sort_order slot
+// and make which one wins depend on map iteration order.
 func buildCatalogCategory(mc *mongoCatalog, in Input, rep *Report) string {
-	names := make([]string, 0, len(mc.categoryName))
-	for _, n := range mc.categoryName {
-		names = append(names, n)
+	seen := map[string]bool{}
+	names := make([]string, 0, len(mc.categoryName)+len(mc.itemTypeName))
+	for _, src := range []map[string]string{mc.categoryName, mc.itemTypeName} {
+		for _, n := range src {
+			key := strings.ToLower(strings.TrimSpace(n))
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			names = append(names, n)
+		}
 	}
-	sort.Strings(names) // deterministic output
+	sort.Strings(names) // deterministic output — sort_order below is the index
 	if len(names) == 0 {
 		return ""
 	}
@@ -216,6 +245,13 @@ ON CONFLICT (clinic_code, lower(btrim(name))) WHERE status = 1 DO NOTHING;
 `, lit(in.ClinicCode), lit(nameLit), i)
 	}
 	e.Statements = s.stmts
+	if drugCats := distinctValues(mc.itemTypeName); len(drugCats) > 0 {
+		rep.notef("catalog_category: รวมหมวดของยา/เวชภัณฑ์จาก item_types เข้ากองเดียวกับหมวดบริการด้วย (%s) — "+
+			"ก่อนหน้านี้เขียนแค่หมวดบริการ ทำให้ catalog_item.category_id ของยาเป็น NULL ทุกแถวโดยไม่มี error "+
+			"(categoryIDByName เป็น subselect · หาไม่เจอ = NULL ไม่ใช่ข้อผิดพลาด) · V4 เองก็ใช้กองเดียว "+
+			"(catalog.ResolveCategoryID สร้างหมวดให้เมื่อยังไม่มี ไม่แยกว่าเป็นของยาหรือบริการ)",
+			strings.Join(drugCats, ", "))
+	}
 	return s.String()
 }
 
@@ -242,6 +278,25 @@ func catalogItemIDByCode(clinic, code string) string {
 //
 // sourceTable/sourceID tie a drug back to its `items` row the way the app's own
 // CreateSKU does; services and courses carry the default 'catalog'.
+//
+// WHY source_id IS IN THE DO UPDATE AND source_table / source_key ARE NOT
+//
+// source_id is repaired FILL-ONLY — COALESCE(existing, new) — because a row that already
+// resolved keeps the id it has, while a row left NULL by an earlier run gets one. That
+// NULL is not hypothetical: the subselect in buildItems used to carry `AND active`, so
+// every SKU switched off in V2 arrived with source_id NULL, and the trigger
+// catalog_capture_legacy_source_key (migration 0301) then took its `source_id IS NULL`
+// branch and set legacy_source_key NULL too. Both columns matter downstream — the
+// checkout safety check joins items ON i.id = ci.source_id and reads a missing join as
+// "not sellable", and a doctor-fee rule binds a bill line through legacy_source_key. The
+// old DO UPDATE touched neither, so re-running the import could not fix it either.
+//
+// Filling source_id is enough to fix both: the trigger fires on UPDATE as well, sees
+// source_table='items' with a non-NULL source_id, and copies items.source_key across.
+//
+// source_table stays out because changing it would re-point provenance at a different
+// table, and source_key stays out because re-minting the key of a row a fee rule already
+// points at is how that rule silently stops matching.
 func upsertCatalogItem(clinic, code, itemType, nameTh, nameEn, categoryName,
 	sellPrice, cost string, status int, sourceTable, sourceIDExpr, createdAt string) string {
 	if sourceTable == "" {
@@ -269,6 +324,7 @@ DO UPDATE SET item_type  = EXCLUDED.item_type,
               sell_price = EXCLUDED.sell_price,
               cost       = EXCLUDED.cost,
               status     = EXCLUDED.status,
+              source_id  = COALESCE(catalog_item.source_id, EXCLUDED.source_id),
               updated_at = now();
 
 `, lit(clinic), lit(code), lit(itemType), lit(nameTh), nullLit(nameEn),
@@ -378,15 +434,16 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 // One SKU can appear several times in the export, once per stock location, so the
 // collection is folded: the first document defines the SKU (items + catalog_item) and
 // EVERY document becomes a slot_stock lot keyed by its Mongo _id.
-func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, slotSQL string, err error) {
+func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, slotSQL, moveSQL string, err error) {
 	br := newBranchResolver(in)
 	defer br.report(rep, "slot_stock")
 	if len(mc.items) == 0 {
-		return "", "", "", nil
+		return "", "", "", "", nil
 	}
 	eItems := rep.entity(EntItems)
 	eCatalog := rep.entity(EntCatalogDrug)
 	eSlot := rep.entity(EntSlotStock)
+	eMove := rep.entity(EntStockMovement)
 	eItems.SourceRows = len(mc.items)
 	eSlot.SourceRows = len(mc.items)
 
@@ -395,21 +452,25 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 	// than silently make every lot look central.
 	stockOwner, oerr := stockOwners(in)
 	if oerr != nil {
-		return "", "", "", oerr
+		return "", "", "", "", oerr
 	}
 
-	var sItems, sCatalog, sSlot sqlBuilder
+	var sItems, sCatalog, sSlot, sMove sqlBuilder
 	firstSeen := map[string]bool{}
 	noBranch, draft := 0, 0
 	// mainStockLots counts lots in stocks no branch claims; untickedLots counts, per legacy
 	// branch, the lots dropped because that branch is not part of this clinic.
 	mainStockLots := 0
 	untickedLots := map[string]int{}
+	// movesWritten is the receive-ledger rows emitted beside the lots. Counted separately
+	// from the lots themselves so "lot written but no movement" is visible as a mismatch in
+	// the report rather than as an empty stock-in screen months later.
+	movesWritten := 0
 
 	for n, d := range mc.items {
 		code := d.Text("code")
 		if code == "" {
-			return "", "", "", fmt.Errorf("items doc %d: ไม่มี code (ใช้เป็นคีย์)", n+1)
+			return "", "", "", "", fmt.Errorf("items doc %d: ไม่มี code (ใช้เป็นคีย์)", n+1)
 		}
 		mongoID := docObjectID(d, "_id")
 		name := firstNonEmpty(joinName(d.Text("name1"), d.Text("name2")), code)
@@ -454,24 +515,62 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 			//
 			// The DO UPDATE deliberately leaves source_key out too — a re-import must not
 			// re-mint the key of a row a fee rule may already point at.
+			// WHY THIS IS NOT `ON CONFLICT ... DO UPDATE`
+			//
+			// It was, and that is how one tenant ended up with 1,256 junk rows.
+			// uniq_items_clinic_code is PARTIAL — `ON items (clinic_code, code) WHERE
+			// active` — so it is the only conflict target available, and an INACTIVE row
+			// never violates it. Every re-run therefore inserted another copy of every
+			// switched-off SKU. Measured at C2EC1E3: 645 real codes, 1,901 rows, 356 codes
+			// holding 4–6 rows each, all of them inactive, created on the day of the last
+			// re-run. Those duplicates are what makes `code` ambiguous for anything that
+			// resolves a SKU by code.
+			//
+			// NOT EXISTS + UPDATE covers both halves with no index to depend on: the row is
+			// created once and refreshed thereafter, whether V2 has it switched on or off.
+			// Both statements run in the catalog group's transaction, so there is no window
+			// between them.
+			//
+			// `active` and `source_key` are deliberately absent from the UPDATE. active is
+			// the clinic's own switch and catalog_item.status is derived from it — a re-import
+			// must not flip what somebody turned on in V4. source_key is the immutable
+			// identity a doctor-fee rule may already point at (see the note below).
+			// min_alert is written as 0, and it is written EXPLICITLY.
+			//
+			// The column defaults to 5 (migration 0068), but both of V4's own intake doors
+			// send 0: Stock.CreateItem passes whatever the form holds — 0 when untouched —
+			// and GuidedReceive hardcodes pgkit.Numeric(0). Leaving the default meant every
+			// imported SKU arrived with a reorder threshold of 5 that nobody chose, so the
+			// clinic's first look at its stock page showed low-stock warnings invented by a
+			// migration. The export says nothing about reorder levels; 0 claims nothing.
+			//
+			// It is deliberately absent from the UPDATE below, for the same reason `active`
+			// is: once a human has set a threshold in V4, a re-import must not reset it.
 			sItems.comment("%s · %s", code, oneLine(name))
 			sItems.addf(`INSERT INTO items
-    (clinic_code, code, name, name_en, category, unit, cost, price, active,
+    (clinic_code, code, name, name_en, category, unit, cost, price, min_alert, active,
      created_at, updated_at)
-VALUES (%s, %s, %s, NULL, %s, %s, %s, %s, %s,
-        %s, now())
-ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
-    name       = EXCLUDED.name,
-    category   = EXCLUDED.category,
-    unit       = EXCLUDED.unit,
-    cost       = EXCLUDED.cost,
-    price      = EXCLUDED.price,
-    updated_at = now();
+SELECT %s, %s, %s, NULL, %s, %s, %s, %s, 0, %s,
+       %s, now()
+ WHERE NOT EXISTS (SELECT 1 FROM items WHERE clinic_code = %s AND code = %s);
+
+UPDATE items SET
+    name       = %s,
+    category   = %s,
+    unit       = %s,
+    cost       = %s,
+    price      = %s,
+    updated_at = now()
+ WHERE clinic_code = %s AND code = %s;
 
 `, lit(in.ClinicCode), lit(code), lit(nameLit),
 				defaultLit(catLit, "general"), defaultLit(unitLit, "ชิ้น"),
 				moneyLit(cost), moneyLit(price), boolLit(docBool(d, "active")),
-				tsLit(d.Text("createdAt"), "now()"))
+				tsLit(d.Text("createdAt"), "now()"),
+				lit(in.ClinicCode), lit(code),
+				lit(nameLit), defaultLit(catLit, "general"), defaultLit(unitLit, "ชิ้น"),
+				moneyLit(cost), moneyLit(price),
+				lit(in.ClinicCode), lit(code))
 
 			// Every SKU needs a catalog_item or it cannot be sold at all. item_type is
 			// 'drug' for the whole collection (locked decision).
@@ -504,7 +603,33 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 			sCatalog.comment("%s · %s → drug", code, oneLine(name))
 			sCatalog.addf("%s", upsertCatalogItem(in.ClinicCode, code, "drug", nameLit, "",
 				category, price, cost, status, "items",
-				fmt.Sprintf("(SELECT id FROM items WHERE clinic_code = %s AND code = %s AND active LIMIT 1)",
+				// NO `AND active` HERE. That one word cost two tenants their provenance.
+				//
+				// The subquery used to read `... AND code = Y AND active LIMIT 1`, so a SKU
+				// that V2 had switched off matched nothing and the row landed with
+				// source_id = NULL. That is not a cosmetic gap:
+				// trg_catalog_capture_legacy_source_key (migrations 0296/0301) reads `items`
+				// THROUGH source_id, so it then forces legacy_source_key to NULL as well,
+				// and nonSellableCatalogCodes (billing/helpers.go) refuses a drug whose
+				// items row is missing BEFORE it looks at the label. The SKU could not be
+				// made sellable by any amount of correct label data — the pharmacist's work
+				// would have had nowhere to land.
+				//
+				// Measured on prod 2026-09-22, matching with no exceptions:
+				//
+				//	clinic     drug+goods   source_id NULL
+				//	C2EC1E3           645              450   (= the 450 inactive codes)
+				//	C6C936C           566              221   (= the 221 inactive codes)
+				//
+				// Both were repaired by hand (22_link_items_source_id.sql).
+				//
+				// ORDER BY active DESC, id ASC makes the pick deterministic where several
+				// items rows share a code: the row V2 still has switched on, else the
+				// oldest — which is the one THIS import wrote first, not a duplicate from a
+				// later re-run. No code anywhere has two active rows (the partial unique
+				// index uniq_items_clinic_code forbids it), so the first clause never has a
+				// tie to break.
+				fmt.Sprintf("(SELECT id FROM items WHERE clinic_code = %s AND code = %s ORDER BY active DESC, id ASC LIMIT 1)",
 					lit(in.ClinicCode), lit(code)),
 				tsLit(d.Text("createdAt"), "now()")))
 		}
@@ -549,8 +674,25 @@ ON CONFLICT (clinic_code, code) WHERE active DO UPDATE SET
 
 		doc, derr := slotDoc(d, mongoID)
 		if derr != nil {
-			return "", "", "", fmt.Errorf("items doc %d (%s): build doc: %w", n+1, code, derr)
+			return "", "", "", "", fmt.Errorf("items doc %d (%s): build doc: %w", n+1, code, derr)
 		}
+		// cost_lot and cost_per_unit are DIFFERENT numbers and used to be given the same
+		// one. `items.cost` is the cost of ONE unit — measured on the-gloss-cct's export,
+		// of the 42 SKUs carrying a cost every single one sits at or below twice its
+		// selling price (AMK 189 vs 250 at qty 10 · Collaju 16,999 vs 16,999 at qty 3) and
+		// none looks like a lot total. V4 agrees by construction: GuidedReceive writes
+		// CostLot: pgkit.Numeric(row.UnitCost * row.Qty) beside CostPerUnit: row.UnitCost.
+		//
+		// So writing the unit cost into cost_lot understated the value of every multi-unit
+		// lot in the clinic — a 52-unit box of Semaglutide was valued at one pen. The
+		// number also leaves the stock page: ListCourseCatalogCompositionForPurchase
+		// estimates a course's material cost from the lot's cost_per_unit, and
+		// stock/analytics reads the lot value.
+		//
+		// The multiplication is handed to Postgres rather than done in Go. Every other
+		// money value in this file reaches the database as source digits for the same
+		// reason (moneyLit's contract): float64 has no exact ฿0.10, and numeric × numeric
+		// in Postgres is exact.
 		sSlot.comment("%s · lot %s · คลัง %s", code, mongoID, branch)
 		sSlot.addf(`INSERT INTO slot_stock
     (mongo_id, item_code, item_id, code, cost_lot, cost_per_unit, amount, remain,
@@ -562,11 +704,60 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
 ON CONFLICT (mongo_id) DO NOTHING;
 
 `, lit(mongoID), lit(code), lit(mongoID), lit(mongoID),
-			moneyLit(cost), moneyLit(cost),
+			lotCostExpr(cost, d.Text("quantity")), moneyLit(cost),
 			moneyLit(d.Text("quantity")), moneyLit(d.Text("quantity")),
 			tsLit(d.Text("store"), "now()"), tsLitNullable(d.Text("expire")),
 			moneyLit(d.Text("quantity_total")), lit(doc),
 			lit(in.ClinicCode), lit(branch))
+
+		// The receive that put this lot on the shelf.
+		//
+		// WHY A LEDGER ROW IS NOT OPTIONAL
+		//
+		// V4 never opens a lot without one: both doors that create stock — ReceiveLot and
+		// GuidedReceive — call InsertStockReceipt in the same transaction as InsertSlotLot
+		// (reason='receive', positive qty_delta, slot_id/lot_code naming the lot). The
+		// import wrote the lot and not the movement, so an imported clinic had inventory
+		// that had never arrived: "รายงานการรับเข้า" was empty, stock/movements showed
+		// nothing, and the integrity check could not reconcile on-hand against its own
+		// history. Migration 0209 records the reason plainly — 44 of 213 lot×branch pairs
+		// in demo already disagree with slot_stock "because not every writer has always
+		// gone through a movement". This is that writer.
+		//
+		// created_at is the lot's own first_date, NOT now(): the goods arrived when V2 says
+		// they arrived, and stamping the import date would put years of deliveries on one
+		// afternoon and make every stock-in report wrong. user_id stays NULL because no
+		// person did this — naming a staff member would be a lie the ledger keeps forever.
+		//
+		// slot_id is resolved through slot_stock.mongo_id, which migration 0035 declares
+		// UNIQUE, so the subquery can match at most one lot. It is a SELECT rather than a
+		// literal because slot_stock.id is issued by the database one statement earlier.
+		//
+		// The NOT EXISTS keys on (clinic_code, slot_id, reason) — one lot receives once, so
+		// a re-run adds nothing. It cannot key on the lot alone: a withdrawal from the same
+		// lot is also a stock_movement row and must not be mistaken for this one.
+		moveName, _ := clip(name, 200)
+		moveUnit, _ := clip(unit, 32)
+		sMove.comment("%s · รับเข้า lot %s → คลัง %s", code, mongoID, branch)
+		sMove.addf(`INSERT INTO stock_movement
+    (item_code, item_name, branch_code, clinic_code, qty_delta, unit,
+     reason, note, slot_id, lot_code, created_at)
+SELECT %s, %s, %s, %s, %s, %s,
+       'receive', 'migrate v2', s.id, %s, %s
+  FROM slot_stock s
+ WHERE s.mongo_id = %s
+   AND NOT EXISTS (
+       SELECT 1 FROM stock_movement m
+        WHERE m.clinic_code = %s
+          AND m.slot_id     = s.id
+          AND m.reason      = 'receive'
+   );
+
+`, lit(code), lit(moveName), lit(branch), lit(in.ClinicCode),
+			moneyLit(d.Text("quantity")), nullLit(moveUnit),
+			lit(mongoID), tsLit(d.Text("store"), "now()"),
+			lit(mongoID), lit(in.ClinicCode))
+		movesWritten++
 	}
 
 	eItems.Statements = sItems.stmts
@@ -609,10 +800,131 @@ ON CONFLICT (mongo_id) DO NOTHING;
 			"และซ้ำกับตอน import สาขานั้นเป็นคลินิกของตัวเอง",
 			total, strings.Join(parts, ", "))
 	}
+	// Last thing in the drug batch, so it runs in the same transaction as the rows it
+	// judges and a failure takes them with it. See itemsProvenanceGuard.
+	sCatalog.addf("%s", itemsProvenanceGuard(in.ClinicCode))
+	eCatalog.Statements = sCatalog.stmts
+
+	eMove.SourceRows = movesWritten
+	eMove.Statements = sMove.stmts
+	if movesWritten != sSlot.stmts {
+		// Cannot happen while both are written in the same iteration, and said out loud
+		// anyway: a lot with no receive row is inventory that never arrived, which is
+		// exactly the state this entity was added to end.
+		rep.warnf("stock_movement: เขียน %d แถว แต่ล็อตมี %d แถว — ล็อตที่ไม่มีบรรทัดรับเข้าคือของที่โผล่มาในคลังโดยไม่มีประวัติ",
+			movesWritten, sSlot.stmts)
+	}
+	if movesWritten > 0 {
+		rep.notef("stock_movement: เขียนบรรทัดรับเข้า (reason='receive') ให้ทุกล็อต %d แถว — V4 ไม่เคยเปิดล็อตโดยไม่มีบรรทัดนี้ "+
+			"(ReceiveLot และ GuidedReceive เรียก InsertStockReceipt ในทรานแซกชันเดียวกับล็อต) · "+
+			"วันที่ใช้ first_date ของล็อตเดิม ไม่ใช่วันที่ import จึงไม่ยัดของหลายปีมากองวันเดียว · "+
+			"user_id เป็น NULL เพราะไม่มีคนกดรับ · ถ้าไม่มีแถวพวกนี้ รายงานรับเข้าและหน้าความเคลื่อนไหวสต็อกจะว่างทั้งที่มีของ",
+			movesWritten)
+	}
+
 	rep.notef("items: %d เอกสาร → %d SKU (ที่เหลือคือล็อตของ code เดิม → slot_stock)", len(mc.items), len(firstSeen))
 	rep.notef("slot_stock: คลังของแต่ละสาขามาจาก branch.stock_id ในตาราง branch (ไม่ได้อ่านจากสตริง stocks.stock_branch) · "+
 		"พบสาขาที่มีคลังผูกไว้ %d สาขา", len(stockOwner))
-	return sItems.String(), sCatalog.String(), sSlot.String(), nil
+	rep.notef("slot_stock: cost_lot = ต้นทุนต่อหน่วย × จำนวนในล็อต (คนละค่ากับ cost_per_unit) ตามที่ V4 คำนวณใน GuidedReceive — " +
+		"เดิมใส่ค่าเดียวกันทั้งสองช่อง ทำให้มูลค่าคลังของล็อตที่มีหลายหน่วยต่ำกว่าความจริง")
+	return sItems.String(), sCatalog.String(), sSlot.String(), sMove.String(), nil
+}
+
+// lotCostExpr renders slot_stock.cost_lot: the cost of the WHOLE lot, which is the unit
+// cost times the quantity in it.
+//
+// The product is rendered as SQL so Postgres multiplies exact numerics — the same reason
+// moneyLit hands source digits straight through instead of parsing them into a float64.
+// The two short-circuits are not an optimisation: they keep a zero-cost or zero-quantity
+// lot rendering as the literal `0` that every existing generated file already carries, so
+// a diff between two runs shows only the lots whose value actually changed.
+func lotCostExpr(unitCost, qty string) string {
+	c, q := moneyLit(unitCost), moneyLit(qty)
+	if c == "0" || q == "0" {
+		return "0"
+	}
+	return fmt.Sprintf("(%s::numeric * %s::numeric)", c, q)
+}
+
+/*
+itemsProvenanceGuard refuses the import when a ยา/เวชภัณฑ์ row has no provenance.
+
+THE RULE (owner, 22 Sep 2026): for an imported drug/goods SKU, catalog_item.source_id
+and catalog_item.legacy_source_key must never be empty.
+
+# WHY IT IS A REFUSAL AND NOT A WARNING
+
+A blank source_id is not a missing nicety, it is a SKU that can never be sold. The
+chain, all of it silent:
+
+ 1. source_id NULL
+ 2. trg_catalog_capture_legacy_source_key (0296/0301) reads `items` through source_id,
+    so it sets legacy_source_key to NULL too
+ 3. nonSellableCatalogCodes (billing/helpers.go) refuses a drug when `i.id IS NULL` —
+    BEFORE it looks at a single label field
+
+So the SKU is unsellable, and no amount of correct label data fixes it. It went
+unnoticed through two tenants (C2EC1E3 450 rows, C6C936C 221) precisely because every
+layer reported success: the import finished, psql printed no warning, the catalogue
+listed the row, and only the cashier ever found out.
+
+WHAT IT CHECKS
+
+  - source_id present on every drug/goods row of this clinic
+  - legacy_source_key present on the same set — checked separately rather than assumed
+    from the first, because it is written by a TRIGGER. If that trigger is ever dropped
+    or altered, the first check passes and this one catches it.
+  - the link points at an items row of the SAME clinic and the SAME code. A link to
+    another product's row would attach one drug's label to another drug's bill, which
+    is worse than no link at all and is invisible on screen.
+
+It reads catalog_item back rather than trusting the generator, so it also covers rows
+an earlier run left behind. `items` is written in an earlier group that has already
+committed, so the subquery can see it.
+*/
+func itemsProvenanceGuard(clinic string) string {
+	return fmt.Sprintf(`-- ── ด่าน: ยา/เวชภัณฑ์ ต้องมี source_id และ legacy_source_key ─────────────
+-- ว่างแม้แถวเดียว = SKU นั้นขายไม่ได้ตลอดไป และกรอกฉลากยาก็ไม่ช่วย เพราะประตูคิดเงิน
+-- ปฏิเสธที่ "หาแถว items ไม่เจอ" ก่อนจะดูฉลาก · เคยหลุดมาสองคลินิกเพราะทุกชั้นรายงานว่าสำเร็จ
+DO $prov$
+DECLARE no_id bigint; no_key bigint; wrong_target bigint; sample text;
+BEGIN
+    SELECT count(*) INTO no_id
+      FROM catalog_item
+     WHERE clinic_code = %[1]s AND item_type IN ('drug','goods') AND source_id IS NULL;
+    IF no_id > 0 THEN
+        SELECT string_agg(code, ', ' ORDER BY code) INTO sample
+          FROM (SELECT code FROM catalog_item
+                 WHERE clinic_code = %[1]s AND item_type IN ('drug','goods')
+                   AND source_id IS NULL
+                 ORDER BY code LIMIT 10) s;
+        RAISE EXCEPTION 'ยา/เวชภัณฑ์ %% รายการไม่มี source_id — ขายไม่ได้ตลอดไปและกรอกฉลากยาก็ไม่ช่วย · ตัวอย่างรหัส: %%',
+            no_id, sample;
+    END IF;
+
+    -- เขียนโดย trigger ไม่ใช่โดยสคริปต์นี้ จึงตรวจแยก: ถ้า trigger ถูกถอดหรือแก้ ด่านบนจะผ่านแต่ด่านนี้จับได้
+    SELECT count(*) INTO no_key
+      FROM catalog_item
+     WHERE clinic_code = %[1]s AND item_type IN ('drug','goods') AND legacy_source_key IS NULL;
+    IF no_key > 0 THEN
+        RAISE EXCEPTION 'ยา/เวชภัณฑ์ %% รายการไม่มี legacy_source_key — trg_catalog_capture_legacy_source_key ไม่ทำงาน (migration 0296/0301) ตรวจว่า trigger ยังอยู่',
+            no_key;
+    END IF;
+
+    -- ชี้ผิดตัวอันตรายกว่าไม่ชี้: ฉลากของสินค้าหนึ่งจะไปติดบิลของอีกสินค้า และมองไม่เห็นบนหน้าจอ
+    SELECT count(*) INTO wrong_target
+      FROM catalog_item ci
+     WHERE ci.clinic_code = %[1]s AND ci.item_type IN ('drug','goods')
+       AND NOT EXISTS (SELECT 1 FROM items i
+                        WHERE i.id = ci.source_id
+                          AND i.clinic_code = ci.clinic_code
+                          AND i.code = ci.code);
+    IF wrong_target > 0 THEN
+        RAISE EXCEPTION 'ยา/เวชภัณฑ์ %% รายการชี้ไปที่แถว items ของคลินิกอื่นหรือรหัสอื่น', wrong_target;
+    END IF;
+END $prov$;
+
+`, lit(clinic))
 }
 
 // slotDoc keeps the lot's source fields that V4 has no column for, so the row can be
@@ -660,6 +972,11 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 		}
 	}
 	medEmitted, medNoSvc, medNoItem, medZeroQty := 0, 0, 0, 0
+	// medChildEdges is counted apart from childEdges (the service lines') because the two
+	// answer different questions and the report says so separately: a service edge missing
+	// means the course looks empty on screen, a medication edge missing means a paying
+	// customer silently does not get the drugs.
+	medChildEdges := 0
 
 	// Service codes are off-limits when minting course codes.
 	taken := map[string]bool{}
@@ -874,8 +1191,60 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL AND %s IS NOT NULL
 `, lit(in.ClinicCode), courseID, childID, svcID, qty, 1000+mi,
 						courseID, childID, svcID,
 						lit(in.ClinicCode), courseID, childID, svcID)
+
+					// THE SAME EDGE INTO catalog_item_child — decided 22 Sep 2026, replacing
+					// the earlier rule that a drug line got no child row.
+					//
+					// That rule was argued from the course EDITOR: catalog_item_child is a
+					// flat parent→child edge with nowhere to record "used under service X",
+					// and the screen that lists a course's drugs (ListCourseMedications)
+					// reads catalog_course_line. Both statements are still true. What they
+					// miss is what happens when the course is SOLD.
+					//
+					// At sale time V4 does not read catalog_course_line at all.
+					// billing/service.go calls ListCourseCatalogCompositionForPurchase
+					// (query/course_bought.sql), which joins catalog_item_child ON
+					// relation_kind='composition' and nothing else, then maps a child of
+					// item_type 'drug'/'goods' to kind='medication' when it writes
+					// course_bought_items. So without this row the customer pays for the
+					// course, receives its treatments as entitlements, and receives NONE of
+					// its drugs — and a course whose only contents are drugs fails the whole
+					// payment on `len(children) == 0` with
+					// "ยังสร้างสิทธิคอร์สไม่ได้: … ไม่มีรายการย่อยที่พร้อมใช้ในแค็ตตาล็อก".
+					//
+					// Which service the drug belongs under is not lost: that is precisely
+					// what catalog_course_line above keeps. Two tables, two questions.
+					//
+					// uniq_catalog_item_child is (parent_item_id, child_item_id,
+					// relation_kind) (migration 0291), so one drug used under two services in
+					// the same course yields ONE edge — first line wins, the second is
+					// skipped by the NOT EXISTS and its qty is not added. That is the same
+					// outcome 11_fix_course_meds_C2EC1E3.sql already produced in production,
+					// so replaying this against that clinic changes nothing.
+					//
+					// The self guard is load-bearing: catalog_item_child_self_chk (0262)
+					// refuses parent = child, and a 23514 raised here aborts the ENTIRE
+					// import, taking every other table with it.
+					sLine.addf(`INSERT INTO catalog_item_child
+    (clinic_code, parent_item_id, child_item_id, qty, sort_order, relation_kind, created_at)
+SELECT %s, %s, %s, %s, %d, 'composition', now()
+WHERE %s IS NOT NULL AND %s IS NOT NULL
+  AND %s <> %s
+  AND NOT EXISTS (
+      SELECT 1 FROM catalog_item_child ch
+       WHERE ch.clinic_code = %s
+         AND ch.parent_item_id = %s
+         AND ch.child_item_id  = %s
+  );
+
+`, lit(in.ClinicCode), courseID, childID, qty, 1000+mi,
+						courseID, childID,
+						courseID, childID,
+						lit(in.ClinicCode), courseID, childID)
+
 					eLine.SourceRows++
 					medEmitted++
+					medChildEdges++
 				}
 			}
 		}
@@ -901,6 +1270,14 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL AND %s IS NOT NULL
 	if medEmitted > 0 || medNoSvc > 0 || medNoItem > 0 || medZeroQty > 0 {
 		rep.notef("catalog_course_line: เขียนยาในคอร์ส (line_kind='medication') %d บรรทัด · parent_service มาจาก heal_id ใน list_medicien · ข้าม [heal_id ไม่ตรงบริการ: %d, medicien_id ไม่ตรง items: %d, qty<=0: %d]",
 			medEmitted, medNoSvc, medNoItem, medZeroQty)
+	}
+	if medChildEdges > 0 {
+		rep.notef("catalog_item_child: เขียนยาในคอร์สเป็น edge ของคอร์สอีก %d แถว (relation_kind='composition') — "+
+			"ตอนขายคอร์สจริง V4 อ่าน catalog_item_child ไม่ได้อ่าน catalog_course_line "+
+			"(ListCourseCatalogCompositionForPurchase → course_bought_items) ถ้าไม่มีแถวพวกนี้ "+
+			"ลูกค้าจ่ายเงินแล้วได้สิทธิ์แต่บริการ ไม่ได้ยา · และคอร์สที่มีแต่ยาจะจ่ายเงินไม่ผ่านทั้งใบ · "+
+			"ยาตัวเดียวที่อยู่ใต้หลายบริการในคอร์สเดียวกันจะได้ edge เดียว (แถวแรกชนะ)",
+			medChildEdges)
 	}
 	// Loud, because this changes what a course CONTAINS. The alternative was to write 1,
 	// which the clinic owner rejected: it would give every buyer of that course a session

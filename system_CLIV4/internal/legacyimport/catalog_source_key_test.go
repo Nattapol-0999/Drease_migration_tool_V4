@@ -41,7 +41,7 @@ func TestItemsDoesNotWriteSourceKeySoASecondClinicCanImport(t *testing.T) {
 	}
 	in := Input{ClinicCode: "CTEST01", BranchMap: map[string]string{"01": "BR00001"}}
 
-	itemsSQL, _, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
+	itemsSQL, _, _, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
 	if err != nil {
 		t.Fatalf("buildItems: %v", err)
 	}
@@ -71,10 +71,79 @@ func TestItemsDoesNotWriteSourceKeySoASecondClinicCanImport(t *testing.T) {
 		}
 	}
 
-	// The row's real identity, which the ON CONFLICT has to keep targeting. If this ever
-	// becomes ON CONFLICT (source_key) the cross-clinic bug returns as an UPDATE to another
-	// clinic's row, which is worse than the error: it would write silently.
-	if !strings.Contains(itemsSQL, "ON CONFLICT (clinic_code, code)") {
-		t.Error("the items upsert no longer keys on (clinic_code, code)")
+	// The row's real identity, which every branch of the write has to keep targeting.
+	//
+	// This used to assert the literal `ON CONFLICT (clinic_code, code)`. The upsert is now
+	// NOT EXISTS + UPDATE (see TestItemsWriteIsIdempotentForSwitchedOffRows for why), so the
+	// syntax changed while the property did not: the row is found by clinic AND code, and
+	// never by source_key. If identity ever moves to source_key the cross-clinic bug comes
+	// back as a silent UPDATE to another clinic's row, which is worse than the error was.
+	if !strings.Contains(itemsSQL, "WHERE NOT EXISTS (SELECT 1 FROM items WHERE clinic_code = 'CTEST01' AND code =") {
+		t.Errorf("the items INSERT is not guarded by a (clinic_code, code) existence check:\n%s", itemsSQL)
+	}
+	if !strings.Contains(itemsSQL, "UPDATE items SET") ||
+		!strings.Contains(itemsSQL, "WHERE clinic_code = 'CTEST01' AND code =") {
+		t.Errorf("the items UPDATE is not scoped by clinic_code AND code:\n%s", itemsSQL)
+	}
+	for _, forbidden := range []string{"ON CONFLICT (source_key)", "ON CONFLICT (items.source_key)"} {
+		if strings.Contains(itemsSQL, forbidden) {
+			t.Errorf("identity moved to source_key (%q) — a re-import would silently update "+
+				"another clinic's row", forbidden)
+		}
+	}
+}
+
+// The items write has to be idempotent for rows V2 has SWITCHED OFF, not just for live ones.
+//
+// # WHAT WENT WRONG
+//
+// uniq_items_clinic_code is PARTIAL — `ON items (clinic_code, code) WHERE active` — so it is
+// the only conflict target available and an INACTIVE row never violates it. The write used
+// `ON CONFLICT (clinic_code, code) WHERE active DO UPDATE`, which means every re-run inserted
+// another copy of every switched-off SKU instead of refreshing it.
+//
+// Measured at C2EC1E3: 645 real codes, 1,901 rows, 356 codes holding 4–6 rows each, all
+// inactive. Those duplicates are what make `code` ambiguous for anything that resolves a SKU
+// by code — including the source_id subquery in this same function.
+//
+// # WHY A TEST
+//
+// `ON CONFLICT ... WHERE active` reads as a careful, deliberate clause. It is the obvious
+// thing to restore if someone finds NOT EXISTS + UPDATE clumsy, and it works perfectly on
+// the first import of any tenant. It only breaks on the SECOND run, with no error.
+func TestItemsWriteIsIdempotentForSwitchedOffRows(t *testing.T) {
+	mc, err := parseMongoCatalog([]byte(drugItemsDump))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	in := Input{ClinicCode: "CTEST01", BranchMap: map[string]string{"01": "BR00001"}}
+	itemsSQL, _, _, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
+	if err != nil {
+		t.Fatalf("buildItems: %v", err)
+	}
+
+	if strings.Contains(itemsSQL, "WHERE active DO UPDATE") ||
+		strings.Contains(itemsSQL, "ON CONFLICT (clinic_code, code) WHERE active") {
+		t.Errorf("the write is back on the partial index as its conflict target. An inactive "+
+			"row cannot violate it, so a re-run duplicates every switched-off SKU:\n%s", itemsSQL)
+	}
+	// The pair that makes it idempotent regardless of `active`.
+	if !strings.Contains(itemsSQL, "WHERE NOT EXISTS") || !strings.Contains(itemsSQL, "UPDATE items SET") {
+		t.Errorf("expected INSERT ... WHERE NOT EXISTS followed by UPDATE:\n%s", itemsSQL)
+	}
+	// active and source_key must stay out of the UPDATE: active is the clinic's own switch
+	// (catalog_item.status is derived from it) and source_key is the immutable key a
+	// doctor-fee rule may already point at.
+	// One statement only. Slicing to the end of the string would sweep in the INSERT of the
+	// NEXT item, whose column list legitimately names `active`.
+	updatePart := itemsSQL[strings.Index(itemsSQL, "UPDATE items SET"):]
+	updatePart = updatePart[:strings.Index(updatePart, ";")]
+	if strings.Contains(updatePart, "active") {
+		t.Error("the items UPDATE touches `active` — a re-import would flip what somebody " +
+			"switched on in V4, and catalog_item.status follows it")
+	}
+	if strings.Contains(updatePart, "source_key") {
+		t.Error("the items UPDATE touches `source_key` — re-minting it breaks any doctor-fee " +
+			"rule bound to the old value")
 	}
 }
