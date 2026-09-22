@@ -21,8 +21,8 @@ import "server-only";
 // about to copy — and then does as it is told. Two implementations of the same mapping
 // would drift, and the one that drifts silently is the one writing medical records.
 
-import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, open, readFile, rm, stat, copyFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, mkdir, open, readFile, rm, stat, copyFile, link } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -415,7 +415,6 @@ export async function shipFiles(
   extractRoot: string,
 ): Promise<ShipResult> {
   const stage = await mkdtemp(join(workRoot(), "importv4-stage-"));
-  const bundle = join(stage, "..", `importv4-bundle-${process.pid}.tar.gz`);
   const payload = join(stage, "payload");
 
   try {
@@ -429,43 +428,22 @@ export async function shipFiles(
       if (!f) continue;
       const dest = join(payload, f.target_path);
       await mkdir(dirname(dest), { recursive: true });
-      await copyFile(join(extractRoot, f.source_path), dest);
+      await placeFile(join(extractRoot, f.source_path), dest);
       files++;
       bytes += m.bytes;
 
-      // The thumbnail travels in the SAME bundle as its image. Two archives would create a
+      // The thumbnail travels in the SAME stream as its image. Two transfers would create a
       // window where a row could point at a thumbnail that had not arrived, and the whole
       // reason bytes go before rows is to have no such window.
       if (m.thumb) {
         const tdest = join(payload, m.thumb.target_path);
         await mkdir(dirname(tdest), { recursive: true });
-        await copyFile(join(extractRoot, m.thumb.source_path), tdest);
+        await placeFile(join(extractRoot, m.thumb.source_path), tdest);
         thumbs++;
         bytes += m.thumb.bytes;
       }
     }
     if (files === 0) throw new Error("ไม่มีไฟล์ที่จับคู่ได้เลย จึงไม่มีอะไรจะส่ง");
-
-    await run("tar", ["-czf", bundle, "-C", payload, "."], { maxBuffer: 8 * 1024 * 1024 });
-
-    // scp the bundle, then unpack it on the far side into the uploads base. `-m` on
-    // mkdir keeps the mode explicit rather than inheriting a surprising umask; the
-    // container reads these files as a different uid than the one writing them.
-    const remoteTmp = `/tmp/importv4-photos-${Date.now()}.tar.gz`;
-    await run(
-      "scp",
-      [
-        "-i", t.sshKey,
-        "-P", t.sshPort,
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=15",
-        "-o", "IdentitiesOnly=yes",
-        bundle,
-        `${t.sshUser}@${t.sshHost}:${remoteTmp}`,
-      ],
-      { maxBuffer: 8 * 1024 * 1024 },
-    );
 
     // The uploads tree is root-owned: the API container runs as uid 0 and every file
     // already in there is root:root 0644. The ssh account is ubuntu (uid 1000) and cannot
@@ -495,28 +473,15 @@ export async function shipFiles(
     const remote = [
       `set -e`,
       ...quoted.map((d) => `sudo -n mkdir -p ${d}`),
-      `sudo -n tar --no-same-owner --no-same-permissions -xzf ${shellQuote(remoteTmp)} -C ${shellQuote(t.dir)}`,
+      // `-xzf -`: the archive arrives on stdin, so it is never a file on either machine.
+      `sudo -n tar --no-same-owner --no-same-permissions -xzf - -C ${shellQuote(t.dir)}`,
       ...quoted.map((d) => `sudo -n chown -R root:root ${d}`),
       ...quoted.map((d) => `sudo -n find ${d} -type d -exec chmod 755 {} +`),
       ...quoted.map((d) => `sudo -n find ${d} -type f -exec chmod 644 {} +`),
-      `rm -f ${shellQuote(remoteTmp)}`,
       `find ${quoted.join(" ")} -type f | wc -l`,
     ].join(" && ");
 
-    const { stdout, stderr } = await run(
-      "ssh",
-      [
-        "-i", t.sshKey,
-        "-p", t.sshPort,
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=15",
-        "-o", "IdentitiesOnly=yes",
-        `${t.sshUser}@${t.sshHost}`,
-        remote,
-      ],
-      { maxBuffer: 8 * 1024 * 1024 },
-    );
+    const { stdout, stderr } = await streamPayload(payload, t, remote);
 
     return {
       filesSent: files,
@@ -532,8 +497,133 @@ export async function shipFiles(
     };
   } finally {
     await rm(stage, { recursive: true, force: true });
-    await rm(bundle, { force: true });
   }
+}
+
+/**
+ * placeFile puts one image into the payload tree, as a HARD LINK when it can.
+ *
+ * WHY NOT A COPY
+ *
+ * The images exist four times over on the way to the uploads host: the pulled archive, its
+ * extracted tree, the payload assembled here, and the tar that used to be written before
+ * being sent. On a 14.17 GB archive of JPEGs — which gzip cannot shrink — that is about 42 GB
+ * of disk for one clinic, and on 22 Sep 2026 it ran a 77 GB box out of space mid-transfer:
+ *
+ *	gzip: stdout: No space left on device
+ *	tar: Wrote only 8192 of 10240 bytes
+ *
+ * The SQL had already committed by then, so the clinic was left with data and no images.
+ *
+ * A hard link removes the payload copy entirely: the directory tree is real (tar walks it
+ * exactly as before) but the bytes are the extracted file's own. payload and extractRoot are
+ * both under UPLOAD_STAGING_DIR, so they are always on the same filesystem.
+ *
+ * Falls back to copying if the link cannot be made — a filesystem that refuses links must
+ * still produce a correct import, just a hungrier one.
+ */
+async function placeFile(src: string, dest: string): Promise<void> {
+  try {
+    await link(src, dest);
+  } catch {
+    await copyFile(src, dest);
+  }
+}
+
+/**
+ * streamPayload tars the payload straight into the remote command's stdin.
+ *
+ * The tar used to be written to disk and then scp'd, which cost a fourth full copy of every
+ * image here and a fifth in the far side's /tmp. Nothing needs either: `tar -czf -` on this
+ * end and `tar -xzf -` on the other means the bytes only ever exist in the pipe.
+ *
+ * BOTH exit codes are checked. Piping hides failures by default — if tar dies halfway, ssh
+ * still sees a clean end-of-stream and can exit 0 while the far side holds a truncated tree.
+ * A non-zero tar is therefore an error even when the remote reported success.
+ *
+ * stdout of the remote command is returned because the last thing it runs is a file count,
+ * which is the only independent check that the bytes landed.
+ */
+function streamPayload(
+  payload: string,
+  t: UploadsTarget,
+  remoteCmd: string,
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const tar = spawn("tar", ["-czf", "-", "-C", payload, "."], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ssh = spawn(
+      "ssh",
+      [
+        "-i", t.sshKey,
+        "-p", t.sshPort,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=15",
+        "-o", "IdentitiesOnly=yes",
+        `${t.sshUser}@${t.sshHost}`,
+        remoteCmd,
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+
+    let out = "";
+    let err = "";
+    let tarErr = "";
+    // Bounded on purpose: a runaway remote must not be able to grow this process's heap.
+    const cap = (s: string, add: string) => (s.length > 65536 ? s : s + add);
+    tar.stderr.on("data", (d: Buffer) => {
+      tarErr = cap(tarErr, d.toString());
+    });
+    ssh.stdout.on("data", (d: Buffer) => {
+      out = cap(out, d.toString());
+    });
+    ssh.stderr.on("data", (d: Buffer) => {
+      err = cap(err, d.toString());
+    });
+
+    tar.stdout.pipe(ssh.stdin);
+    // EPIPE when the remote exits first: that failure is already reported through ssh's own
+    // exit code and stderr, and an unhandled error event here would crash the process.
+    ssh.stdin.on("error", () => {});
+
+    let tarCode: number | null = null;
+    let sshCode: number | null = null;
+    let settled = false;
+    const finish = () => {
+      if (settled || tarCode === null || sshCode === null) return;
+      settled = true;
+      if (tarCode !== 0) {
+        reject(new Error(`อ่าน/บีบอัดไฟล์รูปไม่สำเร็จ (tar exit ${tarCode}): ${tarErr.trim()}`));
+        return;
+      }
+      if (sshCode !== 0) {
+        reject(
+          new Error(
+            `ส่งไฟล์รูปไปเครื่องปลายทางไม่สำเร็จ (ssh exit ${sshCode}): ${err.trim() || out.trim()}`,
+          ),
+        );
+        return;
+      }
+      resolve({ stdout: out, stderr: err });
+    };
+    tar.on("close", (c) => {
+      tarCode = c ?? -1;
+      finish();
+    });
+    ssh.on("close", (c) => {
+      sshCode = c ?? -1;
+      finish();
+    });
+    const bail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    };
+    tar.on("error", bail);
+    ssh.on("error", bail);
+  });
 }
 
 // ── the rows ─────────────────────────────────────────────────────────────────
