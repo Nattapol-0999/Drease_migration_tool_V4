@@ -550,6 +550,7 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 	percentDiscount := 0
 	noMoneyReceipts := 0
 	var channelMismatch []string
+	overpaidReceipts := 0
 	var out []receiptPlan
 
 	sort.Strings(billOrder) // deterministic output
@@ -643,19 +644,29 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 				idx++
 			}
 			rp.paidExpr = sumExpr(rp.amountTexts)
-			rp.discountExpr = "(" + moneyLit(d.Text("payment_type.price_total")) + " - " + rp.paidExpr + ")"
+			// GREATEST keeps discount non-negative. A receipt that took in MORE money than
+			// the amount it closed would otherwise render a negative discount, and the
+			// column is a discount, not a credit note.
+			rp.discountExpr = "GREATEST(" + moneyLit(d.Text("payment_type.price_total")) +
+				" - " + rp.paidExpr + ", 0)"
 
-			// A receipt cannot take in MORE money than the bill value it settled — that
-			// would be a negative discount, which is an overpayment nobody recorded.
-			// One receipt is dropped and named, rather than the whole import refused.
+			// A receipt that took in MORE money than the value it settled is kept, not
+			// dropped. Decided by the clinic owner for the-gloss on 2026-09-09 and again
+			// for wanaka-sanctuary on 2026-09-22, on the same ground both times: the cash
+			// reached the clinic, and "ยอด V2 = ยอด V4" is the whole point of the import.
+			// Dropping the receipt loses the money AND takes its bill down with it.
+			//
+			// Nothing downstream needs teaching. paid_amount is Σ channels so guard 1 still
+			// balances; renderSettle derives invoice.paid_amount from the receipts so guard
+			// 2 does too; and balanceBills sees cash above the bill value, flags the bill in
+			// sourceOverpaid and clamps bill_discount — which is exactly the named exemption
+			// guard 3 already honours. The anomaly stays reported, the money stays in.
 			if rp.fPaid-rp.fClosed > MoneyTolerance {
-				eRec.skip("รับเงินมากกว่ายอดที่ใบเสร็จปิด (ส่วนลดจะติดลบ)")
 				if len(channelMismatch) < 10 {
 					channelMismatch = append(channelMismatch,
 						fmt.Sprintf("%s (รับ %.2f > ปิดยอด %.2f)", no, rp.fPaid, rp.fClosed))
 				}
-				delete(seenNo, no)
-				continue
+				overpaidReceipts++
 			}
 			if receiptDiscountPercentActive(d) {
 				percentDiscount++
@@ -681,8 +692,8 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 			renumbered)
 	}
 	if len(channelMismatch) > 0 {
-		rep.warnf("receipt: ข้ามใบเสร็จที่รับเงินมากกว่ายอดที่ปิด (ส่วนลดจะติดลบ) — ตัวอย่าง: %s · บิลของใบเสร็จเหล่านี้จะถูกข้ามตามไปด้วย ต้องตรวจด้วยมือ",
-			strings.Join(channelMismatch, "; "))
+		rep.warnf("receipt: %d ใบรับเงินมากกว่ายอดที่ปิด — นำเข้าตามต้นทางเพื่อให้ยอดเงิน V4 เท่ากับ V2 · ส่วนลดของใบเหล่านี้ถูกตรึงที่ 0 (ไม่ให้ติดลบ) และบิลของมันจะถูกยกเว้นจากด่านห้ามเก็บเกินยอด · ต้องตามไปแก้ที่ต้นทางหรือออกใบลดหนี้ใน V4 — ตัวอย่าง: %s",
+			overpaidReceipts, strings.Join(channelMismatch, "; "))
 	}
 	if noMoneyReceipts > 0 {
 		rep.notef("receipt: %d ใบปิดยอดโดยไม่มีเงินเข้าเลย (voucher / ของแถม / ชดเชยบริการ) — ลงเป็น paid_amount = 0 และ discount เท่ากับยอดที่ปิด · เหตุผลเดิมจากช่อง payment_remark ถูกยกไปเก็บใน receipt.note ด้วย",
