@@ -485,6 +485,11 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 		category := mc.itemTypeName[docObjectID(d, "type")]
 		price := d.Text("price")
 		cost := d.Text("cost")
+		// Quantities are read once, clamped once, and used for every column that carries
+		// them (lot value, received amount, on-hand, and the receive movement) so the four
+		// can never disagree. See clampNonNegativeMoney for why V2 hands out negatives.
+		qty := clampNonNegativeMoney(d.Text("quantity"))
+		qtyTotal := clampNonNegativeMoney(d.Text("quantity_total"))
 
 		if !firstSeen[code] {
 			firstSeen[code] = true
@@ -715,10 +720,10 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
 ON CONFLICT (mongo_id) DO NOTHING;
 
 `, lit(mongoID), lit(code), lit(mongoID), lit(mongoID),
-			lotCostExpr(cost, d.Text("quantity")), moneyLit(cost),
-			moneyLit(d.Text("quantity")), moneyLit(d.Text("quantity")),
+			lotCostExpr(cost, qty), moneyLit(cost),
+			qty, qty,
 			tsLit(d.Text("store"), "now()"), tsLitNullable(d.Text("expire")),
-			moneyLit(d.Text("quantity_total")), lit(doc),
+			qtyTotal, lit(doc),
 			lit(in.ClinicCode), lit(branch))
 
 		// The receive that put this lot on the shelf.
@@ -765,7 +770,7 @@ SELECT %s, %s, %s, %s, %s, %s,
    );
 
 `, lit(code), lit(moveName), lit(branch), lit(in.ClinicCode),
-			moneyLit(d.Text("quantity")), nullLit(moveUnit),
+			qty, nullLit(moveUnit),
 			lit(mongoID), tsLit(d.Text("store"), "now()"),
 			lit(mongoID), lit(in.ClinicCode))
 		movesWritten++

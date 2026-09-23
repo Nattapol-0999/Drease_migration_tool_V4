@@ -28,6 +28,39 @@ func moneyLit(s string) string {
 	return t
 }
 
+// clampNonNegativeMoney renders a quantity the same way moneyLit does, except that a
+// negative number becomes 0.
+//
+// # WHY STOCK QUANTITIES ARE CLAMPED AND PRICES ARE NOT
+//
+// V2's stock rooms are configured with `isNegative_qty: true`, so a withdrawal is allowed
+// to take a lot below zero and the number stays negative for good. Measured on the
+// pb-plasticsurgery export: the branch room's quantities add up to −88,243 against
+// MainStock's +25,471. V4 has no CHECK forbidding a negative `remain` either, so those
+// figures import cleanly and then read as inventory the clinic does not have — a lot of
+// −5 boxes is not a debt, it is a counting error that V2 never made anyone resolve.
+//
+// The owner's rule (23 Sep 2026): a negative quantity arrives as 0. Applied to the whole
+// quantity family of one lot — `remain`, `amount`, `amount_total` and the `qty_delta` of
+// its receive movement — because they are the same measurement seen from four angles, and
+// clamping one while leaving another negative would produce a lot that received −5 and
+// holds 0. `cost_lot` follows for the same reason: it is unit cost × quantity, so an
+// unclamped quantity would give the lot a negative value on the stock report.
+//
+// Prices are deliberately NOT clamped: a negative price would be a different decision
+// (about money, not counting) and none appears in any export seen so far.
+func clampNonNegativeMoney(s string) string {
+	lit := moneyLit(s)
+	// moneyLit has already rejected anything non-numeric, so a parse failure here can only
+	// mean validNumeric accepts a shape ParseFloat does not. Treat that as 0 rather than
+	// letting an unparsed string through to a numeric column.
+	f, err := strconv.ParseFloat(lit, 64) // comparison only, the digits are what is stored
+	if err != nil || f < 0 {
+		return "0"
+	}
+	return lit
+}
+
 // positiveMoney reports whether the source text is a number greater than zero. Used to
 // decide draft vs active without parsing money into a float.
 func positiveMoney(s string) bool {
