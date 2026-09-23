@@ -462,6 +462,10 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 		stockType = "drug"
 	}
 
+	// Which of a code's documents speaks for the SKU. Must be decided before the loop
+	// writes anything, because the answer can be a document the loop has not reached yet.
+	masterOf := chooseMasterDocs(mc.items, stockOwner, in)
+
 	var sItems, sCatalog, sSlot, sMove sqlBuilder
 	firstSeen := map[string]bool{}
 	noBranch, draft := 0, 0
@@ -491,7 +495,7 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 		qty := clampNonNegativeMoney(d.Text("quantity"))
 		qtyTotal := clampNonNegativeMoney(d.Text("quantity_total"))
 
-		if !firstSeen[code] {
+		if masterOf[code] == mongoID && !firstSeen[code] {
 			firstSeen[code] = true
 
 			nameLit, _ := clip(name, 255)
@@ -945,6 +949,87 @@ END $prov$;
 
 // slotDoc keeps the lot's source fields that V4 has no column for, so the row can be
 // traced back to the export.
+// chooseMasterDocs decides, per stock code, WHICH of its `items` documents supplies the
+// catalogue row: the name, category, unit, cost, price and the active flag that becomes
+// catalog_item.status.
+//
+// # WHY A CODE HAS SEVERAL DOCUMENTS AT ALL
+//
+// In V2 the `items` collection is not a product register, it is a row per (code × stock
+// room), each holding its own quantity AND its own price. On the pb-plasticsurgery export:
+// 817 codes across 1,287 documents, 467 of them present in both rooms.
+//
+// # WHAT THIS USED TO DO, AND WHAT IT COST
+//
+// The first document in dump order won. mongoexport orders by _id, and an ObjectId begins
+// with its creation time, so the room created in 2020 (MainStock, stock_branch=center)
+// came before the room created in 2024 (the branch's own) nearly every time. The branch
+// room is where the stock actually sits and where staff price it, so a SKU priced only
+// there arrived in V4 at 0: ผ้าคาดผม 350→0 with 42 in hand, ผ้ารัดหน้า L/M/XL 350→0,
+// Augmentin 25→0 with 916 in hand. Five SKUs the clinic sells every day, unsellable or
+// free, with nothing in any log to say why.
+//
+// THE RULE (owner, 23 Sep 2026): the branch room's document wins, unconditionally.
+//
+// Unconditionally is the owner's explicit choice over two softer variants that were
+// offered and declined, and it has two consequences measured on this same export:
+//
+//	ST000770 Skinvive     MainStock 15,900 · branch room 0  → the SKU arrives at 0
+//	ST000728 Dermalogica  branch room's document is blank   → name/category/unit come
+//	                                                          from nothing
+//
+// Neither is a bug in this function. The name falls back to the code (firstNonEmpty on
+// name1/name2 → code), category to 'general' and unit to 'ชิ้น', so the row is still
+// usable; it just carries less than the other document knew. Recorded here because the
+// next person to read a 0 price on Skinvive deserves to find the decision rather than
+// guess at a defect.
+//
+// A code present in only ONE room is untouched by all of this: 350 of the 817 codes are
+// MainStock-only, 8 of them priced, and every one keeps what it had.
+//
+// A room belonging to a branch this import is NOT bringing over does not get to speak
+// either — its lots are dropped (they arrive with that branch's own clinic), so letting
+// it set the price here would price this clinic's catalogue from another company's shelf.
+func chooseMasterDocs(docs []mongodump.Doc, stockOwner map[string]string, in Input) map[string]string {
+	firstInFile := map[string]string{}
+	fromBranchRoom := map[string]string{}
+
+	for _, d := range docs {
+		code := strings.TrimSpace(d.Text("code"))
+		if code == "" {
+			continue
+		}
+		id := docObjectID(d, "_id")
+		if id == "" {
+			continue
+		}
+		if _, seen := firstInFile[code]; !seen {
+			firstInFile[code] = id
+		}
+		legacyBranch, ownedByBranch := stockOwner[docObjectID(d, "stock")]
+		if !ownedByBranch || !knowsBranch(in, legacyBranch) {
+			continue
+		}
+		// First branch room wins when a tenant has several: dump order is stable, so two
+		// runs of the same export pick the same document. Which of two branches should
+		// price a shared SKU is a question no export answers, and inventing an answer per
+		// run would make the same import produce different catalogues.
+		if _, seen := fromBranchRoom[code]; !seen {
+			fromBranchRoom[code] = id
+		}
+	}
+
+	out := make(map[string]string, len(firstInFile))
+	for code, id := range firstInFile {
+		if branchDoc, ok := fromBranchRoom[code]; ok {
+			out[code] = branchDoc
+			continue
+		}
+		out[code] = id
+	}
+	return out
+}
+
 func slotDoc(d mongodump.Doc, mongoID string) (string, error) {
 	m := map[string]any{"migrate_source": "mongo items", "mongo_id": mongoID}
 	for _, f := range []string{"name1", "name2", "vat", "alert_stock", "alert_expire", "disbursement_fee"} {
