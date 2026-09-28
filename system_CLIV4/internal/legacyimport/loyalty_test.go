@@ -2,18 +2,28 @@ package legacyimport
 
 // Tests for mris.points → loyalty_account.
 //
-// Every case here is a decision the clinic owner made about money on 15 Sep 2026, so each
-// one is pinned rather than described: SUM (not last, not max) when a patient has several
-// documents, keep the zero balances, refuse rather than round, and never write a policy.
+// Every case here is a decision about money, so each one is pinned rather than described:
+// the FIRST document of an HN is the balance (not the sum, not the largest), an HN holding
+// nothing gets no account, refuse rather than round, and never write a policy.
+//
+// The first two were decided the other way on 15 Sep 2026 and corrected on 28 Sep 2026 —
+// see the header of loyalty.go for V2's own code showing why. These tests exist so the
+// correction cannot be undone by accident.
 
 import (
 	"strings"
 	"testing"
 )
 
-// pointsSample is the shape taken from the clinic's own mris.points collection, including
-// the case that forced a decision: HN 016400156 carries TWO documents of 1 point each, so
-// SUM (2) and LAST/MAX (1) disagree.
+// pointsSample mirrors the two shapes that forced decisions, taken from real exports:
+//
+//	016500001 — one document holding 0. V2 shows nothing saved; no account is opened.
+//	016400544 — the ordinary case, one document with a balance.
+//	016400156 — THREE documents. The first holds 5, the others 17000 and 1. Anjali
+//	            (C6C936C) really carries this shape: two HN whose first document is 0
+//	            beside a stale one holding 17,000. First=5, MAX=17000, SUM=17006, so the
+//	            three candidate rules give three different answers and the test can only
+//	            pass under one of them.
 const pointsSample = `db.points.insert({
     "_id": ObjectId("632804179ea97d1971cf651f"),
     "total_point": NumberDecimal("0"),
@@ -30,17 +40,24 @@ db.points.insert({
 });
 db.points.insert({
     "_id": ObjectId("633d6e4dda83ba1966c3e451"),
-    "total_point": NumberDecimal("1"),
+    "total_point": NumberDecimal("5"),
     "hn": "016400156",
     "created_at": ISODate("2022-10-05T11:45:17.631Z"),
     "updated_at": ISODate("2022-10-05T11:45:17.631Z")
 });
 db.points.insert({
     "_id": ObjectId("633d6e4dda83ba1966c3e453"),
-    "total_point": NumberDecimal("1"),
+    "total_point": NumberDecimal("17000"),
     "hn": "016400156",
     "created_at": ISODate("2022-10-05T11:45:17.632Z"),
     "updated_at": ISODate("2022-10-05T11:45:17.633Z")
+});
+db.points.insert({
+    "_id": ObjectId("633d6e4dda83ba1966c3e455"),
+    "total_point": NumberDecimal("1"),
+    "hn": "016400156",
+    "created_at": ISODate("2022-10-05T11:45:17.634Z"),
+    "updated_at": ISODate("2022-10-05T11:45:17.635Z")
 });`
 
 func buildLoyaltyOne(t *testing.T, body string) (string, *Report) {
@@ -57,26 +74,31 @@ func buildLoyaltyOne(t *testing.T, body string) (string, *Report) {
 	return sql, rep
 }
 
-// The decision that had a real alternative: two documents of 1 point become 2, not 1.
-func TestLoyaltySumsEveryDocumentOfOneHN(t *testing.T) {
+// The decision with three real alternatives. V2 reads PointSummary.findOne({hn}), so the
+// first document is the balance the patient has actually been shown; the others are
+// leftovers V2 can neither display nor spend.
+func TestLoyaltyUsesTheFirstDocumentOfOneHN(t *testing.T) {
 	sql, rep := buildLoyaltyOne(t, pointsSample)
 
-	// 4 documents → 3 patients.
-	for _, want := range []string{"'016500001'", "'016400544'", "'016400156'"} {
-		if !strings.Contains(sql, want) {
-			t.Errorf("SQL is missing hn %s", want)
-		}
+	if !strings.Contains(sql, ", 5, p.id") {
+		t.Errorf("hn 016400156 did not take the FIRST document's 5 points\n%s", sql)
 	}
-	// 1 + 1 = 2. LAST or MAX would both have written 1, which is the whole point.
-	if !strings.Contains(sql, ", 2, p.id") {
-		t.Errorf("hn 016400156 did not sum to 2 (SUM was the owner's choice; LAST/MAX give 1)\n%s", sql)
+	// The two rules this replaces, pinned as absent so neither can come back quietly.
+	if strings.Contains(sql, ", 17000, p.id") {
+		t.Errorf("hn 016400156 took the LARGEST document (17000) instead of the first\n%s", sql)
+	}
+	if strings.Contains(sql, ", 17006, p.id") {
+		t.Errorf("hn 016400156 summed its documents (17006) instead of taking the first\n%s", sql)
 	}
 	if !strings.Contains(sql, ", 3, p.id") {
 		t.Errorf("hn 016400544 should carry 3 points\n%s", sql)
 	}
-	// The merge has to be visible in the artifact, not just in the total.
-	if !strings.Contains(sql, "รวม 2 เอกสารเป็น 2 แต้ม") {
-		t.Errorf("no comment recording that two documents were merged\n%s", sql)
+	// Which document was used has to be visible in the artifact, not only in the total.
+	if !strings.Contains(sql, "ใช้ใบแรกตามที่ V2 อ่าน") {
+		t.Errorf("no comment recording that the first document was used\n%s", sql)
+	}
+	if !strings.Contains(sql, "ใบที่เหลือ 17000, 1") {
+		t.Errorf("the artifact does not say what was left behind\n%s", sql)
 	}
 	var noted bool
 	for _, n := range rep.Notes {
@@ -85,29 +107,66 @@ func TestLoyaltySumsEveryDocumentOfOneHN(t *testing.T) {
 		}
 	}
 	if !noted {
-		t.Errorf("the report does not say a balance was merged; notes = %v", rep.Notes)
+		t.Errorf("the report does not say an HN carried several documents; notes = %v", rep.Notes)
+	}
+	// A leftover that disagrees with the balance is a number somebody might expect to see,
+	// so it is named rather than counted.
+	var warned bool
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "016400156") && strings.Contains(w, "17000") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no warning naming the HN whose other documents disagree; warnings = %v", rep.Warnings)
 	}
 }
 
-// Zero balances are kept: enrolled-with-nothing-saved is not the same as never enrolled.
-// 1,193 of the reference clinic's 1,216 patients are in this state, so dropping them would
-// discard most of the entity.
-func TestLoyaltyKeepsZeroBalances(t *testing.T) {
+// An HN holding nothing gets no row. V4 opens a loyalty_account on the first movement that
+// awards something, never on a look, so a row at zero is a row the running app would not
+// have written. (Owner's rule, 28 Sep 2026 — it replaces the 15 Sep rule of importing every
+// HN including the zeros.)
+func TestLoyaltySkipsZeroBalances(t *testing.T) {
 	sql, rep := buildLoyaltyOne(t, pointsSample)
-	if !strings.Contains(sql, "'016500001'") {
-		t.Error("the zero-balance patient was dropped")
+	if strings.Contains(sql, "'016500001'") {
+		t.Errorf("the zero-balance patient got an account\n%s", sql)
 	}
-	if !strings.Contains(sql, ", 0, p.id") {
-		t.Errorf("no row carries balance 0\n%s", sql)
+	if strings.Contains(sql, ", 0, p.id") {
+		t.Errorf("a row was written with balance 0\n%s", sql)
+	}
+	if n := rep.Entities[EntLoyaltyAccount].Skipped["ยอดแต้มเป็น 0 — ไม่เปิดบัญชี (มติเจ้าของคลินิก 28 ก.ย. 2569)"]; n != 1 {
+		t.Errorf("skip counter = %d, want 1; skipped = %v", n, rep.Entities[EntLoyaltyAccount].Skipped)
 	}
 	var noted bool
 	for _, n := range rep.Notes {
-		if strings.Contains(n, "ยอด 0 อยู่ 1 hn") {
+		if strings.Contains(n, "ข้าม 1 hn ที่ยอดเป็น 0") {
 			noted = true
 		}
 	}
 	if !noted {
-		t.Errorf("the report does not count the zero balances; notes = %v", rep.Notes)
+		t.Errorf("the report does not count the skipped zero balances; notes = %v", rep.Notes)
+	}
+	// And the artifact says it too, so the number of rows is explainable from the SQL alone.
+	if !strings.Contains(sql, "hn ที่ยอดเป็น 0 ไม่ถูกเปิดบัญชี 1 ราย") {
+		t.Errorf("the script does not record the skipped zero balances\n%s", sql)
+	}
+}
+
+// An export where nobody holds a balance is refused rather than producing an import that
+// writes nothing and reports success.
+func TestLoyaltyRefusesWhenEveryBalanceIsZero(t *testing.T) {
+	body := `db.points.insert({
+    "_id": ObjectId("632804179ea97d1971cf651f"),
+    "total_point": NumberDecimal("0"),
+    "hn": "016500001",
+    "created_at": ISODate("2022-09-19T05:54:31.661Z")
+});`
+	mc, err := parseMongoCatalog([]byte(body))
+	if err != nil {
+		t.Fatalf("parseMongoCatalog: %v", err)
+	}
+	if _, err = buildLoyalty(mc, Input{ClinicCode: "C9C9611"}, NewReport("C9C9611")); err == nil {
+		t.Fatal("expected a refusal when no HN holds a balance")
 	}
 }
 
@@ -115,7 +174,7 @@ func TestLoyaltyKeepsZeroBalances(t *testing.T) {
 // from the same construction: INSERT … SELECT FROM patient.
 func TestLoyaltyResolvesPatientIDAndSkipsUnknownHN(t *testing.T) {
 	sql, _ := buildLoyaltyOne(t, pointsSample)
-	if !strings.Contains(sql, "SELECT %s") && !strings.Contains(sql, "FROM patient p") {
+	if !strings.Contains(sql, "FROM patient p") {
 		t.Errorf("the insert does not select from patient, so patient_id would be NULL\n%s", sql)
 	}
 	if !strings.Contains(sql, `p."HN" =`) {
@@ -147,7 +206,7 @@ func TestLoyaltyRefusesFractionalPoints(t *testing.T) {
 	}
 }
 
-// A negative total is refused with every offending HN named, rather than letting
+// A negative FIRST document is refused with every offending HN named, rather than letting
 // CHECK (balance >= 0) stop at whichever row Postgres reached first.
 func TestLoyaltyRefusesNegativeBalance(t *testing.T) {
 	body := strings.Replace(pointsSample, `NumberDecimal("3")`, `NumberDecimal("-4")`, 1)
@@ -161,6 +220,26 @@ func TestLoyaltyRefusesNegativeBalance(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "016400544") || !strings.Contains(err.Error(), "-4") {
 		t.Errorf("the error should name the HN and the value: %v", err)
+	}
+}
+
+// A negative value in a LATER document is reported but does not stop the import: V2 never
+// shows it, so it cannot be this patient's balance. Refusing on it would block a clinic
+// over a number nobody can reach.
+func TestLoyaltyReportsButKeepsGoingOnANegativeLaterDocument(t *testing.T) {
+	body := strings.Replace(pointsSample, `NumberDecimal("17000")`, `NumberDecimal("-9")`, 1)
+	sql, rep := buildLoyaltyOne(t, body)
+	if !strings.Contains(sql, ", 5, p.id") {
+		t.Errorf("the first document's balance was not written\n%s", sql)
+	}
+	var warned bool
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "ยอดติดลบ") && strings.Contains(w, "016400156") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no warning about the negative leftover; warnings = %v", rep.Warnings)
 	}
 }
 
