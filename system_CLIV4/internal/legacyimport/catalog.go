@@ -3,6 +3,7 @@ package legacyimport
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -358,6 +359,12 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 	var s sqlBuilder
 	seen := map[string]bool{}
 	draft := 0
+	// Services whose legacy `point` turned out to be stored-value credit rather than a
+	// loyalty rate. Collected so the report can name each one instead of stating a count.
+	var creditLike []string
+	// Services the arithmetic let through while the NAME says stored value. Reported for a
+	// human to judge, never refused here.
+	var nameSuspect []string
 	for n, d := range mc.listheals {
 		code := d.Text("code")
 		if code == "" {
@@ -400,6 +407,21 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 		s.addf("%s", upsertCatalogItem(in.ClinicCode, code, "service", nameThLit, nameEnLit,
 			category, price, "0", status, "catalog", "NULL", tsLit(d.Text("createdAt"), "now()")))
 
+		// แต้มสะสมต่อรายการ. V2's `point` is not always points — see
+		// serviceLoyaltyPoints. A value that is really stored-value credit is dropped to 0
+		// and named in the report.
+		points, credit := serviceLoyaltyPoints(d.Text("point"), price)
+		switch {
+		case credit:
+			creditLike = append(creditLike,
+				fmt.Sprintf("%s %s (ราคา %s → point %d)", code, oneLine(nameTh), moneyLit(price), intFromMoney(d.Text("point"))))
+		case points > 0 && looksLikeStoredValueName(nameTh):
+			// Passed the arithmetic but the name says stored value. Reported, not refused:
+			// see looksLikeStoredValueName for why the two cannot be told apart from data.
+			nameSuspect = append(nameSuspect,
+				fmt.Sprintf("%s %s (ราคา %s → point %d)", code, oneLine(nameTh), moneyLit(price), points))
+		}
+
 		// catalog_service carries the service policy. service_kind stays NULL: the
 		// legacy `kind` is free text ("หัตถการ"/"Lab"/"อื่นๆ") with no V4 kind row to
 		// point at, and inventing one would put a guess in the policy table.
@@ -414,7 +436,7 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
     updated_at          = now();
 
 `, catalogItemIDByCode(in.ClinicCode, code), lit(in.ClinicCode),
-			boolLit(docBool(d, "isDoctorFee")), intFromMoney(d.Text("point")),
+			boolLit(docBool(d, "isDoctorFee")), points,
 			catalogItemIDByCode(in.ClinicCode, code))
 	}
 
@@ -422,11 +444,103 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 	if draft > 0 {
 		rep.warnf("catalog_item(service): %d รายการไม่มีราคา → status=draft (ขายไม่ได้จนกว่าจะใส่ราคา)", draft)
 	}
+	if len(creditLike) > 0 {
+		rep.warnf("catalog_service: %d รายการมี point ที่ไม่น้อยกว่าราคาขาย — เป็นวงเงิน/เครดิตบาท ไม่ใช่แต้มสะสม "+
+			"จึงนำเข้าเป็น 0 (มติเจ้าของคลินิก 28 ก.ย. 2569) · คลินิกตั้งแต้มที่ถูกต้องเองในจอได้: %s",
+			len(creditLike), strings.Join(capList(creditLike, 25), " · "))
+	}
+	if len(nameSuspect) > 0 {
+		rep.warnf("catalog_service: %d รายการที่ชื่อบอกว่าเป็นวงเงิน/เครดิต แต่ point น้อยกว่าราคา จึง**นำเข้าตามต้นทาง** — "+
+			"แยกจากตัวเลขไม่ได้ว่าเป็นอัตราแต้มหรือเครดิตส่วนเพิ่ม ต้องให้คนตรวจ ถ้าผิดให้แก้ในจอก่อนเปิด loyalty_policy: %s",
+			len(nameSuspect), strings.Join(capList(nameSuspect, 25), " · "))
+	}
 	if kinds := distinctValues(mc.kindName); len(kinds) > 0 {
 		rep.notef("listheals: legacy kind (%s) ไม่ได้ import — V4 ไม่มีแถว service_kind ให้อ้าง จึงปล่อย NULL ไม่เดา",
 			strings.Join(kinds, ", "))
 	}
 	return s.String(), nil
+}
+
+// serviceLoyaltyPoints decides what reaches catalog_service.loyalty_points, and reports
+// whether the source value was refused.
+//
+// # WHY THE SOURCE NUMBER CANNOT BE TRUSTED AS POINTS
+//
+// V2's listheal.point is used for two unrelated things and nothing in the document says
+// which. Some clinics put a loyalty rate there; others put the STORED-VALUE CREDIT a
+// prepaid package hands back. The second kind is unmistakable in the data because the
+// credit is always at least the price — the package's whole selling point is getting more
+// back than you paid. Measured across the five clinics on production (28 Sep 2026):
+//
+//	point >= price : 33 rows, every one named วงเงิน / Member / VIP / Package แถม —
+//	                 "VIP 500,000 ได้รับ 550,000", "วงเงิน 50,000ใช้ได้60,000"
+//	point <  price : 5 rows, all plausible rates — "รายการรักษา A3 (มีแต้มสะสม)"
+//	                 5,000 → 500, "Anti - Aging" 10,000 → 10
+//
+// Importing the first kind as loyalty points is not a cosmetic error. awardPoints
+// (internal/controller/billing/service.go) sums loyalty_points over the invoice and awards
+// it once the bill is settled in full, and the ONLY gate on that is policy.Active — there
+// is no per-bill ceiling anywhere. Anjali (C6C936C) imported this way carried 4,603,000
+// points across 19 Member packages, so the day the clinic turned the scheme on, one
+// 600,000 baht package would have awarded 750,000 points. Those rows had to be cleared by
+// hand on 28 Sep 2026; this guard is why it does not happen again.
+//
+// The owner's rule (28 Sep 2026): carry `point` only when it is smaller than the price.
+// Anything else arrives as 0 and is named in the report, so the clinic sets a real rate on
+// screen rather than inheriting a number that means something else.
+//
+// A price that is absent or zero cannot be compared, so it falls on the refusing side.
+// Those rows are status=draft anyway (catalogStatus makes a service with no price a draft)
+// and cannot be sold until someone prices them, which is the same moment they would set
+// the points.
+func serviceLoyaltyPoints(pointText, priceText string) (points int, creditLike bool) {
+	p := intFromMoney(pointText)
+	if p <= 0 {
+		return 0, false
+	}
+	// moneyFloat is the package's check-only parser: it returns 0 for anything it cannot
+	// read, which lands unpriced and malformed rows on the refusing side together.
+	price := moneyFloat(priceText)
+	if price <= 0 {
+		return 0, true
+	}
+	if float64(p) >= math.Round(price) {
+		return 0, true
+	}
+	return p, false
+}
+
+// storedValueNameHints are the words V2's clinics put in the name of a prepaid package.
+// Latin ones are matched case-insensitively; the Thai ones have no case.
+var storedValueNameHints = []string{
+	"credit", "member", "vip", "package",
+	"วงเงิน", "แถม", "มัดจำ", "เครดิต",
+}
+
+// looksLikeStoredValueName reports whether a service is NAMED like a prepaid package.
+//
+// # WHY THIS ONLY WARNS
+//
+// serviceLoyaltyPoints catches the credit that is at least the price, which is what a
+// "จ่าย 600,000 ได้ 750,000" package always looks like. It cannot catch a BONUS credit
+// smaller than the price, because "ซื้อ 20,000 ได้เครดิตเพิ่ม 1,000" and "20,000 บาท ได้
+// 1,000 แต้ม" are the same two numbers. Anjali's export holds exactly that: LH491 "Beauty
+// Credit" priced 20,000 with point 1,000 passes the arithmetic, while its siblings LC942
+// to LC946 — the same product family, same wording — were priced 0 and were caught.
+//
+// A name is weaker evidence than a price, so it does not refuse anything: a clinic really
+// can name a loyalty item "รายการรักษา A3 (มีแต้มสะสม)" or set 1 point on "VIP50000", and
+// both exist on production today. Refusing on a word would delete an intention the clinic
+// did state. Warning names the row and leaves the judgement with the person reading the
+// report, before they turn loyalty_policy.active on.
+func looksLikeStoredValueName(name string) bool {
+	n := strings.ToLower(name)
+	for _, hint := range storedValueNameHints {
+		if strings.Contains(n, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildItems maps the Mongo `items` collection onto three tables.
