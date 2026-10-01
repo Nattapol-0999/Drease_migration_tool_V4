@@ -170,13 +170,27 @@ type receiptPlan struct {
 	patientName   string
 	branchCode    string
 	doctorCode    string
-	remark        string
-	payDate       string // SQL literal (date)
-	createdAt     string // SQL literal
-	pointApply    string
-	insurer       string
-	approveCode   string
-	channels      []channelPlan
+	// remark is the WHOLE payment_remark, bound for receipt.note, which is `text`.
+	// detail is the same value clipped to receipt.detail's varchar(255).
+	//
+	// TWO FIELDS, NOT ONE. The same string used to be written into both columns, and a
+	// single receipt in the kvk-clinic export carried a remark of 26,286 characters —
+	// somebody had pasted a whole month's appointment roster into the remark box in V2.
+	// psql stopped on "value too long for type character varying(255)" after 109 seconds,
+	// and because the script is 27 transactions and not one, the groups before the money
+	// phase had already committed: the tenant was left half-loaded. One un-clipped value
+	// out of 19,311 receipts did that.
+	//
+	// Clipped HERE rather than at render time because this is where `rep` is, so the
+	// truncation is reported in the same place as every other entity's.
+	remark      string
+	detail      string
+	payDate     string // SQL literal (date)
+	createdAt   string // SQL literal
+	pointApply  string
+	insurer     string
+	approveCode string
+	channels    []channelPlan
 
 	// paidExpr is the MONEY that actually came in: the channel amounts added up as SQL.
 	// discountExpr is what this receipt closed WITHOUT money — the difference between the
@@ -546,6 +560,10 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 	}
 
 	seenNo := map[string]string{}
+	// Width clipping is reported per column, like every other entity does it, so a
+	// value that had to be cut shows up in the report instead of only in the database.
+	tr := truncations{}
+	var cut bool
 	renumbered := 0
 	percentDiscount := 0
 	noMoneyReceipts := 0
@@ -615,18 +633,30 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 				// issued the bill. p.bp.branchCode is already a resolved V4 code, so it
 				// is used as the fallback rather than resolved twice.
 				branchCode: resolveOrKeep(br, d.Text("paid_branch.branch_code"), p.bp.branchCode),
-				doctorCode: strings.TrimSpace(d.Text("doctor")),
-				remark:     strings.TrimSpace(d.Text("payment_remark")),
 				payDate:    mongoDateLit(d, "created_at", "NULL"),
 				createdAt:  mongoTSLit(d, "created_at", "now()"),
 				pointApply: moneyLit(firstNonEmpty(d.Text("use_point"), "0")),
 				fClosed:    moneyFloat(d.Text("payment_type.price_total")),
 			}
+			// receipt.doctor_code is varchar(64).
+			rp.doctorCode, cut = clip(strings.TrimSpace(d.Text("doctor")), 64)
+			tr.note("doctor_code", cut)
+			// receipt.note is text, so the remark is kept whole; receipt.detail is
+			// varchar(255) and gets the clipped form. V4 reads detail as a one-line
+			// label (cockpit's product_name, the customer profile's title), so the
+			// long form has no place there even when it would fit.
+			rp.remark = strings.TrimSpace(d.Text("payment_remark"))
+			rp.detail, cut = clip(rp.remark, 255)
+			tr.note("detail", cut)
 			if insurer := strings.TrimSpace(d.Text("insurance.insurance_name")); insurer != "" && insurer != "0" {
-				rp.insurer, _ = clip(insurer, 255)
+				// receipt_payment.insurer is varchar(64), not 255. The 255 here was a
+				// latent copy of the width used for name columns.
+				rp.insurer, cut = clip(insurer, 64)
+				tr.note("insurer", cut)
 			}
 			if appr := strings.TrimSpace(d.Text("gov_direct.appr_code")); appr != "" {
-				rp.approveCode, _ = clip(appr, 64)
+				rp.approveCode, cut = clip(appr, 64)
+				tr.note("approve_code", cut)
 			}
 
 			// One receipt_payment per channel that carries money. A zero channel is not
@@ -702,6 +732,10 @@ func planReceipts(mc *mongoCatalog, byBillID map[string]*billPlan, br *branchRes
 	if percentDiscount > 0 {
 		rep.notef("receipt: %d ใบระบุส่วนลดเป็นเปอร์เซ็นต์ในระบบเก่า — ไม่ต้องแปลงอัตรานั้นเอง เพราะส่วนลดถูกคิดจากส่วนต่าง (ยอดที่ปิด − เงินที่รับ) ซึ่งได้จำนวนเงินจริงอยู่แล้ว",
 			percentDiscount)
+	}
+	if sum := tr.summary(); sum != "" {
+		rep.warnf("receipt: ตัดข้อความให้พอดีความกว้างคอลัมน์ %s — ข้อความเต็มของช่องหมายเหตุยังอยู่ครบใน receipt.note (เป็น text ไม่จำกัดความยาว) ที่ถูกตัดคือ receipt.detail ซึ่งเป็นป้ายบรรทัดเดียวบนหน้าจอ",
+			sum)
 	}
 	return out, nil
 }
@@ -985,7 +1019,7 @@ WHERE %s IS NOT NULL
 `, lit(in.ClinicCode), invoiceIDByNo(in.ClinicCode, r.invoiceNo), lit(r.no), r.installmentNo,
 			nullLit(r.hn), nullLit(r.patientName),
 			r.paidExpr, r.discountExpr, r.pointApply,
-			MoneyVATRate, nullLit(r.remark), nullLit(r.remark), nullLit(r.doctorCode), r.payDate,
+			MoneyVATRate, nullLit(r.remark), nullLit(r.detail), nullLit(r.doctorCode), r.payDate,
 			lit(r.branchCode), r.createdAt,
 			invoiceIDByNo(in.ClinicCode, r.invoiceNo),
 			lit(in.ClinicCode), lit(r.no))
