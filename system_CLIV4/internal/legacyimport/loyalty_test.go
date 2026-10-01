@@ -152,21 +152,56 @@ func TestLoyaltySkipsZeroBalances(t *testing.T) {
 	}
 }
 
-// An export where nobody holds a balance is refused rather than producing an import that
-// writes nothing and reports success.
-func TestLoyaltyRefusesWhenEveryBalanceIsZero(t *testing.T) {
+// An export where every balance is zero opens no account and MUST NOT fail.
+//
+// This pins a regression, not a preference. The first version of the zero-balance rule
+// refused such an export, and because an error from buildLoyalty aborts BuildAll, a real
+// clinic with 2,269 hn all at zero could not generate ANY sql — its bills, page, items and
+// ten other collections were blocked by a points collection that simply had nothing in it
+// (seen 30 Sep 2026). A clinic that runs no points scheme looks exactly like this.
+func TestLoyaltyOpensNoAccountWhenEveryBalanceIsZero(t *testing.T) {
 	body := `db.points.insert({
     "_id": ObjectId("632804179ea97d1971cf651f"),
     "total_point": NumberDecimal("0"),
     "hn": "016500001",
     "created_at": ISODate("2022-09-19T05:54:31.661Z")
+});
+db.points.insert({
+    "_id": ObjectId("632804179ea97d1971cf6520"),
+    "total_point": NumberDecimal("0"),
+    "hn": "016500002",
+    "created_at": ISODate("2022-09-19T05:54:31.662Z")
 });`
 	mc, err := parseMongoCatalog([]byte(body))
 	if err != nil {
 		t.Fatalf("parseMongoCatalog: %v", err)
 	}
-	if _, err = buildLoyalty(mc, Input{ClinicCode: "C9C9611"}, NewReport("C9C9611")); err == nil {
-		t.Fatal("expected a refusal when no HN holds a balance")
+	rep := NewReport("C9C9611")
+	sql, err := buildLoyalty(mc, Input{ClinicCode: "C9C9611"}, rep)
+	if err != nil {
+		t.Fatalf("an all-zero export must not fail — it blocks every other group: %v", err)
+	}
+	if strings.Contains(executableSQL(sql), "INSERT INTO loyalty_account") {
+		t.Errorf("an account was opened for a patient holding nothing\n%s", sql)
+	}
+	if !strings.Contains(sql, "ยอดเป็น 0 ทุกราย จึงไม่เปิดบัญชีแต้มให้ใครเลย") {
+		t.Errorf("the artifact does not say why it wrote nothing\n%s", sql)
+	}
+	if !strings.Contains(sql, "ไม่ใช่ข้อผิดพลาด") {
+		t.Errorf("the artifact does not say this is a normal outcome\n%s", sql)
+	}
+	var noted bool
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "ยอดเป็น 0 ทุกราย") && strings.Contains(n, "กลุ่มอื่นนำเข้าต่อได้") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("the report does not say the other groups can still import; notes = %v", rep.Notes)
+	}
+	// And no policy hint: there is no balance to make visible, so the statement would be noise.
+	if strings.Contains(sql, "<BAHT_PER_POINT>") {
+		t.Errorf("the policy hint was printed even though no balance was imported\n%s", sql)
 	}
 }
 
@@ -180,7 +215,9 @@ func TestLoyaltyResolvesPatientIDAndSkipsUnknownHN(t *testing.T) {
 	if !strings.Contains(sql, `p."HN" =`) {
 		t.Errorf("the patient lookup is not keyed on HN\n%s", sql)
 	}
-	if strings.Contains(sql, "VALUES (") {
+	// Executable part only: the artifact documents the loyalty_policy statement as a
+	// comment, and that one legitimately uses VALUES.
+	if strings.Contains(executableSQL(sql), "VALUES (") {
 		t.Errorf("a VALUES insert cannot resolve patient_id — it must be INSERT … SELECT\n%s", sql)
 	}
 	// Re-running must not overwrite a balance the clinic edited on screen.
@@ -274,11 +311,15 @@ db.point_logs.insert({
 	if !strings.Contains(sql, "loyalty_policy ก็ไม่ถูกเขียน") {
 		t.Errorf("the script does not record that no policy was written\n%s", sql)
 	}
-	// And nothing that would actually write those tables.
-	if strings.Contains(sql, "INSERT INTO loyalty_txn") {
+	// And nothing that would actually write those tables. Checked against the EXECUTABLE
+	// part only: the artifact prints the policy statement as a comment on purpose (see
+	// TestLoyaltyPrintsThePolicyStatementItRefusesToRun), so a plain substring search over
+	// the whole script would confuse "documented" with "executed".
+	exec := executableSQL(sql)
+	if strings.Contains(exec, "INSERT INTO loyalty_txn") {
 		t.Error("loyalty_txn must not be written: the owner chose not to import point_logs")
 	}
-	if strings.Contains(sql, "INSERT INTO loyalty_policy") {
+	if strings.Contains(exec, "INSERT INTO loyalty_policy") {
 		t.Error("loyalty_policy must not be written: the owner chose not to set a rate")
 	}
 
@@ -298,6 +339,80 @@ db.point_logs.insert({
 	}
 	if !notedPolicy {
 		t.Errorf("no note about the missing policy; notes = %v", rep.Notes)
+	}
+}
+
+// executableSQL strips comment lines so an assertion can tell what the script RUNS from
+// what it merely documents.
+func executableSQL(sql string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(sql, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// The balances landing correctly was not enough: on 28 Sep 2026 C6C936C imported 544
+// accounts and the customer panel still showed 0, because the screen gates on
+// policy.active and nothing in the import said so. The statement now travels with the
+// artifact — printed, not executed, because the rate prices a liability the clinic owns.
+func TestLoyaltyPrintsThePolicyStatementItRefusesToRun(t *testing.T) {
+	sql, _ := buildLoyaltyOne(t, pointsSample)
+
+	for _, want := range []string{
+		"ต้องทำอีกหนึ่งขั้นหลังรันไฟล์นี้",
+		"INSERT INTO loyalty_policy (clinic_code, baht_per_point, min_redeem, active, updated_at)",
+		"VALUES ('C9C9611', 0, 0, true, now())",
+		"<BAHT_PER_POINT>",
+		"DELETE FROM loyalty_policy WHERE clinic_code = 'C9C9611';",
+		"Earns() = policy.Active",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("the artifact does not carry %q\n%s", want, sql)
+		}
+	}
+
+	// Every line of the hint must be a comment. If one ever renders as a statement the
+	// import would set a clinic's redemption rate by itself.
+	if exec := executableSQL(sql); strings.Contains(exec, "loyalty_policy") {
+		t.Errorf("the policy statement is executable, not documented:\n%s", exec)
+	}
+
+	// The number that makes the decision reviewable: what one fully-paid bill will award
+	// once the switch is on. pointsSample carries no listheals, so it must say so rather
+	// than print a silent 0.
+	if !strings.Contains(sql, "ไม่ใส่แต้มให้รายการใดเลย") {
+		t.Errorf("no statement about the per-bill earning ceiling\n%s", sql)
+	}
+}
+
+// With services in the dump, the hint states how many points one bill can award — the
+// figure that matters because Earns() has no per-bill ceiling of its own.
+func TestLoyaltyPolicyHintCountsTheEarningCeiling(t *testing.T) {
+	body := pointsSample + `
+db.getCollection("listheals").insert([
+  { _id: ObjectId("6a00000000000000000000d1"), code: "LH087", name_th: "Anti - Aging",
+    cost: NumberDecimal("10000"), point: NumberDecimal("10") },
+  { _id: ObjectId("6a00000000000000000000d2"), code: "LH086", name_th: "Anti - Aging",
+    cost: NumberDecimal("10000"), point: NumberDecimal("1") },
+  { _id: ObjectId("6a00000000000000000000d3"), code: "LH447", name_th: "Member 600,000 ได้ 750,000",
+    cost: NumberDecimal("600000"), point: NumberDecimal("750000") }
+]);`
+	sql, _ := buildLoyaltyOne(t, body)
+
+	// 10 + 1 = 11. The Member package is stored-value credit and must not be counted.
+	if !strings.Contains(sql, "รวม 11 แต้มต่อการขายครบทุกรายการในหนึ่งบิล") {
+		t.Errorf("the ceiling is not 11 — the credit package was probably counted\n%s", sql)
+	}
+	if strings.Contains(sql, "750011") || strings.Contains(sql, "รวม 750000") {
+		t.Errorf("the stored-value credit was counted into the earning ceiling\n%s", sql)
+	}
+	if !strings.Contains(sql, "ใส่แต้มไว้ 2 รายการ") {
+		t.Errorf("the count of items carrying points is wrong\n%s", sql)
 	}
 }
 

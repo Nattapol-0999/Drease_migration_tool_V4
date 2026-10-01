@@ -247,10 +247,32 @@ ON CONFLICT (clinic_code, hn) DO NOTHING;`, c, h, b.balance, c, h)
 			len(negative), strings.Join(negative, ", "))
 	}
 
+	// Every hn sits at zero. That is what a clinic with no points scheme looks like, not a
+	// surprise, so it must not fail — and it especially must not fail HERE: an error from
+	// buildLoyalty aborts BuildAll (build.go), so refusing cost a real export its other 13
+	// collections. Seen on 30 Sep 2026: a clinic with 2,269 hn all at zero could not generate
+	// any SQL at all, bills and page included, because of this check.
+	//
+	// Nothing is written and the artifact says why, which is the honest outcome: V4 opens a
+	// loyalty_account on the first movement that awards something, so there is no row for a
+	// patient who has never earned a point.
 	if written == 0 {
-		return "", fmt.Errorf(
-			"mris.points มี %d hn แต่ยอดเป็น 0 ทั้งหมด — ไม่มีบัญชีแต้มให้เปิด (มติ 28 ก.ย. 2569: ไม่เปิดบัญชีให้ยอด 0)",
-			len(hns))
+		s.comment("")
+		s.comment("mris.points มี %d hn แต่ยอดเป็น 0 ทุกราย จึงไม่เปิดบัญชีแต้มให้ใครเลย", len(hns))
+		s.comment("(มติเจ้าของคลินิก 28 ก.ย. 2569 — V4 เปิดบัญชีตอนได้แต้มครั้งแรก ไม่ใช่ตอนเปิดคนไข้)")
+		s.comment("ไม่ใช่ข้อผิดพลาด: คลินิกที่ไม่ได้ใช้ระบบแต้มสะสมจะมีหน้าตาแบบนี้")
+		if len(mc.pointLogs) > 0 {
+			s.comment("point_logs ของ V2 มี %d เอกสาร แต่ไม่ถูกนำเข้าอยู่แล้วตามมติ 15 ก.ย. 2569", len(mc.pointLogs))
+		}
+		s.comment("")
+		e.Statements = s.stmts
+		rep.notef("loyalty_account: %d เอกสาร → %d hn · ยอดเป็น 0 ทุกราย จึงไม่เปิดบัญชีให้ใคร (0 แถว) "+
+			"— ไม่ใช่ข้อผิดพลาด คลินิกที่ไม่ได้ใช้ระบบแต้มจะได้ผลแบบนี้ และกลุ่มอื่นนำเข้าต่อได้ตามปกติ",
+			len(mc.points), len(hns))
+		if noHN > 0 {
+			rep.warnf("loyalty_account: %d เอกสารไม่มี hn — ไม่นำเข้า เพราะแต้มที่ไม่รู้ว่าเป็นของใครเขียนลงตารางไม่ได้", noHN)
+		}
+		return s.String(), nil
 	}
 
 	// Stated in the script itself, not only in the report: whoever reads this SQL later
@@ -264,6 +286,8 @@ ON CONFLICT (clinic_code, hn) DO NOTHING;`, c, h, b.balance, c, h)
 	s.comment("(migration 0238 ตั้งใจให้ loyalty_txn เป็น append-only ที่อธิบายยอด — นี่คือข้อยกเว้นที่เจาะจง)")
 	s.comment("loyalty_policy ก็ไม่ถูกเขียน แต้มจึงยังแลกไม่ได้จนคลินิกตั้งอัตราเองในจอ")
 	s.comment("")
+
+	writePolicyHint(&s, mc, in.ClinicCode, written, total)
 
 	// How many accounts actually landed. A shortfall means those HNs have no patient row
 	// yet, and the balances did not silently vanish — they were never written and will be
@@ -318,6 +342,74 @@ END $loyalty$;`, lit(in.ClinicCode), written, written)
 		"(baht_per_point) และเปิด active เองในจอ · การเปิด active ยังเริ่มแจกแต้มจาก catalog_service.loyalty_points ด้วย")
 
 	return s.String(), nil
+}
+
+// writePolicyHint spells out the one step that has to happen AFTER this script for the
+// balances to be visible, and renders it as SQL an operator can copy.
+//
+// # WHY A HINT AND NOT A WRITE
+//
+// loyalty_policy is not written by this import (owner's decision, 15 Sep 2026) because
+// baht_per_point prices a liability: Anjali's 15,535,139 imported points came from a V2
+// field that held BAHT of prepaid credit, so setting the rate to 1 accepts a debt of
+// 15.5 million. That is the clinic's call, not the importer's.
+//
+// The cost of leaving it out was measured on 28 Sep 2026: the balances landed correctly and
+// the customer panel still showed 0, because the screen gates on policy.active alone
+// (`D != null && D.policy.active ? balance : "0" + pointSchemeOff`). Nobody reading the
+// import report could tell that one more statement was needed — it took reading the
+// deployed frontend bundle to find out. So the statement now travels with the artifact.
+//
+// Deliberately still not executed. What it does print is the exact command, both variants,
+// the rollback, and the number that makes the decision reviewable: how many points a single
+// fully-paid bill will award once the switch is on, since Earns() is policy.Active alone
+// with no per-bill ceiling anywhere.
+func writePolicyHint(s *sqlBuilder, mc *mongoCatalog, clinic string, accounts int, total int64) {
+	// What this import itself adds to the per-bill earning ceiling. Only services carry a
+	// value: buildCourses writes catalog_course.loyalty_points as 0, and the credit guard in
+	// serviceLoyaltyPoints has already refused anything that is really stored value.
+	var ceiling int64
+	kept := 0
+	for _, d := range mc.listheals {
+		if p, credit := serviceLoyaltyPoints(d.Text("point"), d.Text("cost")); !credit && p > 0 {
+			ceiling += int64(p)
+			kept++
+		}
+	}
+
+	c := lit(clinic)
+	s.comment("──────────────────────────────────────────────────────────────────────────")
+	s.comment("ต้องทำอีกหนึ่งขั้นหลังรันไฟล์นี้ ไม่งั้นจอจะโชว์ 0 ทั้งที่ยอดเข้าฐานแล้ว")
+	s.comment("")
+	s.comment("ไฟล์นี้เขียนยอดแต้มให้ %d บัญชี รวม %d แต้ม แต่ไม่ได้เขียน loyalty_policy", accounts, total)
+	s.comment("และจอโปรไฟล์ลูกค้าเช็ค policy.active อย่างเดียวก่อนจะแสดงยอด ถ้าไม่มีแถว policy")
+	s.comment("ลูกค้าจะเห็น 0 พร้อมข้อความ \"ยังไม่เปิดใช้แต้ม — ตั้งค่าที่ ตั้งค่า › แต้มสะสม\"")
+	s.comment("(วัดจริงกับ C6C936C เมื่อ 28 ก.ย. 2569: ยอดเข้าครบ 544 บัญชี แต่จอโชว์ 0 อยู่ 3 ชั่วโมง)")
+	s.comment("")
+	s.comment("① แสดงยอดอย่างเดียว ยังแลกไม่ได้ (Redeems() ต้องมี baht_per_point > 0):")
+	s.comment("   INSERT INTO loyalty_policy (clinic_code, baht_per_point, min_redeem, active, updated_at)")
+	s.comment("   VALUES (%s, 0, 0, true, now())", c)
+	s.comment("   ON CONFLICT (clinic_code) DO UPDATE SET active = true, updated_at = now();")
+	s.comment("")
+	s.comment("② แสดงยอดและให้แลกได้ — ใส่อัตราเองแทน <BAHT_PER_POINT> และ <MIN_REDEEM>:")
+	s.comment("   INSERT INTO loyalty_policy (clinic_code, baht_per_point, min_redeem, active, updated_at)")
+	s.comment("   VALUES (%s, <BAHT_PER_POINT>, <MIN_REDEEM>, true, now())", c)
+	s.comment("   ON CONFLICT (clinic_code) DO UPDATE SET baht_per_point = EXCLUDED.baht_per_point,")
+	s.comment("       min_redeem = EXCLUDED.min_redeem, active = true, updated_at = now();")
+	s.comment("   baht_per_point = 1 คือคงมูลค่าเดิมจาก V2 ไว้ทั้งก้อน = รับหนี้ %d บาท", total)
+	s.comment("")
+	s.comment("③ ย้อนกลับ: DELETE FROM loyalty_policy WHERE clinic_code = %s;", c)
+	s.comment("")
+	s.comment("ทั้งสองแบบเปิด Earns() ด้วย เพราะ Earns() = policy.Active ตัวเดียว ไม่มีเพดานต่อบิล")
+	if kept > 0 {
+		s.comment("การนำเข้าชุดนี้ใส่แต้มไว้ %d รายการ รวม %d แต้มต่อการขายครบทุกรายการในหนึ่งบิล",
+			kept, ceiling)
+	} else {
+		s.comment("การนำเข้าชุดนี้ไม่ใส่แต้มให้รายการใดเลย บิลจะยังไม่แจกแต้มจนคลินิกตั้งเองในจอ")
+	}
+	s.comment("ปลายทางอาจมีรายการที่ให้แต้มอยู่ก่อนแล้ว ไฟล์นี้นับไม่ได้ — ดูหน้าแคตตาล็อกก่อนเปิดสวิตช์")
+	s.comment("──────────────────────────────────────────────────────────────────────────")
+	s.comment("")
 }
 
 // joinInts renders a list of source values for an operator to read.
