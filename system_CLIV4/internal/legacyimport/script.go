@@ -284,6 +284,14 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	if err := checkUserMapIsCreatedBeforeUse(script); err != nil {
 		return "", rep, err
 	}
+	// STRUCTURAL INVARIANT: no value may be wider than the column it lands in.
+	//
+	// Also checked on the assembled text, for the same reason as the one above: it holds
+	// for every entity, and the cost of finding out later is a half-loaded tenant rather
+	// than an error message. See widths.go.
+	if err := checkScriptWidths(script, rep); err != nil {
+		return "", rep, err
+	}
 	return script, rep, nil
 }
 
