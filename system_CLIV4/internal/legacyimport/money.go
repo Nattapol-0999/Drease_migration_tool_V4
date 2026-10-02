@@ -81,6 +81,12 @@ type moneyBatches struct {
 	// pass. Only bills that survived every check are in here, so an entitlement can
 	// never point at a line this script did not write.
 	courseSale map[string]courseSaleRef
+	// courseUsage is every bill line that DEDUCTED a course session
+	// (use_course=true). The legacy line carries no `course_bill` pointer — that is
+	// literally how use_course is decided in planBillLines — so the line says WHAT was
+	// consumed and WHEN, but not from which entitlement. coursebought.go resolves that
+	// by FIFO and reports what it could not place.
+	courseUsage []courseUsageRef
 	// invoiceNoByBillID is bills _id → invoice no, for entitlements that know only their
 	// bill.
 	invoiceNoByBillID map[string]string
@@ -158,6 +164,20 @@ type linePlan struct {
 type courseSaleRef struct {
 	invoiceNo string
 	sortOrder int
+}
+
+// courseUsageRef is one bill line that consumed a course session. It is the only
+// honest record of WHEN a session was used: course_bills keeps a remaining count and
+// no dates at all, while this line sits on a real bill with a real timestamp.
+type courseUsageRef struct {
+	hn         string
+	invoiceNo  string
+	branchCode string
+	createdAt  string // SQL literal — when the session was consumed
+	code       string
+	name       string
+	qty        string
+	sortOrder  int
 }
 
 // receiptPlan is one payment_summary row mapped onto receipt + receipt_payment.
@@ -288,6 +308,18 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 		for _, l := range p.lines {
 			if l.courseBillID != "" {
 				out.courseSale[l.courseBillID] = courseSaleRef{invoiceNo: p.no, sortOrder: l.sortOrder}
+			}
+			if l.useCourse {
+				out.courseUsage = append(out.courseUsage, courseUsageRef{
+					hn:         p.hn,
+					invoiceNo:  p.no,
+					branchCode: p.branchCode,
+					createdAt:  p.createdAt,
+					code:       l.code,
+					name:       l.name,
+					qty:        l.qty,
+					sortOrder:  l.sortOrder,
+				})
 			}
 		}
 	}

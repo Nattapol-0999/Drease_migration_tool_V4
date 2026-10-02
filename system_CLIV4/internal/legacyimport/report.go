@@ -83,6 +83,7 @@ var entityGroups = map[string][]string{
 	// never be missing — either both happen or neither does.
 	"entitlements": {
 		EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
+		EntCourseBoughtUsage,
 	},
 	// loyalty is one integer per patient and depends on nothing but the patients, so it
 	// is its own group: a clinic can carry the point balances over without re-running any

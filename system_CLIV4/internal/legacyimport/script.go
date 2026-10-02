@@ -367,6 +367,10 @@ var analyzeTargets = map[string][]string{
 	EntInvoiceItem:  {"invoice_item"},  // its own NOT EXISTS, and course_bought.invoice_item_id
 	EntReceipt:      {"receipt"},       // receipt_payment resolves the receipt by no
 	EntCourseBought: {"course_bought"}, // course_bought_items resolves the entitlement it belongs to
+	// course_bought_usage resolves its line with a per-row subquery over the rows the
+	// items phase just inserted. Without this the planner keeps costing every one of
+	// those lookups against an empty table.
+	EntCourseBoughtItems: {"course_bought_items"},
 }
 
 // analyzeAfter renders the ANALYZE that must follow one entity's statements, or "" when

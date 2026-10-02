@@ -390,7 +390,8 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		EntCatalogCourse, EntCatalogCourseLine)
 	needStock := wants(EntSlotStock)
 	needMoney := wants(EntInvoice, EntInvoiceItem, EntReceipt, EntReceiptPayment, EntInvoiceSettle)
-	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems)
+	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
+		EntCourseBoughtUsage)
 	needLoyalty := wants(EntLoyaltyAccount)
 
 	if len(in.MongoDump) > 0 && (needCatalog || needStock || needMoney || needEntitlements || needLoyalty) {
@@ -452,13 +453,14 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 
 		if needEntitlements {
-			purge, bought, boughtItems, cerr := buildCourseBought(mc, money, in, rep)
+			purge, bought, boughtItems, boughtUsage, cerr := buildCourseBought(mc, money, in, rep)
 			if cerr != nil {
 				return nil, nil, money, cerr
 			}
 			out[EntCourseBoughtPurge] = purge
 			out[EntCourseBought] = bought
 			out[EntCourseBoughtItems] = boughtItems
+			out[EntCourseBoughtUsage] = boughtUsage
 		}
 
 		// Point balances. Independent of everything above — it reads its own collection

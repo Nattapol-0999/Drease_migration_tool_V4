@@ -11,7 +11,9 @@ import (
 // Course entitlements: what a customer PAID FOR and has not used yet.
 //
 //	course_bills               → course_bought
-//	course_bills.course_list[] → course_bought_items (kind='treatment')
+//	course_bills.course_list[]          → course_bought_items (kind='treatment')
+//	course_bills.course_list_medicien[] → course_bought_items (kind='medication')
+//	bills.list[] (use_course=true)      → course_bought_usage
 //
 // This is the one import that DELETES before it writes, by an explicit decision of the
 // clinic owner. The target already held 169 rows carrying the same migrate_source_ref
@@ -28,22 +30,43 @@ import (
 //
 // WHAT IS NOT WRITTEN, and why
 //
-// course_usage / course_bought_usage stay empty. V4 records WHEN each session was used;
-// the legacy collection records only how many are LEFT. Filling a usage history would
-// mean inventing dates, so the balance is carried on the header (periods_used) and the
-// history is honestly absent.
+// course_usage stays empty.
+//
+// course_bought_usage IS written, decided by the clinic owner on 2 Oct 2026. The
+// earlier rule here said it could not be: course_bills keeps a remaining count and no
+// dates, so a usage history would have to be invented. That was true of course_bills
+// and wrong about the export as a whole — the deductions are on the BILLS, as lines of
+// kind 'course' with no `course_bill` pointer (planBillLines turns exactly those into
+// invoice_item.use_course=true). Each one carries a real timestamp, a real branch and a
+// real item code. What it does NOT carry is which entitlement it came off, because the
+// pointer field is empty by definition for a deduction.
+//
+// So the WHEN is imported and the WHICH is decided here, FIFO by purchase date, by the
+// owner's explicit choice over the alternative of writing only the unambiguous ones.
+// At the clinic this was decided for, 18,545 of 39,790 matched deductions had exactly
+// one candidate; the rest had 2 to 86. assignCourseUsage never exceeds the balance the
+// source reported (that is the capacity it spends), and every deduction it cannot place
+// is counted in the report rather than dropped silently.
+//
+// periods_used / course_bought_items.used are NOT recomputed from the ledger for
+// treatments: the source's remaining count is the balance the clinic has been working
+// from, and the import is not the place to move it. For a course's DRUGS the source
+// keeps no remaining count at all, so there the ledger is the only thing that can say
+// how many were taken, and `used` is filled from it.
 
 // Entitlement entity names, in write order.
 const (
 	EntCourseBoughtPurge = "course_bought(ลบของเดิม)"
 	EntCourseBought      = "course_bought"
 	EntCourseBoughtItems = "course_bought_items"
+	EntCourseBoughtUsage = "course_bought_usage"
 )
 
 var courseBoughtOrder = []string{
 	EntCourseBoughtPurge,
 	EntCourseBought,
 	EntCourseBoughtItems,
+	EntCourseBoughtUsage,
 }
 
 // courseStatusForV4 maps the legacy entitlement status onto the three values V4 actually
@@ -106,8 +129,18 @@ type entitlementPlan struct {
 	lines []entitlementLine
 }
 
-// entitlementLine is one bundled treatment inside a customer's course.
+// Line kinds course_bought_items accepts. A drug line is 'medication'; everything the
+// course bundles as a service is 'treatment'. V4 maps the same two from
+// catalog_item_child at sale time (billing/service.go), so these are its words.
+const (
+	courseLineTreatment  = "treatment"
+	courseLineMedication = "medication"
+)
+
+// entitlementLine is one item bundled inside a customer's course — a treatment or a
+// drug.
 type entitlementLine struct {
+	kind      string
 	code      string
 	name      string
 	perCourse string
@@ -117,15 +150,16 @@ type entitlementLine struct {
 
 // buildCourseBought renders the entitlement block.
 func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Report) (
-	purgeSQL, boughtSQL, itemsSQL string, err error) {
+	purgeSQL, boughtSQL, itemsSQL, usageSQL string, err error) {
 
 	if len(mc.courseBills) == 0 {
-		return "", "", "", nil
+		return "", "", "", "", nil
 	}
 
 	ePurge := rep.entity(EntCourseBoughtPurge)
 	eBought := rep.entity(EntCourseBought)
 	eItems := rep.entity(EntCourseBoughtItems)
+	eUsage := rep.entity(EntCourseBoughtUsage)
 	eBought.SourceRows = len(mc.courseBills)
 
 	br := newBranchResolver(in)
@@ -133,11 +167,11 @@ func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Repo
 
 	plans, err := planEntitlements(mc, money, br, rep, eBought, eItems)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if len(plans) == 0 {
 		rep.warnf("course_bought: ไม่มีสิทธิ์คอร์สที่นำเข้าได้เลยจาก %d แถว", len(mc.courseBills))
-		return "", "", "", nil
+		return "", "", "", "", nil
 	}
 
 	// The purge is limited to the branches these plans actually write, so a second site's
@@ -154,9 +188,14 @@ func buildCourseBought(mc *mongoCatalog, money moneyBatches, in Input, rep *Repo
 	purgeSQL = renderCourseBoughtPurge(in.ClinicCode, branches)
 	ePurge.Statements = 2
 	boughtSQL = renderCourseBought(plans, in, eBought)
+	// The deductions are resolved BEFORE the item lines are rendered: a course's drug
+	// lines take their `used` from this assignment, so the ledger and the balance come
+	// out of one decision instead of two that can disagree.
+	usage := assignCourseUsage(plans, money.courseUsage, rep, eUsage)
 	itemsSQL = renderCourseBoughtItems(plans, in, eItems)
+	usageSQL = renderCourseBoughtUsage(plans, usage, in, eUsage)
 
-	return purgeSQL, boughtSQL, itemsSQL, nil
+	return purgeSQL, boughtSQL, itemsSQL, usageSQL, nil
 }
 
 // planEntitlements resolves and filters the entitlements.
@@ -169,7 +208,23 @@ func planEntitlements(mc *mongoCatalog, money moneyBatches, br *branchResolver, 
 	statusRemapped := 0
 	noSaleLine, noInvoice := 0, 0
 	unresolvedHeal := 0
-	medLines := 0
+	medLines, medNoItem, medZeroQty := 0, 0, 0
+	// medicien_id → the drug's items code / name, the same index catalog.go builds for
+	// list_medicien. Built once per run.
+	itemCodeByID := map[string]string{}
+	itemNameByID := map[string]string{}
+	for _, it := range mc.items {
+		id := docObjectID(it, "_id")
+		if id == "" {
+			continue
+		}
+		if c := it.Text("code"); c != "" {
+			itemCodeByID[id] = c
+		}
+		if n := firstNonEmpty(it.Text("name_th"), it.Text("name_en")); n != "" {
+			itemNameByID[id] = n
+		}
+	}
 	buffetRows := 0
 
 	for _, d := range mc.courseBills {
@@ -291,6 +346,7 @@ func planEntitlements(mc *mongoCatalog, money moneyBatches, br *branchResolver, 
 				lineUsed = 0
 			}
 			p.lines = append(p.lines, entitlementLine{
+				kind:      courseLineTreatment,
 				code:      childCode,
 				name:      lineName,
 				perCourse: fmt.Sprintf("%d", perCourse),
@@ -298,7 +354,40 @@ func planEntitlements(mc *mongoCatalog, money moneyBatches, br *branchResolver, 
 				used:      fmt.Sprintf("%d", lineUsed),
 			})
 		}
-		medLines += len(docArray(d, "course_list_medicien"))
+		// The drugs the course includes. The source carries them after all:
+		// medicien_id is the drug and qty_use how many units the course is worth.
+		// course_bought_items takes them as kind='medication' — unlike catalog_course_line
+		// it has no parent_service column, so the heal_id on the entry is not needed here.
+		// Counted and skipped before 2 Oct 2026; imported since, by the owner's decision.
+		for _, line := range docArray(d, "course_list_medicien") {
+			eItems.SourceRows++
+			medLines++
+			drugID := docObjectID(line, "medicien_id")
+			drugCode := itemCodeByID[drugID]
+			if drugCode == "" {
+				medNoItem++
+				eItems.skip("ยาในคอร์ส: medicien_id ไม่ตรง items ใด")
+				continue
+			}
+			qty := intFromMoney(firstNonEmpty(line.Text("qty_use"), "1"))
+			if qty <= 0 {
+				medZeroQty++
+				eItems.skip("ยาในคอร์ส: qty_use เป็น 0 หรือน้อยกว่า")
+				continue
+			}
+			drugName, _ := clip(firstNonEmpty(itemNameByID[drugID], drugCode), 500)
+			p.lines = append(p.lines, entitlementLine{
+				kind:      courseLineMedication,
+				code:      drugCode,
+				name:      drugName,
+				perCourse: fmt.Sprintf("%d", qty),
+				qtyTotal:  fmt.Sprintf("%d", qty),
+				// `used` is filled by assignCourseUsage. The source keeps no remaining count
+				// for a course's drugs, so the usage ledger is the only thing that can say how
+				// many were taken — 0 until a deduction is placed on this line.
+				used: "0",
+			})
+		}
 
 		plans = append(plans, p)
 	}
@@ -333,10 +422,10 @@ func planEntitlements(mc *mongoCatalog, money moneyBatches, br *branchResolver, 
 		rep.notef("course_bought: %d สิทธิ์เป็นคอร์สแบบไม่จำกัดครั้ง (is_buffet) — V4 ไม่นับ periods เมื่อ is_buffet เป็น true", buffetRows)
 	}
 	if medLines > 0 {
-		rep.notef("course_bought_items: %d บรรทัดยาในคอร์ส (course_list_medicien) ยังไม่นำเข้ารอบนี้ — course_bought_items รองรับ kind='medication' ได้ (ไม่ต้องมี parent_service เหมือน catalog_course_line) ถ้าต้องการให้เพิ่ม บอกได้",
-			medLines)
+		rep.notef("course_bought_items: นำเข้าบรรทัดยาในคอร์ส (course_list_medicien) %d บรรทัดเป็น kind='medication' — ต้นทางมี medicien_id กับ qty_use จริง ไม่ได้แต่งขึ้น · ข้าม [medicien_id ไม่ตรง items: %d, qty_use<=0: %d]",
+			medLines, medNoItem, medZeroQty)
 	}
-	rep.notef("course_usage / course_bought_usage ไม่ถูกเขียน — ต้นทางบอกแค่จำนวนครั้งที่เหลือ ไม่ได้บอกว่าใช้ครั้งไหนวันไหน จึงเก็บยอดไว้ที่ periods_used และไม่แต่งประวัติการใช้ขึ้นมา")
+	rep.notef("course_usage ไม่ถูกเขียน — V4 ไม่ได้ใช้ตารางนี้ · ประวัติการใช้สิทธิ์อยู่ที่ course_bought_usage")
 	rep.notef("course_bought.course_id และ receipt_id ปล่อย NULL — ตัวชี้ที่ V4 ใช้จริงคือ catalog_item_id ส่วนงวดที่จ่าย ต้นทางไม่ได้ระบุ")
 
 	return plans, nil
@@ -533,7 +622,7 @@ func renderCourseBoughtItems(plans []entitlementPlan, in Input, e *EntityResult)
 			s.addf(`INSERT INTO course_bought_items
     (clinic_code, course_bought_id, kind, heal_id, code, name, unit,
      per_course, qty_total, used, created_at, catalog_item_id)
-SELECT %s, %s, 'treatment', 0, %s, %s, NULL,
+SELECT %s, %s, %s, 0, %s, %s, NULL,
        %s, %s, %s, %s, %s
 WHERE %s IS NOT NULL
   AND NOT EXISTS (
@@ -541,14 +630,16 @@ WHERE %s IS NOT NULL
        WHERE cbi.clinic_code = %s
          AND cbi.course_bought_id = %s
          AND cbi.code = %s
+         AND cbi.kind = %s
   );
 
-`, lit(in.ClinicCode), courseBoughtIDByRef(in.ClinicCode, p.sourceRef),
+`, lit(in.ClinicCode), courseBoughtIDByRef(in.ClinicCode, p.sourceRef), lit(l.kind),
 				lit(l.code), lit(l.name),
 				l.perCourse, l.qtyTotal, l.used, p.createdAt,
 				catalogItemIDByCode(in.ClinicCode, l.code),
 				courseBoughtIDByRef(in.ClinicCode, p.sourceRef),
-				lit(in.ClinicCode), courseBoughtIDByRef(in.ClinicCode, p.sourceRef), lit(l.code))
+				lit(in.ClinicCode), courseBoughtIDByRef(in.ClinicCode, p.sourceRef), lit(l.code),
+				lit(l.kind))
 		}
 	}
 	e.Statements = s.stmts
