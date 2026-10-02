@@ -353,6 +353,15 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *EntityResult) ([]billPlan, error) {
 	var plans []billPlan
 	seenNo := map[string]string{} // invoice no → bill _id, to catch in-file duplicates
+
+	// Document numbers that more than one bill claims are settled BEFORE anything is
+	// planned, so a bill that loses its number never has its lines mapped and never
+	// lands in the invoice_item statistics. The resolver still refuses the run for any
+	// duplicate that is not an unpaid zero-value draft — see billdup.go.
+	dropDup, derr := resolveDuplicateBillNos(mc.bills, rep, eInv)
+	if derr != nil {
+		return nil, derr
+	}
 	unknownTypes := map[string]int{}
 	noCodeLines, useCourseLines, coursePurchaseLines := 0, 0, 0
 	statusSkips := map[string]int{}
@@ -373,11 +382,19 @@ func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *E
 			rep.warnf("bills doc %d (%s): ไม่มีทั้ง invoice_no และ invoice_branch_no — ข้ามบิลนี้ เพราะ invoice.no ว่างไม่ได้", n+1, mongoID)
 			continue
 		}
+		if dropDup[mongoID] {
+			// A duplicate of a number another bill keeps. The resolver reported it in
+			// full and counted it as a skip, so nothing is said twice here.
+			continue
+		}
 		if prev, dup := seenNo[no]; dup {
-			// Two bills claiming one document number. There is no safe merge: one of
-			// them is a real charge that would vanish. Refuse the run — the same rule
-			// the duplicate-HN case follows.
-			return nil, fmt.Errorf("bills: เลขที่เอกสาร %q ซ้ำในไฟล์ (bill %s และ %s) — invoice.no ต้องไม่ซ้ำต่อคลินิก จึงปฏิเสธทั้งสคริปต์",
+			// STRUCTURAL INVARIANT, not a data check any more: the resolver above either
+			// settled this number or refused the run, so reaching here means the resolver
+			// and this loop disagree about which bills are importable. Refusing is still
+			// the only safe answer — invoice.no is unique per clinic, and silently merging
+			// two bills would make one of them vanish.
+			return nil, fmt.Errorf("bills: เลขที่เอกสาร %q ยังซ้ำหลังจากตัวแก้เลขซ้ำทำงานแล้ว (bill %s และ %s) "+
+				"— เป็นข้อผิดพลาดของเครื่องมือเอง ไม่ใช่ของข้อมูล จึงปฏิเสธทั้งสคริปต์",
 				no, prev, mongoID)
 		}
 		seenNo[no] = mongoID
