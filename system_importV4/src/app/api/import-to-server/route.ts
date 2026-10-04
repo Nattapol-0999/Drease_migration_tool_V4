@@ -52,6 +52,24 @@ interface Body {
 /** How much of the script's head is checked for the clinic guard. */
 const GUARD_PEEK_BYTES = 64 * 1024;
 
+/** How many characters of psql's own output are put in front of the operator. */
+const PSQL_TAIL_CHARS = 1600;
+
+/**
+ * tailOfLog returns the end of psql's output, which is where the reason is.
+ *
+ * ON_ERROR_STOP makes psql abort on the first error, so the last lines are the ERROR, its
+ * DETAIL and the STATEMENT that raised it — exactly what names the row to fix. Before
+ * this, the output was captured into the job's psqlLog and then never rendered anywhere,
+ * so the cause of every SQL failure lived only in the target's Postgres log.
+ */
+function tailOfLog(log: string): string {
+  const t = log.trim();
+  if (t === "") return "";
+  const tail = t.length > PSQL_TAIL_CHARS ? `…\n${t.slice(-PSQL_TAIL_CHARS)}` : t;
+  return `สิ่งที่ psql ตอบกลับมา (ท้ายสุดคือสาเหตุ):\n${tail}`;
+}
+
 function fail(error: string, status = 400): Response {
   return Response.json({ ok: false, error }, { status });
 }
@@ -211,8 +229,8 @@ async function runImport(
   h.addLog(`psql ใช้เวลา ${seconds} วินาที · ส่งไป ${(bytes / 1048576).toFixed(1)} MB`);
 
   if (r.code !== 0) {
-    // The SQL failed, so nothing was written and the photos must not run: their rows are
-    // keyed on HNs that are not there. The staged archive is left alone for a retry.
+    // The SQL failed, so the photos must not run: their rows are keyed on HNs that may
+    // not be there. The staged archive is left alone for a retry.
     if (photoSessionId) {
       h.setPhotoResult({
         ran: false,
@@ -220,9 +238,32 @@ async function runImport(
         message: "ไม่ได้นำเข้ารูป เพราะสคริปต์ SQL ล้มก่อน — ไฟล์รูปที่อัปโหลดไว้ยังอยู่ กดนำเข้าอีกครั้งได้",
       });
     }
+    // WHAT THIS USED TO SAY, AND WHY IT WAS WRONG
+    //
+    // "ฐานข้อมูลไม่ถูกเปลี่ยน เพราะสคริปต์อยู่ในทรานแซกชันเดียว" — the script is NOT one
+    // transaction. It is one per phase (27 of them on a full clinic) because Postgres
+    // locks per relation and a single transaction over 26 tables goes past
+    // max_locks_per_transaction. See the comment in script.go.
+    //
+    // Measured twice this week: C52AEF6 failed in the money phase and left 2,057
+    // patients, 19,313 invoices and 29,267 invoice lines committed. CBE8806 failed in the
+    // stock phase and left 231 patients, 533 appointments and 188 catalogue rows. Both
+    // times this message told the operator nothing had happened, and both times the
+    // tenant had to be deleted before another attempt.
+    //
+    // The psql output is attached as well. It is the only place the real reason exists —
+    // hint() only recognises connection problems, so every SQL-level failure used to
+    // arrive as the same sentence with the cause left in a log nobody was told to read.
     throw new Error(
-      hint(r) ||
-        `นำเข้าไม่สำเร็จ (exit ${r.code}) — ฐานข้อมูลไม่ถูกเปลี่ยน เพราะสคริปต์อยู่ในทรานแซกชันเดียว`,
+      [
+        hint(r) || `นำเข้าไม่สำเร็จ (exit ${r.code})`,
+        "⚠ ฐานข้อมูลอาจถูกเปลี่ยนไปแล้วบางส่วน — สคริปต์ถูกแบ่งเป็นหลายทรานแซกชัน (กลุ่มละหนึ่ง) " +
+          "กลุ่มที่ผ่านไปก่อนจุดที่ล้มจะ commit ค้างอยู่ในฐาน ตรวจคลินิกนี้ที่ปลายทางก่อน " +
+          "และถ้ามีแถวค้าง ต้องลบคลินิกให้เกลี้ยงก่อนนำเข้าอีกครั้ง ไม่งั้นรอบหน้าจะชน unique index",
+        tailOfLog(log),
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
     );
   }
 

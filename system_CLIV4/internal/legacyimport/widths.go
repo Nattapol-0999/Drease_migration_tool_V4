@@ -2,49 +2,58 @@ package legacyimport
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"strings"
 )
 
-// The declared width of every varchar column this importer writes, and the invariant that
-// no generated literal may exceed one.
+// What every column this importer writes can physically hold, and the invariant that no
+// generated value may exceed it.
 //
-// # WHY THIS FILE EXISTS — measured, not guessed
+// WHY THIS FILE EXISTS — three failures of one shape
 //
-// kvk-clinic (C52AEF6), 1 October 2026. One receipt out of 19,311 carried a 26,286-
-// character payment_remark and the renderer put it into receipt.detail, which is
-// varchar(255). The script was 104 MB; psql ran for 109 seconds and then stopped on
+// Every import that died this week died the same way: a value out of V2 that does not fit
+// the V4 column, discovered only when psql was already running.
 //
-//	ERROR: value too long for type character varying(255)
+//	1 Oct  C52AEF6   a 26,286-character remark into receipt.detail varchar(255)
+//	2 Oct  ปิ่นลักษณ์  two bills claiming one invoice.no (unique index)
+//	2 Oct  CBE8806   a stock lot of 99,999,999,999,999 into slot_stock.amount numeric(14,2)
 //
-// The artifact is 27 transactions, not one (max_locks_per_transaction — see script.go), so
-// the groups before the money phase had already committed: 2,057 patients, 19,313 invoices
-// and 29,267 invoice lines were in, receipts and everything after them were not, and the
-// tenant had to be deleted before another attempt. The widths were knowable the whole
-// time; nothing checked them.
+// The first one is what this file was originally built for, and it covered varchar only.
+// CBE8806 walked straight through it: `numeric field overflow`, three lots out of 206,
+// and because the script commits in 27 transactions the tenant was left half-loaded with
+// 231 patients, 533 appointments and 188 catalogue rows in and no stock at all.
 //
-// So the check runs HERE, on the assembled text, before the file is handed over. A width
-// that does not fit is a defect in this tool, and the place to find it is while the script
-// is still a string in memory — not after an operator has waited two minutes and lost a
-// half-loaded tenant.
+// So the check now covers every kind of column that has a ceiling:
 //
-// # WHERE THESE NUMBERS COME FROM
+//	character varying(n)  — n CHARACTERS, which is what Postgres counts
+//	numeric(p,s)          — |value| < 10^(p-s)
+//	smallint / integer    — the platform ranges
 //
-// information_schema.columns on the V4 schema, read 1 Oct 2026. Only `character varying`
-// columns appear. A `text` or `jsonb` column is deliberately ABSENT rather than listed
-// with a large number: receipt.note really does hold the whole 26,286-character remark and
-// appointment.doc holds a JSON blob, and neither has a limit to check against.
+// `text` and `jsonb` are deliberately ABSENT: receipt.note really does hold the whole
+// 26,286-character remark and appointment.doc holds a JSON blob, and neither has a limit.
 //
-// To refresh after a migration changes a width:
+// IT REPORTS EVERYTHING, NOT THE FIRST THING
 //
-//	SELECT table_name, column_name, character_maximum_length
+// Refusing on the first violation is what turned one clinic into three round trips of
+// pull, create, generate, import, fail, delete. The scan collects every violation and the
+// refusal groups them by column with counts and examples, so one run names every value
+// that has to be dealt with.
+//
+// WHERE THE NUMBERS COME FROM
+//
+// information_schema on the V4 schema, read 2 Oct 2026. To refresh after a migration:
+//
+//	SELECT table_name, column_name, data_type,
+//	       character_maximum_length, numeric_precision, numeric_scale
 //	  FROM information_schema.columns
-//	 WHERE table_schema='public' AND data_type='character varying'
-//	   AND character_maximum_length IS NOT NULL
+//	 WHERE table_schema='public'
 //	 ORDER BY table_name, column_name;
 //
-// A width declared here NARROWER than the database would refuse a script the database
+// A limit declared here TIGHTER than the database would refuse a script the database
 // would have accepted, so these numbers are copied, never estimated.
+
+// columnWidths is the declared width of every varchar column this importer writes.
 var columnWidths = map[string]map[string]int{
 	"appointment": {
 		"booking_group_id": 36, "branch_code": 32, "clinic_code": 32, "confirm_status": 16,
@@ -140,59 +149,151 @@ var columnWidths = map[string]map[string]int{
 	},
 }
 
-// widthViolation is one literal that does not fit the column it is written to.
-type widthViolation struct {
+// numericLimit is a numeric(p,s) column. intDigits is p-s: how many digits may stand to
+// the left of the decimal point, which is the whole of what overflows.
+type numericLimit struct {
+	precision int
+	scale     int
+}
+
+func (n numericLimit) intDigits() int { return n.precision - n.scale }
+
+// columnNumeric is every numeric(p,s) column this importer writes.
+//
+// The tightest ones are the ones to watch: receipt.vat_rate and
+// receipt.card_charge_percent are numeric(6,2), so anything from 10,000 up overflows.
+var columnNumeric = map[string]map[string]numericLimit{
+	"appointment":         {"deposit_amount": {14, 2}, "heal_price": {14, 2}},
+	"catalog_course_line": {"qty": {12, 2}},
+	"catalog_item":        {"cost": {12, 2}, "list_price": {12, 2}, "sell_price": {12, 2}},
+	"catalog_item_child":  {"qty": {12, 2}},
+	"course_bought": {
+		"estimated_material_cost": {14, 2}, "net_sales_value": {14, 2}, "price": {12, 2},
+	},
+	"course_bought_items": {
+		"per_course": {12, 2}, "qty_total": {12, 2},
+		"ref_price_snapshot": {18, 2}, "used": {12, 2},
+	},
+	"course_bought_usage": {"material_cost": {14, 2}, "sessions_used": {12, 2}},
+	"invoice":             {"bill_discount": {12, 2}, "paid_amount": {12, 2}},
+	"invoice_item":        {"discount": {12, 2}, "price": {12, 2}},
+	"items":               {"cost": {12, 2}, "min_alert": {12, 2}, "price": {12, 2}},
+	"loyalty_policy":      {"baht_per_point": {12, 4}},
+	"receipt": {
+		"card_charge": {12, 2}, "card_charge_percent": {6, 2}, "deposit_apply": {12, 2},
+		"discount": {12, 2}, "gift_card_apply": {12, 2}, "paid_amount": {12, 2},
+		"point_apply": {12, 2}, "vat_amount": {12, 2}, "vat_rate": {6, 2},
+	},
+	"receipt_payment": {"amount": {12, 2}},
+	"slot_stock": {
+		"amount": {14, 2}, "amount_total": {14, 2}, "cost_lot": {14, 2},
+		"cost_per_unit": {14, 4}, "disbursement": {14, 2}, "remain": {14, 2},
+	},
+	"stock_movement": {
+		"qty_delta": {10, 2}, "remain_after": {14, 2},
+		"remain_before": {14, 2}, "unit_price": {12, 2},
+	},
+}
+
+// columnIntegers is every smallint/integer column this importer writes. These overflow
+// too, and a legacy id or a count copied straight through is exactly how.
+var columnIntegers = map[string]map[string]string{
+	"appointment":              {"booking_sequence": "integer", "seq": "integer"},
+	"catalog_course":           {"buffet_count": "integer", "days": "integer", "loyalty_points": "integer", "periods": "integer"},
+	"catalog_course_line":      {"sort_order": "integer"},
+	"catalog_item":             {"status": "smallint"},
+	"catalog_item_child":       {"sort_order": "integer"},
+	"catalog_item_sku_counter": {},
+	"catalog_service":          {"followup_days": "integer", "loyalty_points": "integer"},
+	"course_bought": {
+		"buffet_count": "integer", "financial_snapshot_version": "integer",
+		"periods_total": "integer", "periods_used": "integer", "qty": "integer",
+	},
+	"course_bought_usage": {"material_cost_version": "integer"},
+	"invoice_item":        {"qty": "integer", "sort_order": "integer", "tax_rate_bps": "integer"},
+	"items":               {"units_per_package": "integer"},
+	"loyalty_account":     {"balance": "integer"},
+	"loyalty_policy":      {"min_redeem": "integer", "referral_points": "integer"},
+	"patient":             {"Braces_ID_int": "integer", "old_hn_int": "integer", "user_insert": "integer"},
+	"photos":              {"created_by": "integer", "file_size": "integer", "visit_id": "integer"},
+	"receipt":             {"installment_no": "integer", "point_earned": "integer", "point_spent": "integer"},
+	"receipt_payment":     {"payment_index": "smallint"},
+	"sequences":           {"counter": "integer"},
+}
+
+// intBounds are the platform ranges. Values are compared as big.Int against these, so a
+// legacy id with twenty digits cannot wrap on its way to being checked.
+var intBounds = map[string]struct{ lo, hi string }{
+	"smallint": {"-32768", "32767"},
+	"integer":  {"-2147483648", "2147483647"},
+}
+
+// limitKind says which ceiling a value broke, so the refusal can explain itself.
+type limitKind string
+
+const (
+	kindWidth   limitKind = "varchar"
+	kindNumeric limitKind = "numeric"
+	kindInteger limitKind = "integer"
+)
+
+// limitViolation is one generated value that does not fit its column.
+type limitViolation struct {
 	table  string
 	column string
-	width  int
-	got    int
+	kind   limitKind
+	limit  string // human form of the ceiling, e.g. "varchar(255)" or "numeric(14,2)"
+	got    string // what was measured: "26286 characters" / "14 digits"
 	sample string
 }
 
-// widthCheckStats is what the scan saw, so "it found nothing" can be told apart from
+// maxColumnsReported bounds the refusal text. Violations are grouped per column first, so
+// this is a count of COLUMNS, not of rows: one bad column with 4,000 rows is one entry.
+const maxColumnsReported = 12
+
+// maxSamplesPerColumn is how many offending values are shown per column.
+const maxSamplesPerColumn = 3
+
+// limitCheckStats is what the scan saw, so "it found nothing" can be told apart from
 // "it understood nothing".
-type widthCheckStats struct {
+type limitCheckStats struct {
 	Statements int // INSERTs whose shape was read
 	Skipped    int // INSERTs whose shape was not read, or whose arity disagreed
-	Values     int // string literals actually compared against a declared width
+	Strings    int // string literals compared against a width
+	Numbers    int // numeric literals compared against a precision or a range
 }
 
-// maxWidthViolationsReported bounds the error text. One violation is a bug to fix; fifty
-// of them are usually the same bug, and printing all of them buries the first.
-const maxWidthViolationsReported = 8
-
-// checkScriptWidths refuses a script that Postgres would reject for width.
-func checkScriptWidths(script string, rep *Report) error {
-	violations, st := scanScriptWidths(script)
+// checkScriptColumnLimits refuses a script that Postgres would reject for a column limit.
+func checkScriptColumnLimits(script string, rep *Report) error {
+	violations, st := scanScriptColumnLimits(script)
 	if rep != nil {
-		rep.notef("ตรวจความกว้างคอลัมน์: อ่านคำสั่ง INSERT ได้ %d คำสั่ง · เทียบค่าข้อความ %d ค่า · "+
+		rep.notef("ตรวจขีดจำกัดคอลัมน์: อ่านคำสั่ง INSERT ได้ %d คำสั่ง · เทียบข้อความ %d ค่า · เทียบตัวเลข %d ค่า · "+
 			"ข้ามรูปแบบที่อ่านไม่ออก %d (ข้ามแล้วไม่ปฏิเสธ เพราะรูปแบบใหม่ที่ตัวตรวจไม่รู้จักไม่ควรบล็อกการนำเข้าจริง)",
-			st.Statements, st.Values, st.Skipped)
+			st.Statements, st.Strings, st.Numbers, st.Skipped)
 	}
 	if len(violations) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%s", describeWidthViolations(violations))
+	return fmt.Errorf("%s", describeLimitViolations(violations))
 }
 
-// scanScriptWidths measures without deciding, so a test can assert on what was read as
-// well as on what was refused.
+// scanScriptColumnLimits measures without deciding, so a test can assert on what was read
+// as well as on what was refused.
 //
 // # FAIL CLOSED ON A VIOLATION, FAIL OPEN ON A PARSE
 //
 // A statement whose shape this does not understand is COUNTED and skipped, never reported
-// as a violation. Treating "I could not read this" as "this is wrong" would let a new
-// statement shape block a real import, which is a worse failure than the one being
-// prevented. The skipped count is surfaced so a shape that stops being understood is
-// visible rather than silent.
-func scanScriptWidths(script string) ([]widthViolation, widthCheckStats) {
+// as a violation, and so is any value that is not a bare literal — an expression, a cast,
+// a subquery. Treating "I could not read this" as "this is wrong" would let a new
+// statement shape block a real import, which is worse than the bug being prevented.
+func scanScriptColumnLimits(script string) ([]limitViolation, limitCheckStats) {
 	// Comments and dollar-quoted bodies are blanked first: an entity header or a plpgsql
 	// block can contain the words "INSERT INTO" without being a statement this owns.
 	// Blanking preserves length, so offsets into the result still address the original.
 	masked := maskNonSQL(script)
 
-	var violations []widthViolation
-	var st widthCheckStats
+	var violations []limitViolation
+	var st limitCheckStats
 
 	for i := 0; ; {
 		at := strings.Index(masked[i:], "INSERT INTO ")
@@ -215,38 +316,124 @@ func scanScriptWidths(script string) ([]widthViolation, widthCheckStats) {
 		i = pos
 
 		widths := columnWidths[table]
-		if len(widths) == 0 {
-			continue // no varchar column here, or a temp table such as import_user_map
+		nums := columnNumeric[table]
+		ints := columnIntegers[table]
+		if len(widths) == 0 && len(nums) == 0 && len(ints) == 0 {
+			continue // nothing on this table has a ceiling to check
 		}
 		for _, vals := range valueLists {
 			if len(vals) != len(cols) {
-				// Columns and values disagree, so there is no mapping to trust. Counted
-				// as a skip rather than guessed at.
+				// Columns and values disagree, so there is no mapping to trust.
 				st.Skipped++
 				continue
 			}
 			for n, col := range cols {
-				limit, limited := widths[col]
-				if !limited {
+				v := vals[n]
+
+				if max, limited := widths[col]; limited {
+					if text, isLit := literalText(v); isLit {
+						st.Strings++
+						// Postgres counts varchar(n) in CHARACTERS, so this must too: a
+						// Thai character is three bytes, and counting bytes would refuse
+						// values that fit.
+						if got := len([]rune(text)); got > max {
+							violations = append(violations, limitViolation{
+								table: table, column: col, kind: kindWidth,
+								limit:  fmt.Sprintf("varchar(%d)", max),
+								got:    fmt.Sprintf("%d ตัวอักษร", got),
+								sample: sampleForError(text),
+							})
+						}
+					}
 					continue
 				}
-				text, isLit := literalText(vals[n])
-				if !isLit {
-					continue // NULL, a number, now(), a cast, a subquery — nothing to measure
+
+				if lim, limited := nums[col]; limited {
+					if digits, text, isNum := numericIntegerDigits(v); isNum {
+						st.Numbers++
+						if digits > lim.intDigits() {
+							violations = append(violations, limitViolation{
+								table: table, column: col, kind: kindNumeric,
+								limit: fmt.Sprintf("numeric(%d,%d) — ค่าสูงสุดต้องน้อยกว่า 10^%d",
+									lim.precision, lim.scale, lim.intDigits()),
+								got:    fmt.Sprintf("%d หลักหน้าจุดทศนิยม", digits),
+								sample: sampleForError(text),
+							})
+						}
+					}
+					continue
 				}
-				st.Values++
-				// Postgres counts varchar(n) in CHARACTERS, so this must too: a Thai
-				// character is three bytes, and counting bytes would refuse values that fit.
-				if got := len([]rune(text)); got > limit {
-					violations = append(violations, widthViolation{
-						table: table, column: col, width: limit, got: got,
-						sample: sampleForError(text),
-					})
+
+				if kind, limited := ints[col]; limited {
+					if _, text, isNum := numericIntegerDigits(v); isNum {
+						st.Numbers++
+						if b, ok := intBounds[kind]; ok && !integerFits(text, b.lo, b.hi) {
+							violations = append(violations, limitViolation{
+								table: table, column: col, kind: kindInteger,
+								limit:  fmt.Sprintf("%s — ช่วงที่รับได้ %s ถึง %s", kind, b.lo, b.hi),
+								got:    "เกินช่วง",
+								sample: sampleForError(text),
+							})
+						}
+					}
 				}
 			}
 		}
 	}
 	return violations, st
+}
+
+// numericIntegerDigits reads a value that is EXACTLY one numeric literal and returns how
+// many digits stand left of the decimal point. Anything else — an expression, a cast, a
+// quoted string, now() — is not something to measure, and saying so is how this avoids
+// inventing violations.
+func numericIntegerDigits(v string) (digits int, text string, ok bool) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return 0, "", false
+	}
+	body := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	if body == "" {
+		return 0, "", false
+	}
+	intPart, fracPart := body, ""
+	if dot := strings.IndexByte(body, '.'); dot >= 0 {
+		intPart, fracPart = body[:dot], body[dot+1:]
+	}
+	if intPart == "" && fracPart == "" {
+		return 0, "", false
+	}
+	for _, part := range []string{intPart, fracPart} {
+		for i := 0; i < len(part); i++ {
+			if part[i] < '0' || part[i] > '9' {
+				return 0, "", false
+			}
+		}
+	}
+	// Leading zeros are not significant digits: 0000123 is three digits wide.
+	trimmed := strings.TrimLeft(intPart, "0")
+	return len(trimmed), s, true
+}
+
+// integerFits compares a numeric literal against a column's range exactly, using big.Int
+// so a twenty-digit legacy id cannot wrap on its way to being checked. A literal with a
+// fractional part is rejected as out of range only when its integer part is.
+func integerFits(text, lo, hi string) bool {
+	s := text
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		s = s[:dot]
+	}
+	s = strings.TrimPrefix(s, "+")
+	if s == "" || s == "-" {
+		return true // nothing to compare; treated as unreadable rather than wrong
+	}
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return true
+	}
+	loV, _ := new(big.Int).SetString(lo, 10)
+	hiV, _ := new(big.Int).SetString(hi, 10)
+	return v.Cmp(loV) >= 0 && v.Cmp(hiV) <= 0
 }
 
 // sampleForError keeps the message readable: the head of the value, on one line.
@@ -259,37 +446,70 @@ func sampleForError(s string) string {
 	return s
 }
 
-func describeWidthViolations(v []widthViolation) string {
-	sort.Slice(v, func(a, b int) bool {
-		if v[a].table != v[b].table {
-			return v[a].table < v[b].table
+// describeLimitViolations groups every violation by column, so one bad column with four
+// thousand rows reads as one entry with a count rather than four thousand lines.
+func describeLimitViolations(v []limitViolation) string {
+	type group struct {
+		key     string
+		table   string
+		column  string
+		kind    limitKind
+		limit   string
+		count   int
+		samples []string
+		worst   string
+	}
+	byCol := map[string]*group{}
+	var order []string
+	for _, x := range v {
+		key := x.table + "." + x.column
+		g, seen := byCol[key]
+		if !seen {
+			g = &group{key: key, table: x.table, column: x.column, kind: x.kind, limit: x.limit}
+			byCol[key] = g
+			order = append(order, key)
 		}
-		if v[a].column != v[b].column {
-			return v[a].column < v[b].column
+		g.count++
+		if len(g.samples) < maxSamplesPerColumn {
+			g.samples = append(g.samples, fmt.Sprintf("%q (%s)", x.sample, x.got))
 		}
-		return v[a].got > v[b].got
+		g.worst = x.got
+	}
+	sort.Slice(order, func(a, b int) bool {
+		if byCol[order[a]].count != byCol[order[b]].count {
+			return byCol[order[a]].count > byCol[order[b]].count
+		}
+		return order[a] < order[b]
 	})
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "ไม่สร้างไฟล์: มีค่า %d จุดยาวเกินความกว้างคอลัมน์ปลายทาง — psql จะหยุดกลางทาง "+
+	rows := 0
+	for _, k := range order {
+		rows += byCol[k].count
+	}
+	fmt.Fprintf(&b, "ไม่สร้างไฟล์: มีค่าเกินขีดจำกัดคอลัมน์ปลายทาง %d ค่า ใน %d คอลัมน์ — psql จะหยุดกลางทาง "+
 		"และเพราะสคริปต์ถูกแบ่งเป็นหลายทรานแซกชัน กลุ่มที่ commit ไปแล้วจะค้างอยู่ในฐาน "+
-		"(ต้องลบคลินิกก่อนลองใหม่) จึงปฏิเสธตั้งแต่ตอนนี้\n", len(v))
-	for n, x := range v {
-		if n >= maxWidthViolationsReported {
-			fmt.Fprintf(&b, "  … และอีก %d จุด\n", len(v)-maxWidthViolationsReported)
+		"(ต้องลบคลินิกก่อนลองใหม่) จึงปฏิเสธตั้งแต่ตอนนี้ · รายการทั้งหมดอยู่ข้างล่าง ไม่ใช่แค่ตัวแรก\n",
+		rows, len(order))
+	for n, k := range order {
+		if n >= maxColumnsReported {
+			fmt.Fprintf(&b, "  … และอีก %d คอลัมน์\n", len(order)-maxColumnsReported)
 			break
 		}
-		fmt.Fprintf(&b, "  %s.%s เป็น varchar(%d) แต่ได้ค่ายาว %d ตัวอักษร: %q\n",
-			x.table, x.column, x.width, x.got, x.sample)
+		g := byCol[k]
+		fmt.Fprintf(&b, "  %s.%s เป็น %s · เกิน %d ค่า · ตัวอย่าง: %s\n",
+			g.table, g.column, g.limit, g.count, strings.Join(g.samples, ", "))
 	}
-	b.WriteString("แก้ที่ตัวสร้าง: ค่าที่ลงคอลัมน์ varchar ต้องผ่าน clip(value, n) ให้ตรงความกว้าง " +
-		"แล้วรายงานการตัดผ่าน truncations เหมือน entity อื่น (ดู money.go · patient.go)")
+	b.WriteString("แก้ที่ตัวสร้าง หรือแก้ข้อมูลที่ต้นทาง: ค่าข้อความต้องผ่าน clip(value, n) ให้ตรงความกว้าง " +
+		"และค่าตัวเลขที่ต้นทางใส่มาเกินจริง (เช่นพิมพ์ 9 รวด) ต้องตัดสินใจทีละเคสว่าจะตัด ตั้งศูนย์ หรือข้ามแถวนั้น " +
+		"เพราะเป็นตัวเลขที่กระทบยอดเงินและยอดสต็อก")
 	return b.String()
 }
 
 // ── a very small amount of SQL reading ───────────────────────────────────────────
 //
 // Enough to find the values of an INSERT and no more. Everything here gives up rather
-// than guesses: see the note on scanScriptWidths.
+// than guesses: see the note on scanScriptColumnLimits.
 
 // maskNonSQL blanks line comments and dollar-quoted bodies, preserving length so offsets
 // into the result also address the original.

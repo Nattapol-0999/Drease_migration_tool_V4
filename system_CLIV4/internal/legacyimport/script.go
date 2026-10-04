@@ -7,8 +7,12 @@ import (
 
 // BuildScript renders the complete, runnable .sql artifact for one clinic.
 //
-// Everything lands in ONE transaction: a half-imported clinic is the hardest state to
-// recover from, and a guard that fires must undo the whole thing, not part of it.
+// The script COMMITS ONCE PER GROUP, not once for the whole file: a single transaction
+// over every table it writes to runs past max_locks_per_transaction (see the note above
+// the group loop). The price of that is real — a failure part way through leaves every
+// group before it committed, and a half-imported clinic is the hardest state to recover
+// from. That is why the guards here refuse to emit a script whose values can already be
+// seen not to fit, instead of letting psql discover it halfway down the file.
 //
 // The output is DETERMINISTIC — the same dumps produce a byte-identical file, with no
 // timestamp in the header. That is on purpose: the artifact is meant to be reviewed,
@@ -89,9 +93,13 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 		}
 		b.WriteString("--   ส่วนที่เหลือของสคริปต์ยังเป็น insert-only ตามเดิม\n")
 	} else {
-		b.WriteString("-- Everything is in ONE transaction and every statement is insert-only\n")
+		b.WriteString("-- Every statement is insert-only\n")
 		b.WriteString("-- (ON CONFLICT DO NOTHING / NOT EXISTS), so re-running it adds nothing twice.\n")
 	}
+	b.WriteString("-- COMMITS ONCE PER GROUP, not once for the whole file: a single transaction over\n")
+	b.WriteString("-- every table below runs past max_locks_per_transaction. So if a statement fails,\n")
+	b.WriteString("-- the groups already committed STAY in the database — wipe the clinic before a\n")
+	b.WriteString("-- second attempt.\n")
 	b.WriteString("-- No timestamp in this header on purpose: the same dumps must produce an\n")
 	b.WriteString("-- identical file so two attempts can be diffed.\n")
 	b.WriteString("--\n")
@@ -284,12 +292,14 @@ func BuildScript(in Input) (script string, rep *Report, err error) {
 	if err := checkUserMapIsCreatedBeforeUse(script); err != nil {
 		return "", rep, err
 	}
-	// STRUCTURAL INVARIANT: no value may be wider than the column it lands in.
+	// STRUCTURAL INVARIANT: no value may exceed the limit of the column it lands in —
+	// varchar width, numeric precision, or integer range.
 	//
 	// Also checked on the assembled text, for the same reason as the one above: it holds
 	// for every entity, and the cost of finding out later is a half-loaded tenant rather
-	// than an error message. See widths.go.
-	if err := checkScriptWidths(script, rep); err != nil {
+	// than an error message. It reports every violation it finds, not the first one, so
+	// one run names everything that has to be dealt with. See widths.go.
+	if err := checkScriptColumnLimits(script, rep); err != nil {
 		return "", rep, err
 	}
 	return script, rep, nil
@@ -322,7 +332,7 @@ func checkUserMapIsCreatedBeforeUse(script string) error {
 // then looks up one row at a time.
 //
 // WHY THIS EXISTS — measured, not guessed
-// The whole artifact is one transaction, and inside a transaction nothing refreshes
+// Each group runs in its own transaction, and inside a transaction nothing refreshes
 // planner statistics: autovacuum cannot see uncommitted rows and never runs. So after
 // the invoice phase has inserted 77,263 rows, pg_class/pg_statistic still describe the
 // table the way it was when the transaction opened — in the tenant this was found on,
@@ -382,9 +392,10 @@ func analyzeAfter(entity string) string {
 	}
 	var b strings.Builder
 	b.WriteString("-- Refresh planner statistics before the next phase looks these rows up one by one.\n")
-	b.WriteString("-- Inside one transaction nothing else will: autovacuum cannot see uncommitted rows,\n")
-	b.WriteString("-- so without this the planner keeps costing every lookup against the row count the\n")
-	b.WriteString("-- table had when the transaction opened, and picks a Seq Scan over the exact index.\n")
+	b.WriteString("-- Inside the transaction that writes this group nothing else will: autovacuum cannot\n")
+	b.WriteString("-- see uncommitted rows, so without this the planner keeps costing every lookup\n")
+	b.WriteString("-- against the row count the table had when this group's transaction opened, and\n")
+	b.WriteString("-- picks a Seq Scan over the exact index.\n")
 	for _, t := range tables {
 		b.WriteString("ANALYZE " + t + ";\n")
 	}

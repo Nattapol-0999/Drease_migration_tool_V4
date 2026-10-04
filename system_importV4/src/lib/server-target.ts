@@ -124,8 +124,10 @@ export function describeTarget(t: ServerTarget): string {
 
 /**
  * psqlCommand builds the remote command. ON_ERROR_STOP makes psql abort on the first
- * error, and the generated script wraps everything in one transaction, so a failure
- * anywhere leaves the database untouched.
+ * error, but the generated script commits once per data group, so a failure part way
+ * through leaves every group before it behind in the database and the clinic has to be
+ * wiped before the import can be retried. That is why the CLI refuses up front to emit a
+ * script it can already see Postgres rejecting for a column limit.
  */
 export function psqlCommand(t: ServerTarget): string {
   const flags = `-d ${shellQuote(t.dbName)} -v ON_ERROR_STOP=1 -f -`;

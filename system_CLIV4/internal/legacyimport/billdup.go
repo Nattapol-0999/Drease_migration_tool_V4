@@ -133,23 +133,31 @@ func resolveDuplicateBillNos(bills []mongodump.Doc, rep *Report, eInv *EntityRes
 	drop := map[string]bool{}
 	resolved := make([]string, 0, len(nos))
 
+	// Groups that cannot be resolved are COLLECTED, not returned on sight. Refusing at
+	// the first one is what turned a single clinic into three round trips of pull,
+	// create, generate, import, fail, delete: each run reported one problem and hid the
+	// rest. One refusal now names every number that needs a decision.
+	var refusals []string
+
 	for _, no := range nos {
 		g := groups[no]
 
 		// Every member has to be an unpaid draft worth nothing, or this is a question
 		// about real money and the run stops.
+		unsafe := false
 		for _, m := range g {
-			if isZeroValueDraftBill(m.doc) {
-				continue
+			if !isZeroValueDraftBill(m.doc) {
+				unsafe = true
+				break
 			}
+		}
+		if unsafe {
 			parts := make([]string, 0, len(g))
 			for _, x := range g {
 				parts = append(parts, describeBillForDup(x.doc))
 			}
-			return nil, fmt.Errorf("bills: เลขที่เอกสาร %q ซ้ำในไฟล์ %d ใบ และไม่ใช่กรณีบันทึกซ้ำที่ข้ามได้อย่างปลอดภัย "+
-				"(จะข้ามอัตโนมัติได้ ต้องเป็นใบร่างที่ยังไม่เก็บเงินและยอดเป็น 0 ทุกใบ คือสถานะ %s และ price_total = 0) "+
-				"— invoice.no ต้องไม่ซ้ำต่อคลินิก จึงปฏิเสธทั้งสคริปต์ · ใบที่ซ้ำ: %s",
-				no, len(g), zeroValueDraftStatus, strings.Join(parts, " | "))
+			refusals = append(refusals, fmt.Sprintf("%s ซ้ำ %d ใบ: %s", no, len(g), strings.Join(parts, " | ")))
+			continue
 		}
 
 		// Keep the most complete one. In the measured pair the loser's single line is a
@@ -171,6 +179,13 @@ func resolveDuplicateBillNos(bills []mongodump.Doc, rep *Report, eInv *EntityRes
 		}
 		resolved = append(resolved, fmt.Sprintf("%s: เก็บ %s (%d รายการ) ข้าม %s",
 			no, g[best].id, g[best].lines, strings.Join(droppedIDs(g, best), ", ")))
+	}
+
+	if len(refusals) > 0 {
+		return nil, fmt.Errorf("bills: เลขที่เอกสารซ้ำ %d เลขที่ข้ามอัตโนมัติไม่ได้ — invoice.no ต้องไม่ซ้ำต่อคลินิก "+
+			"จึงปฏิเสธทั้งสคริปต์ · จะข้ามอัตโนมัติได้ ต้องเป็นใบร่างที่ยังไม่เก็บเงินและยอดเป็น 0 ทุกใบ "+
+			"(สถานะ %s และ price_total = 0) · รายการทั้งหมด ไม่ใช่แค่เลขแรก:\n  %s",
+			len(refusals), zeroValueDraftStatus, strings.Join(refusals, "\n  "))
 	}
 
 	if len(resolved) > 0 && rep != nil {

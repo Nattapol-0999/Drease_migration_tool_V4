@@ -434,7 +434,8 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 
 		// The money half of the same file. It runs last because invoice_item resolves
 		// catalog_item_id by code, so the catalog statements above must be in the
-		// script before it — the SQL is applied top-down in one transaction.
+		// script before it — the SQL is applied top-down, group by group, and the
+		// catalog group commits before the money group runs.
 		//
 		// Built for entitlements too even when money itself was not selected: an
 		// entitlement points at the invoice line that sold it, and that reference comes
