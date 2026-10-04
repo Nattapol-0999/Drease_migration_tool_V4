@@ -306,6 +306,68 @@ export function failJob(id: string, error: string): void {
   j.finishedAt = Date.now();
 }
 
+/**
+ * The handful of facts the clear-up screen needs about a job.
+ *
+ * Deliberately not jobView: that is the polling payload and carries the log, the report
+ * and the psql output. Deciding whether a directory on disk may be deleted needs none of
+ * that.
+ */
+export interface JobFacts {
+  id: string;
+  kind: JobKind;
+  state: JobState;
+  clinicCode: string;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+export function knownJobs(): JobFacts[] {
+  const out: JobFacts[] = [];
+  for (const j of store.values()) {
+    out.push({
+      id: j.id,
+      kind: j.kind,
+      state: j.state,
+      clinicCode: j.clinicCode,
+      startedAt: j.startedAt,
+      finishedAt: j.finishedAt,
+    });
+  }
+  return out;
+}
+
+/** How many jobs are mid-flight right now. */
+export function runningJobCount(): number {
+  let n = 0;
+  for (const j of store.values()) if (j.state === "running") n++;
+  return n;
+}
+
+/** Where job artifacts live, so the clear-up screen can list the directory itself. */
+export function jobsDir(): string {
+  return jobsRoot();
+}
+
+/**
+ * forgetJob removes a job directory and its store entry WITHOUT an owner check.
+ *
+ * dropJob is the owner-scoped door, used by the operator who started that job. This one
+ * exists for the clear-up screen, which also has to remove directories a service restart
+ * left behind — those have no store entry, so there is no owner left to compare against.
+ * The tool has one configured operator (AUTH_USER), so there is no second person's work
+ * being deleted here.
+ *
+ * A running job is refused rather than killed: its child process is still writing into
+ * that directory.
+ */
+export async function forgetJob(id: string): Promise<void> {
+  const j = store.get(id);
+  if (j?.state === "running") throw new Error("งานนี้กำลังทำงานอยู่ จึงยังลบไม่ได้");
+  store.delete(id);
+  await rm(join(jobsRoot(), id), { recursive: true, force: true });
+}
+
 export async function dropJob(id: string): Promise<void> {
   const j = store.get(id);
   store.delete(id);

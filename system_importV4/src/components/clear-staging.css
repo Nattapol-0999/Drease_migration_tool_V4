@@ -1,0 +1,219 @@
+/* The clear-up button in the page header and the panel it opens. Own file so globals.css
+   and page-header.css stay untouched. Every colour is a theme variable, so this follows
+   the light/dark switch like the rest of the tool. */
+
+.clear-staging-btn {
+  padding: 5px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--bad);
+  background: transparent;
+  color: var(--bad);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.clear-staging-btn:hover {
+  background: var(--bad);
+  color: var(--on-bad);
+}
+
+.clear-staging-btn:focus-visible {
+  outline: 2px solid var(--bad);
+  outline-offset: 2px;
+}
+
+.cs-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 16px;
+  overflow: auto;
+  z-index: 60;
+}
+
+.cs-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--card-shadow);
+  padding: 16px 18px 14px;
+  width: min(1040px, 100%);
+  color: var(--text);
+}
+
+.cs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cs-head h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.cs-close {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.cs-sub {
+  margin: 8px 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.cs-error {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--bad);
+  background: var(--bad-tint);
+  color: var(--bad-text);
+  font-size: 13px;
+}
+
+.cs-warn {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--warn);
+  background: var(--warn-tint);
+  color: var(--warn-text);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.cs-result {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.cs-refused {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.cs-group {
+  margin-top: 14px;
+}
+
+.cs-group h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.cs-muted {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.cs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.cs-table th,
+.cs-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.cs-table th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.cs-num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cs-files {
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.cs-busy {
+  opacity: 0.6;
+}
+
+.cs-why {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.cs-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.cs-spacer {
+  flex: 1 1 auto;
+}
+
+.cs-secondary {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.cs-secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.cs-danger {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--bad);
+  background: var(--bad);
+  color: var(--on-bad);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.cs-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cs-danger:focus-visible,
+.cs-secondary:focus-visible,
+.cs-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

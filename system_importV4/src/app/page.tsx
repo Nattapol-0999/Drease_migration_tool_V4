@@ -1,3 +1,4 @@
+import ClearStagingButton from "@/components/ClearStagingButton";
 import GenerateForm from "@/components/GenerateForm";
 import Logo from "@/components/Logo";
 import LogoutButton from "@/components/LogoutButton";
@@ -15,6 +16,7 @@ export default function Home() {
         {/* Grouped so the header stays two columns: the title on the left and the
             controls together on the right, rather than three items spread apart. */}
         <div className="page-head-actions">
+          <ClearStagingButton />
           <ThemeToggle />
           <LogoutButton />
         </div>
