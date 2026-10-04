@@ -141,6 +141,24 @@ func (b *branchResolver) report(rep *Report, label string) {
  * Returns legacy codes, not V4 ones: the caller resolves, so the counting and reporting
  * stay in one place.
  */
+// patientHNSet is every HN the patient dump carries, used to drop a bill whose patient
+// does not exist rather than refusing the whole import (owner's decision, 4 Oct 2026).
+//
+// Deliberately NOT branchByHN's key set: that one skips a patient with no branch_code, and
+// a patient with a blank branch is still a patient. It also reads only the `HN` column,
+// not `old_hn`, because the guard this feeds compares against patient."HN" — matching on
+// anything else here would drop a bill the database would have accepted, or keep one it
+// will refuse.
+func patientHNSet(rows []legacydump.Row) map[string]bool {
+	out := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if hn := strings.TrimSpace(r.Get("HN")); hn != "" {
+			out[hn] = true
+		}
+	}
+	return out
+}
+
 func branchByHN(rows []legacydump.Row) map[string]string {
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {

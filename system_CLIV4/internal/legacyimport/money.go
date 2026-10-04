@@ -238,7 +238,7 @@ type channelPlan struct {
 
 // buildMoney renders the whole money block. It returns empty batches when the export
 // carries no bills, so a catalog-only import is unaffected.
-func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
+func buildMoney(mc *mongoCatalog, in Input, knownHN map[string]bool, rep *Report) (moneyBatches, error) {
 	// One resolver for the whole money block: bills and receipts must agree on which V4
 	// branch a legacy code means, and the counts are reported once for both.
 	br := newBranchResolver(in)
@@ -256,7 +256,7 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 	eRec.SourceRows = len(mc.payments)
 
 	// ── pass 1: which bills are in, and do their own numbers add up ───────────
-	plans, err := planBills(mc, br, rep, eInv, eItem)
+	plans, err := planBills(mc, br, knownHN, rep, eInv, eItem)
 	if err != nil {
 		return out, err
 	}
@@ -350,9 +350,42 @@ func buildMoney(mc *mongoCatalog, in Input, rep *Report) (moneyBatches, error) {
 }
 
 // planBills validates and maps every bill, dropping the ones policy excludes.
-func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *EntityResult) ([]billPlan, error) {
+// planBills decides which bills become invoices.
+//
+// knownHN is every HN the patient dump carries, or nil when this run did not read one.
+//
+// # A BILL WHOSE PATIENT DOES NOT EXIST (owner's decision, 4 Oct 2026)
+//
+// invoice.hn is text with no foreign key, so a bill naming an HN that is not a patient
+// imports cleanly and then shows up in nobody's history — which is why GUARD 5 refuses it
+// at the database. Measured on the identity-medical export: 20 HN appear on 45 bills and
+// in neither the HN nor the old_hn column of all 8,630 patient rows. The patients are
+// simply not in the source, and the bills carry no name, no phone, nothing to rebuild one
+// from — only an HN. So the whole clinic could not be imported over 1.6% of its bills.
+//
+// The owner's rule: if the HN is not among the patients, skip that bill.
+//
+// It is done HERE rather than by softening GUARD 5 for two reasons. The report then names
+// every dropped bill and the money on it before anybody runs psql, instead of after; and
+// the guard stays exactly as strict, so it still catches the case this cannot see — an HN
+// absent from the dump but present in the live table, which is what a second import into
+// an existing clinic looks like.
+//
+// # WHAT GOES WITH THE BILL
+//
+// Its receipts. planReceipts drops a payment whose bill was not planned, and reports the
+// count. The money on those bills does not reach V4 and has to be handled by hand; the
+// report says so, with the total, because a silent gap in a clinic's revenue is the one
+// outcome worth refusing over.
+func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
+	rep *Report, eInv, eItem *EntityResult) ([]billPlan, error) {
 	var plans []billPlan
 	seenNo := map[string]string{} // invoice no → bill _id, to catch in-file duplicates
+
+	// Bills dropped because their patient is not in the dump, kept for one report line.
+	orphanHN := map[string]int{}
+	orphanBills := 0
+	orphanValue := 0.0
 
 	// Document numbers that more than one bill claims are settled BEFORE anything is
 	// planned, so a bill that loses its number never has its lines mapped and never
@@ -405,6 +438,16 @@ func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *E
 			rep.warnf("bills %s (เลขที่ %s): ไม่มี HN — ข้ามบิลนี้ เพราะเก็บเงินโดยไม่รู้เจ้าของบิลไม่ได้", mongoID, no)
 			continue
 		}
+		// The patient named on this bill is not in the file. Counted and reported in one
+		// line at the end rather than one warning per bill: the measured export has 45 of
+		// them, and forty-five lines would bury the rest of the report.
+		if knownHN != nil && !knownHN[hn] {
+			eInv.skip("HN ในบิลไม่มีอยู่ในไฟล์คนไข้ — ข้ามบิลนี้ตามมติเจ้าของคลินิก")
+			orphanHN[hn]++
+			orphanBills++
+			orphanValue += moneyFloat(d.Text("price_total"))
+			continue
+		}
 
 		// Translated through the branch map: the bill names the LEGACY branch and V4 owns
 		// its own codes, so writing the source value straight through would file the
@@ -439,6 +482,26 @@ func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *E
 		bp.lines = lines
 		bp.fLineTotal = lineTotal
 		plans = append(plans, bp)
+	}
+
+	if orphanBills > 0 {
+		hns := make([]string, 0, len(orphanHN))
+		for hn := range orphanHN {
+			hns = append(hns, hn)
+		}
+		sort.Strings(hns)
+		shown := hns
+		more := ""
+		if len(shown) > 40 {
+			shown = shown[:40]
+			more = fmt.Sprintf(" … และอีก %d HN", len(hns)-40)
+		}
+		rep.warnf("bills: ข้าม %d ใบ เพราะ HN ในบิลไม่มีอยู่ในไฟล์คนไข้ (%d HN) ตามมติเจ้าของคลินิก (4 ต.ค. 2569) — "+
+			"**ยอดบิลที่ไม่ถูกนำเข้ารวม %s บาท** และใบเสร็จของบิลเหล่านี้จะถูกข้ามตามไปด้วย "+
+			"ต้องตามเก็บด้วยมือถ้าเป็นรายการจริง · คนไข้เหล่านี้ไม่มีทั้งในคอลัมน์ HN และ old_hn ของไฟล์ "+
+			"และบิลไม่มีชื่อหรือเบอร์ให้สร้างคนไข้ขึ้นมาใหม่ได้ · HN: %s%s",
+			orphanBills, len(hns), strconv.FormatFloat(orphanValue, 'f', 2, 64),
+			strings.Join(shown, ", "), more)
 	}
 
 	if len(unknownTypes) > 0 {

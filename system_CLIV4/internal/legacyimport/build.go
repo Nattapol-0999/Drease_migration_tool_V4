@@ -348,8 +348,17 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	// its branch from the patient's, and guessing it instead would file the booking at a
 	// branch the patient has never been to.
 	var branchByPatient map[string]string
+	// knownHN is nil when the patient dump was not read at all. nil and empty mean
+	// different things downstream: nil is "this run cannot tell whether a patient exists",
+	// empty is "it can, and there are none".
+	var knownHN map[string]bool
 
-	if len(in.PatientDump) > 0 && wants(EntPatient, EntAppointment) {
+	// The money groups are listed here as well, even though they write no patient row: a
+	// bill names its patient by HN with no foreign key behind it, so planBills has to be
+	// able to tell whether that patient exists. Without the dump it cannot, and the SQL
+	// guard is left to check against the live table instead.
+	if len(in.PatientDump) > 0 &&
+		wants(EntPatient, EntAppointment, EntInvoice, EntCourseBought, EntLoyaltyAccount) {
 		// The column list is kept, not discarded: buildPatient needs it to tell a file with
 		// a few unusable rows apart from a file whose HN column is spelled differently.
 		patientCols, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
@@ -357,6 +366,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			return nil, nil, money, fmt.Errorf("patient dump: %w", err)
 		}
 		branchByPatient = branchByHN(patientRows)
+		knownHN = patientHNSet(patientRows)
 		if wants(EntPatient) {
 			if out[EntPatient], err = buildPatient(patientCols, patientRows, in, rep); err != nil {
 				return nil, nil, money, err
@@ -441,7 +451,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		// entitlement points at the invoice line that sold it, and that reference comes
 		// out of this plan. Only the SQL is withheld.
 		if needMoney || needEntitlements {
-			if money, err = buildMoney(mc, in, rep); err != nil {
+			if money, err = buildMoney(mc, in, knownHN, rep); err != nil {
 				return nil, nil, money, err
 			}
 			if needMoney {
