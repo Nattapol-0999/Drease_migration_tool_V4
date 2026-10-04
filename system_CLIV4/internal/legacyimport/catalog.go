@@ -591,6 +591,9 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 	// from the lots themselves so "lot written but no movement" is visible as a mismatch in
 	// the report rather than as an empty stock-in screen months later.
 	movesWritten := 0
+	// Quantities cut to fit their column, kept so the report can name every one. See
+	// clampnumeric.go for the rule and for what it costs.
+	var clamps qtyClamps
 
 	for n, d := range mc.items {
 		code := d.Text("code")
@@ -827,6 +830,16 @@ UPDATE items SET
 		// money value in this file reaches the database as source digits for the same
 		// reason (moneyLit's contract): float64 has no exact ฿0.10, and numeric × numeric
 		// in Postgres is exact.
+		// V2 lets a quantity be typed in wider than the column it has to land in — a
+		// field of nines, 99999999999999 units of a face mask. Postgres rejects it mid
+		// file, and because the script commits per group that leaves the clinic half
+		// imported. The owner's rule (ก1, 2 Oct 2026) is to cut it to what each column
+		// holds, which is NOT the same number for slot_stock as for the movement below.
+		slotAmount, cutAmount := clampToColumn("slot_stock", "amount", qty)
+		slotTotal, cutTotal := clampToColumn("slot_stock", "amount_total", qtyTotal)
+		clamps.record(code, mongoID, "slot_stock.amount/remain", qty, slotAmount, cutAmount)
+		clamps.record(code, mongoID, "slot_stock.amount_total", qtyTotal, slotTotal, cutTotal)
+
 		sSlot.comment("%s · lot %s · คลัง %s", code, mongoID, branch)
 		sSlot.addf(`INSERT INTO slot_stock
     (mongo_id, item_code, item_id, code, cost_lot, cost_per_unit, amount, remain,
@@ -838,10 +851,10 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
 ON CONFLICT (mongo_id) DO NOTHING;
 
 `, lit(mongoID), lit(code), lit(mongoID), lit(mongoID),
-			lotCostExpr(cost, qty), moneyLit(cost),
-			qty, qty,
+			lotCostExpr(cost, slotAmount), moneyLit(cost),
+			slotAmount, slotAmount,
 			tsLit(d.Text("store"), "now()"), tsLitNullable(d.Text("expire")),
-			qtyTotal, lit(doc),
+			slotTotal, lit(doc),
 			lit(in.ClinicCode), lit(branch))
 
 		// The receive that put this lot on the shelf.
@@ -872,6 +885,12 @@ ON CONFLICT (mongo_id) DO NOTHING;
 		// lot is also a stock_movement row and must not be mistaken for this one.
 		moveName, _ := clip(name, 200)
 		moveUnit, _ := clip(unit, 32)
+		// qty_delta is numeric(10,2) while slot_stock.amount is numeric(14,2), so the
+		// same source quantity is cut to a SMALLER figure here. That is the cost of ก1
+		// the owner accepted: for a clamped lot the receive ledger will not add up to
+		// what the shelf says. Every such lot is named in the report.
+		moveQty, cutMove := clampToColumn("stock_movement", "qty_delta", qty)
+		clamps.record(code, mongoID, "stock_movement.qty_delta", qty, moveQty, cutMove)
 		sMove.comment("%s · รับเข้า lot %s → คลัง %s", code, mongoID, branch)
 		sMove.addf(`INSERT INTO stock_movement
     (item_code, item_name, branch_code, clinic_code, qty_delta, unit,
@@ -888,7 +907,7 @@ SELECT %s, %s, %s, %s, %s, %s,
    );
 
 `, lit(code), lit(moveName), lit(branch), lit(in.ClinicCode),
-			qty, nullLit(moveUnit),
+			moveQty, nullLit(moveUnit),
 			lit(mongoID), tsLit(d.Text("store"), "now()"),
 			lit(mongoID), lit(in.ClinicCode))
 		movesWritten++
@@ -961,6 +980,7 @@ SELECT %s, %s, %s, %s, %s, %s,
 		"พบสาขาที่มีคลังผูกไว้ %d สาขา", len(stockOwner))
 	rep.notef("slot_stock: cost_lot = ต้นทุนต่อหน่วย × จำนวนในล็อต (คนละค่ากับ cost_per_unit) ตามที่ V4 คำนวณใน GuidedReceive — " +
 		"เดิมใส่ค่าเดียวกันทั้งสองช่อง ทำให้มูลค่าคลังของล็อตที่มีหลายหน่วยต่ำกว่าความจริง")
+	clamps.report(rep)
 	return sItems.String(), sCatalog.String(), sSlot.String(), sMove.String(), nil
 }
 
@@ -972,12 +992,21 @@ SELECT %s, %s, %s, %s, %s, %s,
 // The two short-circuits are not an optimisation: they keep a zero-cost or zero-quantity
 // lot rendering as the literal `0` that every existing generated file already carries, so
 // a diff between two runs shows only the lots whose value actually changed.
+// A product too wide for cost_lot is capped in SQL rather than in Go, because the
+// multiplication itself happens in Postgres: a quantity cut to 999999999999.99 times any
+// real unit cost overflows numeric(14,2) at run time, where no literal check can see it.
+// LEAST is only emitted when the digits cannot be shown to fit, so every lot whose value
+// was already safe renders exactly as it did before and two runs still diff cleanly.
 func lotCostExpr(unitCost, qty string) string {
 	c, q := moneyLit(unitCost), moneyLit(qty)
 	if c == "0" || q == "0" {
 		return "0"
 	}
-	return fmt.Sprintf("(%s::numeric * %s::numeric)", c, q)
+	product := fmt.Sprintf("(%s::numeric * %s::numeric)", c, q)
+	if lim, ok := columnNumeric["slot_stock"]["cost_lot"]; ok && !productFits(c, q, lim) {
+		return fmt.Sprintf("LEAST(%s, %s::numeric)", product, numericCeiling(lim))
+	}
+	return product
 }
 
 /*
