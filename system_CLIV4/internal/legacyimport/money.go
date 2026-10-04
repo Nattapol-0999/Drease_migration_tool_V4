@@ -358,7 +358,7 @@ func planBills(mc *mongoCatalog, br *branchResolver, rep *Report, eInv, eItem *E
 	// planned, so a bill that loses its number never has its lines mapped and never
 	// lands in the invoice_item statistics. The resolver still refuses the run for any
 	// duplicate that is not an unpaid zero-value draft — see billdup.go.
-	dropDup, derr := resolveDuplicateBillNos(mc.bills, rep, eInv)
+	dropDup, derr := resolveDuplicateBillNos(mc.bills, mc.payments, rep, eInv)
 	if derr != nil {
 		return nil, derr
 	}
