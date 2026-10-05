@@ -41,7 +41,7 @@ func TestDuplicateZeroValueDraftsAreResolvedKeepingTheCompleteBill(t *testing.T)
 	}
 	rep, e := &Report{}, &EntityResult{}
 
-	drop, err := resolveDuplicateBillNos(bills, nil, rep, e)
+	drop, _, err := resolveDuplicateBillNos(bills, nil, rep, e)
 	if err != nil {
 		t.Fatalf("a double-submit of two worthless drafts was refused: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestThreeWayDuplicateDropsEveryLoser(t *testing.T) {
 		bill("6138e44c61af936bf6896bb3", "send", "640202709", "0", 3),
 		bill("6138e44c61af936bf6896bbd", "send", "640202709", "0", 2),
 	}
-	drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err != nil {
 		t.Fatalf("refused a three-way double-submit: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestDuplicateWithDifferentMoneyStillRefusesTheWholeScript(t *testing.T) {
 		bill("aaaaaaaaaaaaaaaaaaaaaaa1", "send", "640054443", "0", 1),
 		bill("aaaaaaaaaaaaaaaaaaaaaaa2", "send", "640054443", "1500", 1),
 	}
-	_, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a duplicate with money on it was resolved silently")
 	}
@@ -112,7 +112,7 @@ func TestDuplicateThatWasAlreadyPaidStillRefuses(t *testing.T) {
 		bill("bbbbbbbbbbbbbbbbbbbbbbb1", "full_paid", "640054443", "0", 2),
 		bill("bbbbbbbbbbbbbbbbbbbbbbb2", "send", "640054443", "0", 1),
 	}
-	_, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a paid duplicate was dropped automatically")
 	}
@@ -129,7 +129,7 @@ func TestDeletedBillsDoNotReserveADocumentNumber(t *testing.T) {
 		bill("ccccccccccccccccccccccc1", "delete", "640054443", "9999", 5),
 		bill("ccccccccccccccccccccccc2", "full_paid", "640054443", "1500", 2),
 	}
-	drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err != nil {
 		t.Fatalf("a deleted twin blocked a live bill: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestDuplicateTieGoesToTheEarlierBillAndIsStable(t *testing.T) {
 		bill("ddddddddddddddddddddddd2", "send", "640202665", "0", 1),
 	}
 	for i := 0; i < 3; i++ {
-		drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+		drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 		if err != nil {
 			t.Fatalf("run %d refused: %v", i, err)
 		}
@@ -163,7 +163,7 @@ func TestNoDuplicatesMeansNoDropsAndNoReport(t *testing.T) {
 		bill("eeeeeeeeeeeeeeeeeeeeeee3", "partially_paid", "640000003", "500", 3),
 	}
 	rep := &Report{}
-	drop, err := resolveDuplicateBillNos(bills, nil, rep, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, rep, &EntityResult{})
 	if err != nil {
 		t.Fatalf("refused a clean dump: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestBillsWithNoDocumentNumberAreNotTreatedAsDuplicatesOfEachOther(t *testin
 		bill("fffffffffffffffffffffff1", "send", "", "0", 1),
 		bill("fffffffffffffffffffffff2", "send", "", "0", 1),
 	}
-	drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err != nil {
 		t.Fatalf("two bills with no number were treated as a duplicate: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestEmptyZeroValueDuplicateIsResolvedAndKeepsTheLatest(t *testing.T) {
 	}
 	rep, e := &Report{}, &EntityResult{}
 
-	drop, err := resolveDuplicateBillNos(bills, payments, rep, e)
+	drop, _, err := resolveDuplicateBillNos(bills, payments, rep, e)
 	if err != nil {
 		t.Fatalf("an empty, money-free course-deduction duplicate was refused: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestEmptyDuplicateWhereOneReceiptCarriesMoneyRefuses(t *testing.T) {
 		withMoney(paymentRow("pay2pay2pay2pay2pay2pay2", "aaaaaaaaaaaaaaaaaaaaaab2", "650112440"),
 			"payment", "500"),
 	}
-	_, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a duplicate whose receipt took money was resolved automatically")
 	}
@@ -359,7 +359,7 @@ func TestEmptyDuplicateWhereAReceiptClosedAValueRefuses(t *testing.T) {
 		withMoney(paymentRow("pay3pay3pay3pay3pay3pay3", "bbbbbbbbbbbbbbbbbbbbbbc1", "650112321"),
 			"price_total", "1500"),
 	}
-	_, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a receipt that closed a real value was treated as money-free")
 	}
@@ -375,7 +375,7 @@ func TestEmptyDuplicateFindsAPaymentLinkedThroughPayId(t *testing.T) {
 	payments := []mongodump.Doc{
 		withMoney(paymentRow("payXpayXpayXpayXpayXpayX", "", "650112321"), "payment_transfer", "900"),
 	}
-	_, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, payments, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("money linked through pay_id was not seen")
 	}
@@ -389,7 +389,7 @@ func TestPaidDuplicateWithLinesIsStillRefused(t *testing.T) {
 		billAt("ddddddddddddddddddddddd1", "full_paid", "650146639", 3, ts(479)),
 		billAt("ddddddddddddddddddddddd2", "full_paid", "650146639", 2, ts(486)),
 	}
-	_, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("two paid bills with real lines were resolved automatically")
 	}
@@ -400,7 +400,7 @@ func TestEmptyDuplicateWithAnOutstandingBalanceIsRefused(t *testing.T) {
 		billFull("eeeeeeeeeeeeeeeeeeeeeef1", "full_paid", "650146639", "0", "1500", "", 0),
 		billFull("eeeeeeeeeeeeeeeeeeeeeef2", "full_paid", "650146639", "0", "0", "", 0),
 	}
-	_, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a bill with an outstanding balance was treated as worth nothing")
 	}
@@ -411,7 +411,7 @@ func TestMixedEmptyAndNonEmptyDuplicateIsRefused(t *testing.T) {
 		billAt("fffffffffffffffffffffff1", "full_paid", "650146639", 0, ts(479)),
 		billAt("fffffffffffffffffffffff2", "full_paid", "650146639", 1, ts(486)),
 	}
-	_, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err == nil {
 		t.Fatal("a group where only some members are empty was resolved")
 	}
@@ -426,7 +426,7 @@ func TestEmptyDuplicateBreaksATimestampTieByPositionAndIsStable(t *testing.T) {
 		billAt("1111111111111111111111a3", "full_paid", "650146639", 0, ts(479)),
 	}
 	for i := 0; i < 3; i++ {
-		drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+		drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 		if err != nil {
 			t.Fatalf("run %d refused: %v", i, err)
 		}
@@ -443,7 +443,7 @@ func TestEmptyDuplicateIgnoresFilePositionWhenTimestampsDiffer(t *testing.T) {
 		billAt("2222222222222222222222b1", "full_paid", "650146639", 0, ts(900)),
 		billAt("2222222222222222222222b2", "full_paid", "650146639", 0, ts(100)),
 	}
-	drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err != nil {
 		t.Fatalf("refused: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestDoorOneStillKeepsTheMostCompleteDraft(t *testing.T) {
 		billAt("3333333333333333333333c1", "send", "640202709", 3, ts(100)),
 		billAt("3333333333333333333333c2", "send", "640202709", 1, ts(900)),
 	}
-	drop, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	drop, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
 	if err != nil {
 		t.Fatalf("refused: %v", err)
 	}
@@ -497,6 +497,297 @@ func TestIsEmptyZeroValueBillReadsEveryCondition(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := isEmptyZeroValueBill(c.doc, links); got != c.want {
+			t.Errorf("%s -> %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// ── door three: one number, two different patients ──────────────────────────────────
+//
+// Measured on the Kasetsart University infirmary export (9f815aaa, 4 Oct 2026): 43,074
+// bills, 42,926 importable and numbered, 47 numbers claimed twice, and not one of those
+// groups shares an HN. The older copy is full_paid in 42 of them and carries the receipt;
+// the newer copy is `send` in all 47 and has collected nothing. Five months apart, real
+// lines on both sides — V2's counter wrapped round and reissued numbers it had used.
+//
+// Owner's decisions: ก (suffix the newer copy instead of dropping anything) and แคบ
+// (only when the group names different patients, so a same-patient double-click with
+// lines on both copies still refuses rather than becoming a double charge).
+
+// billPatient builds a bills document with the three fields door three reads: an HN of
+// its own, a value, and a creation time.
+func billPatient(id, hn, status, no, total string, lines int, created time.Time) mongodump.Doc {
+	d := bill(id, status, no, total, lines)
+	d["hn"] = hn
+	d["created_at"] = created
+	return d
+}
+
+// day is a distinct calendar day, which is how far apart the measured duplicates sit.
+func day(n int) time.Time {
+	return time.Date(2026, 1, 15, 9, 30, 0, 0, time.UTC).AddDate(0, 0, n)
+}
+
+func TestDuplicateOfTwoDifferentPatientsKeepsBothAndSuffixesTheNewer(t *testing.T) {
+	// The measured shape of 690348950: HN 016900394 paid ฿230 in March with a receipt
+	// under it, then in August the counter came back round and HN 016900670 was issued
+	// the same number for a ฿270 visit of its own.
+	bills := []mongodump.Doc{
+		billPatient("a1a1a1a1a1a1a1a1a1a1a1a1", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("a2a2a2a2a2a2a2a2a2a2a2a2", "016900670", "send", "690348950", "270", 2, day(146)),
+	}
+	payments := []mongodump.Doc{
+		withMoney(paymentRow("payApayApayApayApayApayA", "a1a1a1a1a1a1a1a1a1a1a1a1", "690310456"),
+			"payment", "230"),
+	}
+	rep, e := &Report{}, &EntityResult{}
+
+	drop, renumber, err := resolveDuplicateBillNos(bills, payments, rep, e)
+	if err != nil {
+		t.Fatalf("two different patients sharing a reissued number were refused: %v", err)
+	}
+	if len(drop) != 0 {
+		t.Fatalf("dropped %v — neither bill may be lost, they are two different visits", drop)
+	}
+	if got := renumber["a1a1a1a1a1a1a1a1a1a1a1a1"]; got != "" {
+		t.Errorf("the OLDER copy was renamed to %q — it must keep 690348950, it is the one "+
+			"the clinic can look up in V2 and the one receipt 690310456 belongs to", got)
+	}
+	if got, want := renumber["a2a2a2a2a2a2a2a2a2a2a2a2"], "690348950-2"; got != want {
+		t.Errorf("the newer copy was numbered %q, want %q", got, want)
+	}
+	if len(e.Skipped) != 0 {
+		t.Errorf("counted a skip (%v) for a door that skips nothing", e.Skipped)
+	}
+
+	joined := strings.Join(rep.Warnings, "\n")
+	for _, want := range []string{
+		"690348950",   // the number that was reissued
+		"690348950-2", // what the newer copy became
+		"016900670",   // whose bill was renamed
+		"คนไข้ต่างคนกัน", // why nothing was dropped
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the report does not mention %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestSuffixedNumberFitsTheInvoiceNoColumn(t *testing.T) {
+	// The suffix must never be the thing that overflows invoice.no — that is the class of
+	// failure widths.go exists to end, and discovering it in psql would leave a tenant
+	// half-loaded.
+	if got := invoiceNoLimit(); got != 32 {
+		t.Fatalf("invoice.no is recorded as varchar(%d); migration 0076 declares 32 — the "+
+			"ceiling this door checks against moved", got)
+	}
+	bills := []mongodump.Doc{
+		billPatient("b1b1b1b1b1b1b1b1b1b1b1b1", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("b2b2b2b2b2b2b2b2b2b2b2b2", "016900670", "send", "690348950", "270", 2, day(1)),
+	}
+	_, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	for id, no := range renumber {
+		if n := len([]rune(no)); n > invoiceNoLimit() {
+			t.Errorf("bill %s was given %q, %d characters, which does not fit", id, no, n)
+		}
+	}
+}
+
+func TestSuffixRefusesRatherThanOverflowInvoiceNo(t *testing.T) {
+	// A 31-character number leaves no room for "-2". Refusing names the group; writing it
+	// anyway would move the failure to psql with the transaction already open.
+	long := strings.Repeat("9", 31)
+	bills := []mongodump.Doc{
+		billPatient("c1c1c1c1c1c1c1c1c1c1c1c1", "016900394", "full_paid", long, "230", 2, day(0)),
+		billPatient("c2c2c2c2c2c2c2c2c2c2c2c2", "016900670", "send", long, "270", 2, day(1)),
+	}
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err == nil {
+		t.Fatal("a suffix that cannot fit invoice.no was written anyway")
+	}
+	if !strings.Contains(err.Error(), long) {
+		t.Errorf("the refusal does not name the number it could not resolve:\n%s", err)
+	}
+}
+
+func TestSuffixSkipsANumberTheFileAlreadyUses(t *testing.T) {
+	// If some other bill in the dump genuinely carries 690348950-2, handing that number
+	// out would move the collision rather than resolve it.
+	bills := []mongodump.Doc{
+		billPatient("d1d1d1d1d1d1d1d1d1d1d1d1", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("d2d2d2d2d2d2d2d2d2d2d2d2", "016900670", "send", "690348950", "270", 2, day(1)),
+		billPatient("d3d3d3d3d3d3d3d3d3d3d3d3", "016900999", "send", "690348950-2", "100", 1, day(2)),
+	}
+	_, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	if got, want := renumber["d2d2d2d2d2d2d2d2d2d2d2d2"], "690348950-3"; got != want {
+		t.Errorf("numbered %q, want %q — -2 is already a real bill's number", got, want)
+	}
+	if _, renamed := renumber["d3d3d3d3d3d3d3d3d3d3d3d3"]; renamed {
+		t.Error("the bill that legitimately owned 690348950-2 was renamed")
+	}
+}
+
+func TestThreeDifferentPatientsOnOneNumberSuffixInIssueOrder(t *testing.T) {
+	// Deliberately out of file order: the oldest keeps the number wherever it sits in the
+	// file, and the rest are suffixed oldest-first, so the numbers follow the clinic's own
+	// chronology rather than the dump's layout.
+	bills := []mongodump.Doc{
+		billPatient("e2e2e2e2e2e2e2e2e2e2e2e2", "016900670", "send", "690348950", "270", 2, day(100)),
+		billPatient("e3e3e3e3e3e3e3e3e3e3e3e3", "016900999", "send", "690348950", "310", 1, day(200)),
+		billPatient("e1e1e1e1e1e1e1e1e1e1e1e1", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+	}
+	drop, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	if len(drop) != 0 {
+		t.Fatalf("dropped %v", drop)
+	}
+	want := map[string]string{
+		"e2e2e2e2e2e2e2e2e2e2e2e2": "690348950-2",
+		"e3e3e3e3e3e3e3e3e3e3e3e3": "690348950-3",
+	}
+	for id, w := range want {
+		if got := renumber[id]; got != w {
+			t.Errorf("bill %s numbered %q, want %q", id, got, w)
+		}
+	}
+	if got := renumber["e1e1e1e1e1e1e1e1e1e1e1e1"]; got != "" {
+		t.Errorf("the oldest bill was renamed to %q", got)
+	}
+}
+
+func TestSuffixIsTheSameOnEveryRun(t *testing.T) {
+	// Map iteration order must not reach the output: two runs of one dump have to produce
+	// the same script, or an operator cannot tell a re-run from a change.
+	bills := []mongodump.Doc{
+		billPatient("f1f1f1f1f1f1f1f1f1f1f1f1", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("f2f2f2f2f2f2f2f2f2f2f2f2", "016900670", "send", "690348950", "270", 2, day(10)),
+		billPatient("f3f3f3f3f3f3f3f3f3f3f3f3", "016900701", "full_paid", "690400000", "500", 3, day(1)),
+		billPatient("f4f4f4f4f4f4f4f4f4f4f4f4", "016900702", "send", "690400000", "640", 1, day(20)),
+	}
+	var first map[string]string
+	for i := 0; i < 5; i++ {
+		_, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+		if err != nil {
+			t.Fatalf("run %d refused: %v", i, err)
+		}
+		if first == nil {
+			first = renumber
+			continue
+		}
+		if len(renumber) != len(first) {
+			t.Fatalf("run %d renamed %d bills, run 0 renamed %d", i, len(renumber), len(first))
+		}
+		for id, no := range first {
+			if renumber[id] != no {
+				t.Fatalf("run %d numbered bill %s %q, run 0 numbered it %q", i, id, renumber[id], no)
+			}
+		}
+	}
+	if got, want := first["f2f2f2f2f2f2f2f2f2f2f2f2"], "690348950-2"; got != want {
+		t.Errorf("numbered %q, want %q", got, want)
+	}
+	if got, want := first["f4f4f4f4f4f4f4f4f4f4f4f4"], "690400000-2"; got != want {
+		t.Errorf("numbered %q, want %q — each number gets its own counter", got, want)
+	}
+}
+
+func TestSamePatientTwiceWithLinesIsStillRefusedNotSuffixed(t *testing.T) {
+	// THE REASON door three asks about HNs at all (owner: แคบ). One patient, one day,
+	// lines on both copies: this may well be one visit saved twice, and importing both
+	// would charge it twice. A refusal costs a round trip; a double charge is invisible
+	// once it is in.
+	bills := []mongodump.Doc{
+		billPatient("91919191919191919191919a", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("91919191919191919191919b", "016900394", "send", "690348950", "230", 2, day(0).Add(time.Second)),
+	}
+	_, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err == nil {
+		t.Fatalf("one patient's bill recorded twice was suffixed into two invoices: %v", renumber)
+	}
+	for _, want := range []string{"690348950", "คนไข้คนเดียวกัน", "คิดเงินซ้ำ"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not explain itself with %q:\n%s", want, err)
+		}
+	}
+}
+
+func TestSuffixRefusesWhenAnHNIsBlank(t *testing.T) {
+	// "Unknown" is not a patient that can be told apart from another "unknown", so the
+	// group is not evidence of two different visits.
+	bills := []mongodump.Doc{
+		billPatient("81818181818181818181818a", "016900394", "full_paid", "690348950", "230", 2, day(0)),
+		billPatient("81818181818181818181818b", "", "send", "690348950", "270", 2, day(10)),
+	}
+	_, _, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err == nil {
+		t.Fatal("a bill with no HN was treated as a different patient")
+	}
+}
+
+func TestSuffixRefusesWhenABillHasNoCreationTime(t *testing.T) {
+	// The rule turns on which copy is older. With no timestamp there is no older copy,
+	// only a position in a file — not a good enough reason to decide which patient keeps
+	// the number their receipt was issued against.
+	withTime := billPatient("71717171717171717171717a", "016900394", "full_paid", "690348950", "230", 2, day(0))
+	noTime := billPatient("71717171717171717171717b", "016900670", "send", "690348950", "270", 2, day(10))
+	delete(noTime, "created_at")
+
+	_, _, err := resolveDuplicateBillNos([]mongodump.Doc{withTime, noTime}, nil, &Report{}, &EntityResult{})
+	if err == nil {
+		t.Fatal("a bill with no created_at was ordered by age anyway")
+	}
+}
+
+func TestDoorsOneAndTwoStillWinOverSuffixing(t *testing.T) {
+	// Precedence is deliberate and unchanged: a group of worthless drafts is resolved by
+	// door one even when the drafts belong to different patients. Door one drops a
+	// document that is empty of money and content; door three invents a number. Where
+	// both apply, dropping nothing of value beats inventing something.
+	bills := []mongodump.Doc{
+		billPatient("61616161616161616161616a", "016900394", "send", "690348950", "0", 3, day(0)),
+		billPatient("61616161616161616161616b", "016900670", "send", "690348950", "0", 1, day(10)),
+	}
+	drop, renumber, err := resolveDuplicateBillNos(bills, nil, &Report{}, &EntityResult{})
+	if err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+	if len(renumber) != 0 {
+		t.Errorf("door three renamed %v — door one had already resolved this group", renumber)
+	}
+	if len(drop) != 1 || !drop["61616161616161616161616b"] {
+		t.Errorf("dropped %v, want only the 1-line draft", drop)
+	}
+}
+
+func TestDifferentPatientsAreRecognisedOnlyWhenEveryHNIsDistinct(t *testing.T) {
+	cases := []struct {
+		name string
+		hns  []string
+		want bool
+	}{
+		{"two different patients", []string{"016900394", "016900670"}, true},
+		{"three different patients", []string{"01", "02", "03"}, true},
+		{"the same patient twice", []string{"016900394", "016900394"}, false},
+		{"three bills, two of them one patient", []string{"01", "02", "02"}, false},
+		{"one HN blank", []string{"016900394", ""}, false},
+		{"both blank", []string{"", ""}, false},
+		{"whitespace is not an HN", []string{"016900394", "   "}, false},
+	}
+	for _, c := range cases {
+		g := make([]dupBillMember, 0, len(c.hns))
+		for i, hn := range c.hns {
+			d := billPatient("x", hn, "send", "690348950", "100", 1, day(i))
+			g = append(g, dupBillMember{doc: d, id: "x", pos: i, lines: 1})
+		}
+		if got := billsAreDifferentPatients(g); got != c.want {
 			t.Errorf("%s -> %v, want %v", c.name, got, c.want)
 		}
 	}

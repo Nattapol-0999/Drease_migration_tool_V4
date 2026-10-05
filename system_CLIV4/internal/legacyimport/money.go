@@ -391,7 +391,7 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 	// planned, so a bill that loses its number never has its lines mapped and never
 	// lands in the invoice_item statistics. The resolver still refuses the run for any
 	// duplicate that is not an unpaid zero-value draft — see billdup.go.
-	dropDup, derr := resolveDuplicateBillNos(mc.bills, mc.payments, rep, eInv)
+	dropDup, renumberDup, derr := resolveDuplicateBillNos(mc.bills, mc.payments, rep, eInv)
 	if derr != nil {
 		return nil, derr
 	}
@@ -419,6 +419,14 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 			// A duplicate of a number another bill keeps. The resolver reported it in
 			// full and counted it as a skip, so nothing is said twice here.
 			continue
+		}
+		if renamed := renumberDup[mongoID]; renamed != "" {
+			// Another patient's bill, issued earlier, already holds the number this one
+			// came with — V2's counter wrapped. Door three in billdup.go kept both bills
+			// and gave this one a suffix; it is applied HERE, before the number is
+			// reserved or written anywhere, so every row that names an invoice (items,
+			// receipts, course refs, guards 4a and 1-3) sees the same one number.
+			no = renamed
 		}
 		if prev, dup := seenNo[no]; dup {
 			// STRUCTURAL INVARIANT, not a data check any more: the resolver above either

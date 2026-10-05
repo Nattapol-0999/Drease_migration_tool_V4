@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"system_cliv4/internal/mongodump"
@@ -49,7 +50,9 @@ import (
 //     same dump: 4,886 bills have no branch number at all and 361 branch numbers are
 //     duplicated across 2,615 bills, one of them 466 times. Far worse than what it fixes.
 //   - Suffixing the duplicates (640054443-2). Keeps every row at the price of inventing a
-//     document number the clinic cannot look up in V2.
+//     document number the clinic cannot look up in V2. Rejected HERE, for this shape —
+//     where both bills are the same patient's double-click — and later adopted for a
+//     different shape, two different patients. See door three below.
 
 // A SECOND SHAPE, MEASURED LATER (owner's decisions ก2 then 1ก, 4 Oct 2026)
 //
@@ -131,6 +134,75 @@ import (
 // 2 Oct rule there — keep the most complete document — was decided against a measured pair
 // whose loser was a subset of the winner. Switching that one to "latest" would throw away
 // real invoice lines.
+
+// A THIRD SHAPE: ONE NUMBER, TWO DIFFERENT PATIENTS (owner's decisions ก then แคบ, 4 Oct 2026)
+//
+// Doors one and two both end in a bill being dropped, so both are narrow enough that
+// dropping cannot lose anything: the members are worthless drafts, or empty and unpaid.
+// Neither can help with a duplicate where both bills are REAL, and the Kasetsart
+// University infirmary export (9f815aaa, 4 Oct 2026) is nothing but that shape.
+//
+// Measured on it — 43,074 bills, 42,926 importable and numbered, 47 numbers claimed twice,
+// every group exactly two bills:
+//
+//	groups whose two bills share an HN   0
+//	groups naming two DIFFERENT patients 47
+//	status of the older copy             full_paid 42 · send 5
+//	status of the newer copy             send 47
+//	value on the older copies            ฿14,305   · 118 lines · ฿2,155 collected
+//	value on the newer copies            ฿14,962.25 · 142 lines · ฿0 collected
+//	bills with no lines at all           0, on either side
+//	months                               older Jan–Jun 2026, newer Jun–Aug 2026
+//
+// Five months apart, different patients, real lines on both sides. That is not a save
+// button pressed twice: V2's counter wrapped and started handing out numbers it had
+// already issued. Receipt numbers are untouched by it — all 33,754 are distinct.
+//
+// So there is nothing here to drop. Both bills are somebody's visit, and the older one is
+// the copy that was paid and has a receipt under it.
+//
+// THE RULE: THE OLDER COPY KEEPS THE NUMBER, THE NEWER ONE GETS A SUFFIX
+//
+// 690008624 stays with the bill that was issued first — the one the clinic can still look
+// up in V2, and the one the receipt belongs to — and the later bill is written as
+// 690008624-2. Nothing is dropped, no money moves, and 47 of 42,926 documents (0.11%)
+// carry a number with a suffix on it.
+//
+// WHY "DIFFERENT PATIENTS" IS PART OF THE RULE, NOT AN AFTERTHOUGHT (owner: แคบ)
+//
+// Suffixing unconditionally would also admit the shape doors one and two exist for: the
+// SAME patient's bill recorded twice, with lines on both copies. Importing both of those
+// is charging one visit twice, which is worse than refusing — a refusal costs a round trip,
+// a double charge costs the clinic's trust and is invisible once it is in.
+//
+// Two bills naming two different HNs cannot be one visit recorded twice. That is the whole
+// test, it is measurable, and it admits all 47 of the measured groups while leaving the
+// same-patient case exactly as refused as it was.
+//
+// Every member must also carry a created_at, because the rule turns on which copy is
+// older. Without one there is no older copy, only a position in a file, and that is not a
+// good enough reason to decide which patient keeps the real document number.
+//
+// PRECEDENCE, WHICH IS DELIBERATE
+//
+// Doors one and two are tried first and keep their behaviour even when the group names
+// different patients. Both of them drop a document that holds no money and no content;
+// this one invents a number. Where both could apply, dropping nothing of value beats
+// inventing something. None of the 47 measured groups can reach door one or two anyway —
+// every bill in them has lines and a non-zero total.
+//
+// WHY THIS CANNOT DISTURB V4's OWN NUMBERING
+//
+// V4 issues its own document numbers from doc_counter (AllocDocSeq → newReceiptNo,
+// taxinvoice.FormatDocNo), never from MAX(invoice.no), so a legacy number with a suffix on
+// it is an opaque string to V4 and cannot shift the next number it hands out. invoice.no is
+// varchar(32) with no CHECK on its characters (migration 0076), and the suffix is checked
+// against that width here rather than being discovered by psql.
+//
+// Re-running the same script is still a no-op: the generated INSERT dedups on
+// (clinic_code, no), so the second run finds 690008624-2 already there, under the same HN.
+// GUARD 4a is untouched and still refuses if a number this script wants is held at the
+// target by a DIFFERENT patient.
 
 // zeroValueDraftStatus is the only status that makes a bill droppable on its own: V2's
 // "issued but not paid". A paid bill is only ever dropped through the empty-and-unpaid
@@ -286,6 +358,128 @@ func describeBillForDup(d mongodump.Doc, links paymentLinks) string {
 		paid)
 }
 
+// ── door three: one number, two different patients ──────────────────────────────────
+
+// dupSuffixSep separates a legacy document number from the copy counter door three adds.
+//
+// A hyphen, because V2's own numbers in this scheme are bare digits (YY0NNNNNN) and
+// C-prefixed course bills (CYY0NNNNNN) — see applyDocNoBranchMarker — so nothing V2 issues
+// can already look like a suffixed number, and an operator reading 690008624-2 can see
+// both which V2 document it came from and that this importer renamed it.
+const dupSuffixSep = "-"
+
+// maxDupSuffix bounds the search for a free number. Two copies is what the measured export
+// has; the ceiling exists so a pathological group cannot spin, and reaching it refuses.
+const maxDupSuffix = 99
+
+// invoiceNoLimit is what invoice.no can hold, read from the one table of column widths
+// every generated value is checked against, so a suffix can never be the thing that
+// overflows the column.
+//
+// Zero when the entry is missing, which makes suffixing refuse rather than guess — a width
+// invented here could be wider than the database and would move the failure back to psql,
+// which is the whole class of bug widths.go exists to end.
+func invoiceNoLimit() int { return columnWidths["invoice"]["no"] }
+
+// billsAreDifferentPatients reports whether every bill in the group names a different,
+// non-blank HN — the evidence that the group cannot be one visit recorded twice.
+//
+// A blank HN disqualifies the group: planBills skips such a bill anyway, and "unknown" is
+// not a patient that can be told apart from another "unknown".
+func billsAreDifferentPatients(g []dupBillMember) bool {
+	seen := map[string]bool{}
+	for _, m := range g {
+		hn := strings.TrimSpace(m.doc.Text("hn"))
+		if hn == "" || seen[hn] {
+			return false
+		}
+		seen[hn] = true
+	}
+	return true
+}
+
+// everyBillHasACreationTime reports whether the group can be ordered by age at all.
+func everyBillHasACreationTime(g []dupBillMember) bool {
+	for _, m := range g {
+		if mongoTime(m.doc, "created_at").IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// oldestFirst orders a duplicate group by age, with position in the file breaking a tie,
+// so the same dump always renames the same bills.
+func oldestFirst(g []dupBillMember) []dupBillMember {
+	out := make([]dupBillMember, len(g))
+	copy(out, g)
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := mongoTime(out[i].doc, "created_at"), mongoTime(out[j].doc, "created_at")
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return out[i].pos < out[j].pos
+	})
+	return out
+}
+
+// nextFreeSuffixedNo finds the first "<base>-N" that no other bill in this run claims and
+// that still fits invoice.no.
+//
+// taken holds every number already claimed — the numbers read out of the file AND the
+// suffixes handed out so far — because a suffix that collides with either would simply
+// move the duplicate rather than resolve it.
+func nextFreeSuffixedNo(base string, taken map[string]bool) (string, bool) {
+	limit := invoiceNoLimit()
+	if limit <= 0 {
+		return "", false
+	}
+	for n := 2; n <= maxDupSuffix; n++ {
+		cand := base + dupSuffixSep + strconv.Itoa(n)
+		if len([]rune(cand)) > limit {
+			return "", false
+		}
+		if !taken[cand] {
+			return cand, true
+		}
+	}
+	return "", false
+}
+
+// renumberLaterCopies gives every copy after the oldest a new document number, leaving the
+// oldest with the original. It writes into renumber and taken, and returns one report line
+// per renamed bill, or false when a free number that fits could not be found.
+func renumberLaterCopies(
+	no string,
+	g []dupBillMember,
+	renumber map[string]string,
+	taken map[string]bool,
+) ([]string, bool) {
+	ordered := oldestFirst(g)
+	assigned := map[string]string{}
+	var lines []string
+	for _, m := range ordered[1:] {
+		next, ok := nextFreeSuffixedNo(no, taken)
+		if !ok {
+			return nil, false
+		}
+		taken[next] = true
+		assigned[m.id] = next
+		lines = append(lines, fmt.Sprintf("%s → %s (hn %s · สถานะ %s · ยอด %s · %d รายการ)",
+			no, next,
+			strings.TrimSpace(m.doc.Text("hn")),
+			strings.TrimSpace(m.doc.Text("status")),
+			strings.TrimSpace(m.doc.Text("price_total")),
+			m.lines))
+	}
+	// Committed only once every copy in the group got a number: a half-renamed group
+	// would leave the collision in place and refuse later with a confusing message.
+	for id, next := range assigned {
+		renumber[id] = next
+	}
+	return lines, true
+}
+
 // droppedIDs lists the members of a duplicate group except the one being kept.
 func droppedIDs(g []dupBillMember, keep int) []string {
 	out := make([]string, 0, len(g)-1)
@@ -297,16 +491,18 @@ func droppedIDs(g []dupBillMember, keep int) []string {
 	return out
 }
 
-// resolveDuplicateBillNos decides which bill keeps a document number that more than one
-// bill claims, and returns the set of bill _ids to drop.
+// resolveDuplicateBillNos decides what happens to a document number that more than one
+// bill claims. It returns the bill _ids to drop and the bill _ids to renumber (_id → the
+// new document number), which planBills applies before anything is written.
 //
-// It refuses — returning an error that stops the whole script — for any duplicate group
-// that is not entirely unpaid zero-value drafts. See the note at the top of this file.
+// Three doors, in order, each narrower than the problem it solves — see the notes at the
+// top of this file. Any group that opens none of them refuses the whole script, and the
+// refusal names every such number at once rather than the first one.
 func resolveDuplicateBillNos(
 	bills, payments []mongodump.Doc,
 	rep *Report,
 	eInv *EntityResult,
-) (map[string]bool, error) {
+) (map[string]bool, map[string]string, error) {
 	links := indexPaymentLinks(payments)
 	groups := map[string][]dupBillMember{}
 	for i, d := range bills {
@@ -333,16 +529,27 @@ func resolveDuplicateBillNos(
 	sort.Strings(nos) // deterministic reporting and a deterministic first refusal
 
 	drop := map[string]bool{}
+	renumber := map[string]string{}
 	resolved := make([]string, 0, len(nos))
+
+	// Every number any importable bill claims, which is what a suffix must avoid. Door
+	// three adds each suffix it hands out, so two groups cannot be given the same new
+	// number and a suffix cannot land on a number the file already uses.
+	taken := make(map[string]bool, len(groups))
+	for no := range groups {
+		taken[no] = true
+	}
 
 	// Groups that cannot be resolved are COLLECTED, not returned on sight. Refusing at
 	// the first one is what turned a single clinic into three round trips of pull,
 	// create, generate, import, fail, delete: each run reported one problem and hid the
 	// rest. One refusal now names every number that needs a decision.
 	var refusals []string
-	// Resolved groups are reported separately per door, because "two worthless drafts"
-	// and "two empty course deductions" are different facts about the clinic's data.
+	// Resolved groups are reported separately per door, because "two worthless drafts",
+	// "two empty course deductions" and "two different patients" are different facts
+	// about the clinic's data and have different consequences.
 	var resolvedEmpty []string
+	var renamed []string
 
 	for _, no := range nos {
 		g := groups[no]
@@ -364,6 +571,15 @@ func resolveDuplicateBillNos(
 			}
 		}
 		if !allDrafts && !allEmpty {
+			// Door three: two real bills, but of DIFFERENT patients, so the group cannot
+			// be one visit recorded twice and nothing may be dropped. The oldest copy
+			// keeps the number and the later ones are suffixed.
+			if billsAreDifferentPatients(g) && everyBillHasACreationTime(g) {
+				if lines, ok := renumberLaterCopies(no, g, renumber, taken); ok {
+					renamed = append(renamed, lines...)
+					continue
+				}
+			}
 			parts := make([]string, 0, len(g))
 			for _, x := range g {
 				parts = append(parts, describeBillForDup(x.doc, links))
@@ -431,12 +647,16 @@ func resolveDuplicateBillNos(
 	}
 
 	if len(refusals) > 0 {
-		return nil, fmt.Errorf("bills: เลขที่เอกสารซ้ำ %d เลขที่ข้ามอัตโนมัติไม่ได้ — invoice.no ต้องไม่ซ้ำต่อคลินิก "+
-			"จึงปฏิเสธทั้งสคริปต์ · จะข้ามอัตโนมัติได้ ต้องเข้าข้อใดข้อหนึ่ง และต้องเข้าทุกใบในกลุ่ม: "+
-			"(1) เป็นใบร่างที่ยังไม่เก็บเงินและยอด 0 (สถานะ %s) หรือ "+
-			"(2) ไม่มีรายการเลย ยอด 0 ค้างชำระ 0 และใบรับเงินที่ผูกอยู่ต้องไม่มีเงินในช่องใดเลย (สถานะใดก็ได้) · "+
-			"รายการทั้งหมด ไม่ใช่แค่เลขแรก:\n  %s",
-			len(refusals), zeroValueDraftStatus, strings.Join(refusals, "\n  "))
+		return nil, nil, fmt.Errorf("bills: เลขที่เอกสารซ้ำ %d เลขที่จัดการอัตโนมัติไม่ได้ — invoice.no ต้องไม่ซ้ำต่อคลินิก "+
+			"จึงปฏิเสธทั้งสคริปต์ · จะจัดการอัตโนมัติได้ ต้องเข้าข้อใดข้อหนึ่ง และต้องเข้าทุกใบในกลุ่ม: "+
+			"(1) เป็นใบร่างที่ยังไม่เก็บเงินและยอด 0 (สถานะ %s) → เก็บใบที่มีรายการมากสุด หรือ "+
+			"(2) ไม่มีรายการเลย ยอด 0 ค้างชำระ 0 และใบรับเงินที่ผูกอยู่ต้องไม่มีเงินในช่องใดเลย (สถานะใดก็ได้) → เก็บใบล่าสุด หรือ "+
+			"(3) เป็นของคนไข้ต่างคนกันทุกใบ และทุกใบมีเวลาที่สร้าง → ไม่ทิ้งใบไหน "+
+			"แต่เติมท้ายเลขให้ใบที่ใหม่กว่า (เลขเดิม%s2) · "+
+			"กลุ่มที่เป็นคนไข้คนเดียวกันยังปฏิเสธเสมอ เพราะอาจเป็นการบันทึกการมาครั้งเดียวซ้ำสองใบ "+
+			"ซึ่งถ้าเข้าทั้งคู่จะกลายเป็นคิดเงินซ้ำ · รายการทั้งหมด ไม่ใช่แค่เลขแรก:\n  %s",
+			len(refusals), zeroValueDraftStatus, dupSuffixSep,
+			strings.Join(refusals, "\n  "))
 	}
 
 	if len(resolved) > 0 && rep != nil {
@@ -453,9 +673,17 @@ func resolveDuplicateBillNos(
 			"ไม่มีเงินหายเพราะทุกใบและทุกใบเสร็จเป็น 0 บาท · %s",
 			len(resolvedEmpty), strings.Join(resolvedEmpty, " · "))
 	}
+	if len(renamed) > 0 && rep != nil {
+		rep.warnf("bills: เลขที่เอกสารซ้ำ %d เลข ที่เป็นของ**คนไข้ต่างคนกัน** — ระบบเก่าวนเลขกลับมาใช้ซ้ำ "+
+			"ไม่ใช่การกดบันทึกซ้ำ จึงไม่ทิ้งใบไหนเลยตามมติเจ้าของคลินิก: ใบที่เก่ากว่าคงเลขเดิมไว้ "+
+			"(เป็นใบที่ค้นใน V2 ได้ และเป็นใบที่ใบเสร็จผูกอยู่) ส่วนใบที่ใหม่กว่าถูกเติมท้ายเลขเป็น %s2 · "+
+			"บิลเข้า V4 ครบทุกใบ เงินไม่หาย รายการไม่หาย · "+
+			"ผลข้างเคียงที่ต้องรู้: %d ใบนี้ถือเลขที่เอกสารที่ค้นใน V2 ตรงตัวไม่ได้ ต้องตัดท้าย %s2 ออกก่อน · %s",
+			len(renamed), dupSuffixSep, len(renamed), dupSuffixSep, strings.Join(renamed, " · "))
+	}
 	if (len(resolved) > 0 || len(resolvedEmpty) > 0) && rep != nil {
 		rep.notef("bills: ถ้าใบที่ซ้ำมียอดไม่เท่ากัน เก็บเงินแล้ว หรือมีใบรับเงินผูกอยู่ จะยังปฏิเสธทั้งสคริปต์เหมือนเดิม "+
 			"(ข้ามไปทั้งหมด %d ใบจาก %d เลข)", len(drop), len(resolved)+len(resolvedEmpty))
 	}
-	return drop, nil
+	return drop, renumber, nil
 }
