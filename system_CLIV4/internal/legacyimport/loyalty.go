@@ -187,9 +187,15 @@ func buildLoyalty(mc *mongoCatalog, in Input, rep *Report) (string, error) {
 
 	for _, hn := range hns {
 		b := byHN[hn]
-		if b.balance < 0 {
+		// bal is what gets written. It is a copy on purpose: a negative balance is
+		// clamped below and b must keep the source figure, both for the report and
+		// because b.disagrees() compares the balance against the other documents.
+		bal := b.balance
+		if bal < 0 {
+			// Owner's decision ข, 5 Oct 2026: a negative balance is carried over as zero
+			// rather than refusing the clinic. See the note on clampedNegative.
 			negative = append(negative, fmt.Sprintf("%s (%d)", hn, b.balance))
-			continue
+			bal = 0
 		}
 		if b.docs > 1 {
 			multi++
@@ -203,17 +209,19 @@ func buildLoyalty(mc *mongoCatalog, in Input, rep *Report) (string, error) {
 				}
 			}
 		}
-		if b.balance == 0 {
+		if bal == 0 {
 			// Owner's rule, 28 Sep 2026: no row for a patient who has nothing saved.
+			// A clamped negative lands here too, which is the same answer to the same
+			// question — this patient has nothing to spend.
 			zero++
 			e.skip("ยอดแต้มเป็น 0 — ไม่เปิดบัญชี (มติเจ้าของคลินิก 28 ก.ย. 2569)")
 			continue
 		}
 
 		written++
-		total += b.balance
-		if b.balance > maxPer {
-			maxPer = b.balance
+		total += bal
+		if bal > maxPer {
+			maxPer = bal
 		}
 
 		hnLit, cut := clip(hn, 32)
@@ -224,9 +232,9 @@ func buildLoyalty(mc *mongoCatalog, in Input, rep *Report) (string, error) {
 
 		if b.docs > 1 {
 			s.comment("hn %s — %d แต้ม (ต้นทางมี %d เอกสาร ใช้ใบแรกตามที่ V2 อ่าน · ใบที่เหลือ %s)",
-				hn, b.balance, b.docs, joinInts(b.ignored))
+				hn, bal, b.docs, joinInts(b.ignored))
 		} else {
-			s.comment("hn %s — %d แต้ม", hn, b.balance)
+			s.comment("hn %s — %d แต้ม", hn, bal)
 		}
 		// patient_id read in SQL at write time, exactly like photos.branch_code: the id is
 		// the target's, this side has never seen it, and uq_patient_clinic_hn makes the
@@ -235,17 +243,10 @@ func buildLoyalty(mc *mongoCatalog, in Input, rep *Report) (string, error) {
 SELECT %s, %s, %d, p.id, now()
   FROM patient p
  WHERE p.clinic_code = %s AND p."HN" = %s
-ON CONFLICT (clinic_code, hn) DO NOTHING;`, c, h, b.balance, c, h)
+ON CONFLICT (clinic_code, hn) DO NOTHING;`, c, h, bal, c, h)
 	}
 
-	if len(negative) > 0 {
-		// CHECK (balance >= 0) would refuse it anyway; failing here names every HN
-		// instead of stopping at whichever row Postgres reached first.
-		return "", fmt.Errorf(
-			"loyalty_account: %d hn มีแต้มติดลบในเอกสารใบแรก ซึ่ง CHECK (balance >= 0) ปฏิเสธ — %s · "+
-				"ต้นทางมี use_point ที่หักเกินยอด ต้องให้เจ้าของคลินิกตัดสินว่าจะปรับเป็น 0 หรือแก้ที่ต้นทาง",
-			len(negative), strings.Join(negative, ", "))
-	}
+	reportClampedNegativeBalances(negative, rep)
 
 	// Every hn sits at zero. That is what a clinic with no points scheme looks like, not a
 	// surprise, so it must not fail — and it especially must not fail HERE: an error from
@@ -429,4 +430,68 @@ func capList(items []string, max int) []string {
 	}
 	out := append([]string{}, items[:max]...)
 	return append(out, fmt.Sprintf("… และอีก %d รายการ", len(items)-max))
+}
+
+// A NEGATIVE POINT BALANCE (owner's decision ข, 5 Oct 2026)
+//
+// loyalty_account.balance has CHECK (balance >= 0), so a negative figure out of V2 used to
+// refuse the whole clinic and ask for a decision. Denarin Co., Ltd. produced that refusal
+// over 74 HN and the decision came back: carry them over as zero.
+//
+// WHAT THE SOURCE ACTUALLY SAYS, WHICH IS NOT WHAT THE OLD MESSAGE CLAIMED
+//
+// The refusal used to blame `use_point` deducting past a balance. Measured on that export,
+// that is wrong. Its 851 points documents hold one per HN:
+//
+//	775 HN at zero
+//	 74 HN at exactly -15, every one of them the same figure
+//	  2 HN positive, 100,000 and 135,000
+//
+// and the point_logs trail for a -15 HN reads
+//
+//	type "add_point"  point -15  payment_id 69071ed5…  bill_id null
+//
+// An ADD of minus fifteen. Across 2,777 log rows there are only 8 `use_point` entries at
+// all, against 2,765 `add_point` of which 2,686 are zero and 74 are -15. So V2's own
+// earning formula returned a negative for 74 payments; nobody spent points they did not
+// have. The message now says that instead of guessing.
+//
+// WHY ZERO IS THE HONEST VALUE AND NOT A ROUNDING
+//
+// V2 never displays a negative balance — usePointInPayment reads total_point and treats
+// anything at or below zero as nothing to spend — so zero is what the clinic and the
+// patient have always seen on screen. Writing it is carrying the balance over, not
+// changing it.
+//
+// WHAT THAT MEANS FOR THE ROWS, WHICH IS THE PART WORTH SAYING OUT LOUD
+//
+// A clamped balance is zero, and the owner's 28 Sep rule is that a zero balance opens no
+// account — V4 creates one on the first movement that awards something. So these HN get NO
+// loyalty_account row, exactly like the 775 that were already at zero. Anyone who goes
+// looking for 74 rows at zero will not find them, which is why the report says so rather
+// than only reporting the clamp.
+
+// reportClampedNegativeBalances names every HN whose balance was carried over as zero.
+//
+// A warning rather than a note: a point balance is a liability to a patient, and one that
+// changed on the way in has to be visible to whoever ran the import. Bounded, because 74
+// HN is a measured case and a worse export should not bury the rest of the report.
+func reportClampedNegativeBalances(negative []string, rep *Report) {
+	if len(negative) == 0 || rep == nil {
+		return
+	}
+	shown := negative
+	more := ""
+	if len(shown) > 80 {
+		shown = shown[:80]
+		more = fmt.Sprintf(" … และอีก %d hn", len(negative)-80)
+	}
+	rep.warnf("loyalty_account: %d hn มียอดแต้มติดลบในต้นทาง จึงนำเข้าเป็น 0 ตามมติเจ้าของคลินิก (5 ต.ค. 2569) "+
+		"— V2 เองไม่เคยแสดงยอดติดลบ (usePointInPayment ถือว่ายอด ≤ 0 คือไม่มีแต้มให้ใช้) "+
+		"ดังนั้น 0 คือตัวเลขที่คลินิกและคนไข้เห็นบนจอมาตลอด ไม่ใช่การแก้ยอด · "+
+		"**ผลจริงคือ hn เหล่านี้จะไม่มีแถว loyalty_account เลย** เพราะยอด 0 ไม่เปิดบัญชี "+
+		"ตามมติ 28 ก.ย. 2569 (V4 เปิดบัญชีตอนได้แต้มครั้งแรก) — อย่าไปตามหาแถวที่ยอดเป็น 0 · "+
+		"สาเหตุที่ต้นทาง: V2 บันทึก point_logs เป็น type=add_point ที่มีค่าติดลบ "+
+		"ไม่ใช่การใช้แต้มเกินยอด ถ้าไม่แก้สูตรที่ V2 ยอดจะติดลบเพิ่มได้อีก · hn ที่ถูกปรับ: %s%s",
+		len(negative), strings.Join(shown, ", "), more)
 }

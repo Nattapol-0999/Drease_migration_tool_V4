@@ -243,21 +243,67 @@ func TestLoyaltyRefusesFractionalPoints(t *testing.T) {
 	}
 }
 
-// A negative FIRST document is refused with every offending HN named, rather than letting
-// CHECK (balance >= 0) stop at whichever row Postgres reached first.
-func TestLoyaltyRefusesNegativeBalance(t *testing.T) {
+// A negative FIRST document is carried over as ZERO, not refused (owner's decision ข,
+// 5 Oct 2026). It used to refuse the whole clinic and ask for a decision; Denarin Co., Ltd.
+// produced that refusal over 74 HN all sitting at exactly -15, and the answer came back.
+//
+// Zero is the figure V2 has always shown — usePointInPayment treats any total at or below
+// zero as nothing to spend — so writing it carries the balance over rather than changing
+// it. And because a zero balance opens no account (28 Sep rule), the practical outcome is
+// that these HN get no loyalty_account row at all, which the warning has to say.
+func TestLoyaltyCarriesANegativeBalanceOverAsZero(t *testing.T) {
 	body := strings.Replace(pointsSample, `NumberDecimal("3")`, `NumberDecimal("-4")`, 1)
-	mc, err := parseMongoCatalog([]byte(body))
-	if err != nil {
-		t.Fatalf("parseMongoCatalog: %v", err)
+	sql, rep := buildLoyaltyOne(t, body)
+
+	// No row for the clamped HN: zero opens no account.
+	if strings.Contains(sql, "016400544") && strings.Contains(sql, "INSERT INTO loyalty_account") {
+		for _, line := range strings.Split(sql, "\n") {
+			if strings.Contains(line, "016400544") && strings.Contains(line, ", 0, p.id") {
+				t.Errorf("a loyalty_account row was written at zero:\n%s", line)
+			}
+		}
 	}
-	_, err = buildLoyalty(mc, Input{ClinicCode: "C9C9611"}, NewReport("C9C9611"))
-	if err == nil {
-		t.Fatal("expected a refusal for a negative balance")
+	// And certainly not the negative figure.
+	if strings.Contains(sql, ", -4, p.id") {
+		t.Errorf("the negative balance reached the script:\n%s", sql)
 	}
-	if !strings.Contains(err.Error(), "016400544") || !strings.Contains(err.Error(), "-4") {
-		t.Errorf("the error should name the HN and the value: %v", err)
+
+	var warned bool
+	joined := strings.Join(rep.Warnings, "\n")
+	for _, want := range []string{"016400544", "-4", "นำเข้าเป็น 0"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the warning does not carry %q:\n%s", want, joined)
+		}
 	}
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "นำเข้าเป็น 0") && strings.Contains(w, "016400544") {
+			warned = true
+			// The two things an operator would otherwise get wrong.
+			if !strings.Contains(w, "ไม่มีแถว loyalty_account") {
+				t.Errorf("the warning does not say no row is written: %s", w)
+			}
+			if !strings.Contains(w, "add_point") {
+				t.Errorf("the warning does not name the real cause measured in the source: %s", w)
+			}
+			if strings.Contains(w, "use_point ที่หักเกินยอด") {
+				t.Errorf("the warning still blames use_point, which the measurement disproved: %s", w)
+			}
+		}
+	}
+	if !warned {
+		t.Errorf("a clamped balance was not reported at all: %v", rep.Warnings)
+	}
+}
+
+func TestLoyaltySaysNothingWhenNoBalanceWasClamped(t *testing.T) {
+	_, rep := buildLoyaltyOne(t, pointsSample)
+	for _, w := range rep.Warnings {
+		if strings.Contains(w, "นำเข้าเป็น 0") {
+			t.Errorf("reported a clamp that did not happen: %s", w)
+		}
+	}
+	reportClampedNegativeBalances(nil, NewReport("X"))
+	reportClampedNegativeBalances([]string{"x (-1)"}, nil)
 }
 
 // A negative value in a LATER document is reported but does not stop the import: V2 never
