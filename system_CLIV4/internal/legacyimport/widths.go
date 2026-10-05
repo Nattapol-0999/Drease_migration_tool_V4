@@ -235,6 +235,28 @@ const (
 	kindWidth   limitKind = "varchar"
 	kindNumeric limitKind = "numeric"
 	kindInteger limitKind = "integer"
+
+	// kindFraction is a value with a fractional part written into a column that holds
+	// whole numbers only.
+	//
+	// WHY IT IS A VIOLATION AND NOT A ROUNDING (owner's decision, 5 Oct 2026)
+	//
+	// Postgres does not refuse 0.2 into an integer column. It rounds, commits, and says
+	// nothing. Measured on pinluck-clinic: six of 29,337 bill lines carried a fractional
+	// bills.list[].amount, invoice_item.qty took them as 0, 1, 1, 1, 2 — and four
+	// invoices ended up worth less than the receipts under them had collected while two
+	// ended up worth MORE, showing patients ฿1,000 and ฿315 of debt that never existed.
+	// The whole clinic was in production before anything complained.
+	//
+	// The range check above could not see it: integerFits deliberately compares only the
+	// integer part, because a wide legacy id must not be called out of range over its
+	// decimals. So nothing in this file looked at whether the value was whole.
+	//
+	// It covers every integer column this importer writes, not just the one that broke —
+	// sort_order, tax_rate_bps, point_earned, point_spent, installment_no, payment_index,
+	// file_size, visit_id, counter, Braces_ID_int, old_hn_int, user_insert, created_by.
+	// Any of them would have been rounded just as quietly.
+	kindFraction limitKind = "integer-fraction"
 )
 
 // limitViolation is one generated value that does not fit its column.
@@ -375,6 +397,17 @@ func scanScriptColumnLimits(script string) ([]limitViolation, limitCheckStats) {
 								sample: sampleForError(text),
 							})
 						}
+						// An integer column cannot hold a fraction, and Postgres does not
+						// say so: it rounds on the cast and commits. See the note on
+						// kindFraction for the import that proved this the expensive way.
+						if frac, fractional := fractionalPart(text); fractional {
+							violations = append(violations, limitViolation{
+								table: table, column: col, kind: kindFraction,
+								limit:  fmt.Sprintf("%s — เก็บได้แต่จำนวนเต็ม", kind),
+								got:    fmt.Sprintf("มีเศษ .%s (Postgres จะปัดให้เป็น %s)", frac, roundedForError(text)),
+								sample: sampleForError(text),
+							})
+						}
 					}
 				}
 			}
@@ -415,9 +448,37 @@ func numericIntegerDigits(v string) (digits int, text string, ok bool) {
 	return len(trimmed), s, true
 }
 
+// fractionalPart returns the digits after the decimal point when they are not all zero.
+//
+// Trailing zeros do not count: 2.00 is the whole number two written long, and calling that
+// a violation would refuse every money-shaped literal that happens to feed an integer
+// column. .005 does count — it is the half-satang that Postgres would round away.
+func fractionalPart(text string) (digits string, fractional bool) {
+	s := strings.TrimSpace(text)
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return "", false
+	}
+	frac := s[dot+1:]
+	if strings.Trim(frac, "0") == "" {
+		return "", false
+	}
+	return frac, true
+}
+
+// roundedForError shows what the column would have ended up holding, so the refusal names
+// the damage rather than only the input. Same rule as the database: half away from zero.
+func roundedForError(text string) string {
+	if q, ok := qtyAsWritten(text); ok {
+		return q.String()
+	}
+	return "(อ่านค่าไม่ออก)"
+}
+
 // integerFits compares a numeric literal against a column's range exactly, using big.Int
 // so a twenty-digit legacy id cannot wrap on its way to being checked. A literal with a
-// fractional part is rejected as out of range only when its integer part is.
+// fractional part is rejected as out of range only when its integer part is — whether it
+// is whole at all is kindFraction's question, checked separately.
 func integerFits(text, lo, hi string) bool {
 	s := text
 	if dot := strings.IndexByte(s, '.'); dot >= 0 {
@@ -448,6 +509,11 @@ func sampleForError(s string) string {
 
 // describeLimitViolations groups every violation by column, so one bad column with four
 // thousand rows reads as one entry with a count rather than four thousand lines.
+//
+// The kind is part of the grouping key, not just the column: one integer column can break
+// two different rules at once — 3000000000.5 is both out of range and not whole — and
+// merging those would print one entry under whichever rule happened to be seen first,
+// with a count covering both. They are different problems with different fixes.
 func describeLimitViolations(v []limitViolation) string {
 	type group struct {
 		key     string
@@ -462,7 +528,7 @@ func describeLimitViolations(v []limitViolation) string {
 	byCol := map[string]*group{}
 	var order []string
 	for _, x := range v {
-		key := x.table + "." + x.column
+		key := x.table + "." + x.column + " · " + string(x.kind)
 		g, seen := byCol[key]
 		if !seen {
 			g = &group{key: key, table: x.table, column: x.column, kind: x.kind, limit: x.limit}
@@ -503,6 +569,15 @@ func describeLimitViolations(v []limitViolation) string {
 	b.WriteString("แก้ที่ตัวสร้าง หรือแก้ข้อมูลที่ต้นทาง: ค่าข้อความต้องผ่าน clip(value, n) ให้ตรงความกว้าง " +
 		"และค่าตัวเลขที่ต้นทางใส่มาเกินจริง (เช่นพิมพ์ 9 รวด) ต้องตัดสินใจทีละเคสว่าจะตัด ตั้งศูนย์ หรือข้ามแถวนั้น " +
 		"เพราะเป็นตัวเลขที่กระทบยอดเงินและยอดสต็อก")
+	for _, k := range order {
+		if byCol[k].kind == kindFraction {
+			b.WriteString("\nค่าที่ \"มีเศษ\" เป็นเรื่องแยก: คอลัมน์นั้นเก็บจำนวนเต็มเท่านั้น และ Postgres จะไม่ปฏิเสธ " +
+				"มันจะปัดแล้ว commit เงียบ ๆ ทำให้ตัวเลขในฐานไม่ใช่ตัวเลขของต้นทาง · " +
+				"ถ้าเป็นจำนวนในบิล ให้แก้ที่ต้นทางเป็นจำนวนเต็มแล้วปรับราคาต่อหน่วยให้ยอดรวมเท่าเดิม " +
+				"(เช่น จำนวน 0.2 ราคา 500 → จำนวน 1 ราคา 100) แล้วดึงข้อมูลใหม่")
+			break
+		}
+	}
 	return b.String()
 }
 

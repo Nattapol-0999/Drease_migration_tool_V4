@@ -265,6 +265,15 @@ func buildMoney(mc *mongoCatalog, in Input, knownHN map[string]bool, rep *Report
 		return out, nil
 	}
 
+	// Before the receipts, and before balanceBills works out any discount: a quantity
+	// that cannot fit invoice_item.qty changes what the bill is WORTH, and every number
+	// computed after this point would be computed against a total the database is not
+	// going to hold. Refusing here means no file is produced and nothing is written.
+	// See landedqty.go.
+	if err := checkLandedLineValues(plans, rep); err != nil {
+		return out, err
+	}
+
 	byBillID := map[string]*billPlan{}
 	for i := range plans {
 		byBillID[plans[i].mongoID] = &plans[i]
