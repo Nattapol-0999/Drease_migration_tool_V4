@@ -9,9 +9,21 @@ import (
 // The six lines that put pinluck-clinic into production with four invoices worth less than
 // the receipts under them and two showing debt that never existed. invoice_item.qty is an
 // integer column; V2 records the line quantity in bills.list[].amount, and these six carry
-// a fraction. Owner's decision 1c (5 Oct 2026): refuse at generate time, because the SQL
-// guards read the rows back AFTER their transaction has committed and there is nothing
-// left for a RAISE to undo.
+// a fraction.
+//
+// TWO DECISIONS, IN ORDER, AND BOTH ARE STILL HERE
+//
+// 1c (5 Oct): refuse at generate time, because the SQL guards read the rows back AFTER
+// their transaction has committed and there is nothing left for a RAISE to undo.
+//
+// ค (5 Oct, later the same day): move the fraction into the price instead — 16.25 at ฿400
+// becomes 1 at ฿6,500 — so an ordinary clinical quantity does not send the clinic back to
+// hand-edit V2 before every migration.
+//
+// So checkLandedLineValues no longer fires on a dump like this: planBillLines folds the
+// fraction before a plan is built. What it tests now is the INVARIANT — no plan may reach
+// the writers carrying a quantity an integer column would round — which is what proves the
+// fold is complete, plus the backstop for a literal nothing can parse.
 
 func TestQtyAsWrittenRoundsTheWayPostgresCasts(t *testing.T) {
 	// numeric -> int4 is half AWAY FROM ZERO, not banker's rounding. 2.5 must be 3, or a
@@ -301,5 +313,179 @@ func TestLineValueLostMatchesABigRatComputedByHand(t *testing.T) {
 	}
 	if got.Cmp(byHand) != 0 {
 		t.Errorf("lineValueLost = %s, hand-computed = %s", got.FloatString(4), byHand.FloatString(4))
+	}
+}
+
+// ── moving the fraction into the price (owner's decision ค) ──────────────────────────
+//
+// The owner asked for the fraction to be ROUNDED UP first. Measured on the two dumps that
+// hit this, that invents ฿3,835 of debt across eight invoices — 16.25 -> 17 makes a ฿6,500
+// bill ฿6,800 while the receipt still says ฿6,500, so a full_paid visit turns into
+// partially_paid and the patient is shown a balance they never owed. Guard 3 never sees
+// it: it only looks for money ABOVE the net. Folding into the price keeps every satang.
+
+func TestFoldFractionIntoPriceKeepsTheValueExactly(t *testing.T) {
+	// Every fractional line measured on the two clinics, and what each has to become.
+	cases := []struct {
+		price, qty string
+		want       string
+		where      string
+	}{
+		{"400", "16.25", "6500.00", "denarin LH026 Xeomin, twice"},
+		{"2000", "0.5", "1000.00", "pinluck 670070199 ST118, half a bottle"},
+		{"500", "0.2", "100.00", "pinluck 670075362 and 690028527 ST039"},
+		{"1000", "1.44", "1440.00", "pinluck 690004617 and 690012615 ST168"},
+		{"630", "1.5", "945.00", "pinluck 690040398 LH001"},
+	}
+	for _, c := range cases {
+		got, residue, ok := foldFractionIntoPrice(c.price, c.qty)
+		if !ok {
+			t.Errorf("%s: %s x %s was not foldable", c.where, c.qty, c.price)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%s: %s x %s folded to %s, want %s", c.where, c.qty, c.price, got, c.want)
+		}
+		if residue.Sign() != 0 {
+			t.Errorf("%s: %s x %s left a residue of %s — these all divide exactly",
+				c.where, c.qty, c.price, residue.FloatString(6))
+		}
+	}
+}
+
+func TestFoldingIsNeverRoundingUp(t *testing.T) {
+	// The decision that was rejected, kept as a test so it cannot creep back in.
+	// Rounding 16.25 up gives 17 x 400 = 6,800 against a ฿6,500 receipt.
+	got, _, ok := foldFractionIntoPrice("400", "16.25")
+	if !ok {
+		t.Fatal("not foldable")
+	}
+	if got == "6800.00" {
+		t.Fatal("the quantity was rounded up — that is the ฿300 of invented debt this avoids")
+	}
+	if got != "6500.00" {
+		t.Fatalf("folded to %s, want the source value 6500.00", got)
+	}
+}
+
+func TestFoldReportsTheHalfSatangItCannotKeep(t *testing.T) {
+	// invoice_item.price is numeric(12,2). 333.33 x 1.11 is 369.9963, which cannot be
+	// held, so the product is rounded and the residue has to be said out loud.
+	got, residue, ok := foldFractionIntoPrice("333.33", "1.11")
+	if !ok {
+		t.Fatal("not foldable")
+	}
+	if got != "370.00" {
+		t.Errorf("folded to %s, want 370.00 (half away from zero, like the database)", got)
+	}
+	if residue.Sign() == 0 {
+		t.Error("a product that does not fit two decimals reported no residue")
+	}
+	if residue.FloatString(4) != "-0.0037" {
+		t.Errorf("residue = %s, want -0.0037", residue.FloatString(4))
+	}
+}
+
+func TestFoldRefusesNothingButLeavesUnreadableLiteralsAlone(t *testing.T) {
+	for _, c := range [][2]string{{"abc", "1.5"}, {"500", "now()"}, {"", "0.2"}} {
+		if _, _, ok := foldFractionIntoPrice(c[0], c[1]); ok {
+			t.Errorf("price=%q qty=%q was folded on a guess", c[0], c[1])
+		}
+	}
+}
+
+func TestReportOfFoldedQuantitiesNamesBothNumbersAndTheSideEffect(t *testing.T) {
+	rep := &Report{}
+	zero := func() *big.Rat { return new(big.Rat) }
+	reportFoldedQuantities([]foldedLine{
+		{invoiceNo: "690011967", code: "LH026", name: "Program Botulinum Toxin 1u (Xeomin)",
+			srcPrice: "400", srcQty: "16.25", newPrice: "6500.00", residue: zero()},
+		{invoiceNo: "680108492", code: "LH026", name: "Program Botulinum Toxin 1u (Xeomin)",
+			srcPrice: "400", srcQty: "16.25", newPrice: "6500.00", residue: zero()},
+	}, rep)
+
+	joined := strings.Join(rep.Warnings, "\n")
+	for _, want := range []string{
+		"2 บรรทัดใน 2 ใบ", // counted
+		"680108492",       // both bills, and in number order
+		"690011967",
+		"16.25 × 400",          // what the source said
+		"จำนวน 1 ราคา 6500.00", // what was written
+		"ยอดบิลเท่าเดิมทุกสตางค์",
+		"ไม่ใช่ราคาในแคตตาล็อกอีกแล้ว", // the side effect, stated not buried
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the report does not carry %q:\n%s", want, joined)
+		}
+	}
+	// A warning, not a note: the unit price changing is something the clinic must be told.
+	if len(rep.Warnings) == 0 {
+		t.Error("the fold was reported as a note instead of a warning")
+	}
+	// Bills must be listed in a fixed order whatever order they were collected in.
+	if strings.Index(joined, "680108492") > strings.Index(joined, "690011967") {
+		t.Error("the bills are not in number order, so two runs could read differently")
+	}
+}
+
+func TestResidueIsOnlyReportedWhenThereIsOne(t *testing.T) {
+	clean := &Report{}
+	reportFoldedQuantities([]foldedLine{
+		{invoiceNo: "1", code: "A", name: "a", srcPrice: "400", srcQty: "16.25",
+			newPrice: "6500.00", residue: new(big.Rat)},
+	}, clean)
+	for _, w := range clean.Warnings {
+		if strings.Contains(w, "ยอดรวมเคลื่อนไป") {
+			t.Errorf("reported a rounding residue that was zero: %s", w)
+		}
+	}
+
+	lossy := &Report{}
+	r, _ := new(big.Rat).SetString("-0.0037")
+	reportFoldedQuantities([]foldedLine{
+		{invoiceNo: "1", code: "A", name: "a", srcPrice: "333.33", srcQty: "1.11",
+			newPrice: "370.00", residue: r},
+	}, lossy)
+	var said bool
+	for _, w := range lossy.Warnings {
+		if strings.Contains(w, "ยอดรวมเคลื่อนไป") {
+			said = true
+			if !strings.Contains(w, "-0.0037") {
+				t.Errorf("the residue warning does not state the amount: %s", w)
+			}
+		}
+	}
+	if !said {
+		t.Error("a non-zero rounding residue was not reported")
+	}
+}
+
+func TestReportSaysNothingWhenNothingWasFolded(t *testing.T) {
+	rep := &Report{}
+	reportFoldedQuantities(nil, rep)
+	if len(rep.Warnings) != 0 {
+		t.Errorf("warned about a fold that did not happen: %v", rep.Warnings)
+	}
+	reportFoldedQuantities([]foldedLine{{invoiceNo: "1", residue: new(big.Rat)}}, nil)
+}
+
+func TestPlansAfterFoldingPassTheInvariantCheck(t *testing.T) {
+	// End to end on the shape planBillLines produces: a folded line carries qty 1 and the
+	// whole value in its price, so checkLandedLineValues — the invariant that no plan may
+	// reach the writers with a quantity an integer column would round — finds nothing.
+	newPrice, _, ok := foldFractionIntoPrice("400", "16.25")
+	if !ok {
+		t.Fatal("not foldable")
+	}
+	plans := []billPlan{billWithLines("690011967", "016800323",
+		[3]string{"LH026", newPrice, "1"})}
+	if err := checkLandedLineValues(plans, &Report{}); err != nil {
+		t.Fatalf("a folded plan still trips the invariant check: %v", err)
+	}
+	// And the value is unchanged: 16.25 x 400 = 6,500 = 1 x 6,500.
+	before, _ := new(big.Rat).SetString("6500")
+	after, _ := new(big.Rat).SetString(newPrice)
+	if before.Cmp(after) != 0 {
+		t.Errorf("the bill is worth %s after folding, was %s", after.FloatString(2), before.FloatString(2))
 	}
 }

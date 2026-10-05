@@ -407,6 +407,9 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 	unknownTypes := map[string]int{}
 	noCodeLines, useCourseLines, coursePurchaseLines := 0, 0, 0
 	statusSkips := map[string]int{}
+	// Quantities moved into their price because invoice_item.qty holds whole numbers
+	// only. Collected for one report line rather than one warning per line.
+	var foldedLines []foldedLine
 
 	for n, d := range mc.bills {
 		mongoID := docObjectID(d, "_id")
@@ -487,7 +490,7 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 		}
 
 		lines, lineTotal, lerr := planBillLines(d, mongoID, no, rep, eItem, unknownTypes,
-			&noCodeLines, &useCourseLines, &coursePurchaseLines)
+			&noCodeLines, &useCourseLines, &coursePurchaseLines, &foldedLines)
 		if lerr != nil {
 			return nil, lerr
 		}
@@ -530,6 +533,7 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 		rep.warnf("invoice_item: มีชนิดรายการที่ mapping นี้ไม่รู้จัก (%s) — บรรทัดนั้นไม่ถูกนำเข้า เพราะ invoice_item.kind เป็นตัวตัดสินว่าจะตัดสต็อกหรือไม่ เดาผิดคือสต็อกเพี้ยน",
 			strings.Join(parts, ", "))
 	}
+	reportFoldedQuantities(foldedLines, rep)
 	if noCodeLines > 0 {
 		rep.notef("invoice_item: %d บรรทัดไม่มีรหัสสินค้าในต้นทาง (บรรทัดขายคอร์ส) — ลงเป็น code ว่างและ catalog_item_id = NULL ตามที่ต้นทางมี",
 			noCodeLines)
@@ -547,7 +551,8 @@ func planBills(mc *mongoCatalog, br *branchResolver, knownHN map[string]bool,
 // planBillLines maps one bill's list[] onto invoice_item rows and returns their net
 // total, which is what the bill's own price_total is checked against.
 func planBillLines(d mongodump.Doc, mongoID, no string, rep *Report, eItem *EntityResult,
-	unknownTypes map[string]int, noCodeLines, useCourseLines, coursePurchaseLines *int) ([]linePlan, float64, error) {
+	unknownTypes map[string]int, noCodeLines, useCourseLines, coursePurchaseLines *int,
+	folded *[]foldedLine) ([]linePlan, float64, error) {
 
 	raw, ok := d.Get("list")
 	if !ok || raw == nil {
@@ -610,6 +615,25 @@ func planBillLines(d mongodump.Doc, mongoID, no string, rep *Report, eItem *Enti
 		codeLit, _ := clip(code, 64)
 		price := line.Text("price")
 		qty := firstNonEmpty(line.Text("amount"), "1")
+
+		// A fractional quantity cannot reach invoice_item.qty, which is an integer
+		// column — Postgres would round it and commit, and the bill would quietly stop
+		// being worth what the source says. The fraction moves into the price instead,
+		// so 16.25 at ฿400 is written as 1 at ฿6,500: same value, whole quantity. See
+		// landedqty.go for why this and not rounding up.
+		if whole, measurable := qtySurvivesTheColumn(qty); measurable && !whole {
+			if newPrice, residue, ok := foldFractionIntoPrice(price, qty); ok {
+				*folded = append(*folded, foldedLine{
+					invoiceNo: no, code: codeLit, name: nameLit,
+					srcPrice: strings.TrimSpace(price), srcQty: strings.TrimSpace(qty),
+					newPrice: newPrice, residue: residue,
+				})
+				price, qty = newPrice, "1"
+			}
+			// Not foldable means one of the two literals is unreadable. Left alone on
+			// purpose: checkLandedLineValues refuses the run and names it, which beats
+			// guessing what an unparseable quantity was supposed to mean.
+		}
 
 		lines = append(lines, linePlan{
 			kind:         kind,

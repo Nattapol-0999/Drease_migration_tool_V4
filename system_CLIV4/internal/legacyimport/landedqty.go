@@ -96,6 +96,73 @@ func qtySurvivesTheColumn(lit string) (survives bool, measurable bool) {
 	return r.IsInt(), true
 }
 
+// MOVING THE FRACTION INTO THE PRICE (owner's decision ค, 5 Oct 2026)
+//
+// Refusing was right as a first move — it stopped a wrong bill from being written — but it
+// turned out to be the wrong place to stop. Two clinics in a row hit it, and the fractions
+// were not data-entry slips: 16.25 units of Xeomin at ฿400, half a 2,000-baht bottle,
+// 1.44 of a 1,000-baht dressing. Fractional quantities are ordinary in a clinic, so
+// refusing every one of them means the clinic hand-edits V2 before every migration.
+//
+// The owner first asked for the fraction to be ROUNDED UP. Measured, that is the worse of
+// the two failures: 16.25 -> 17 makes the bill ฿6,800 against the ฿6,500 the receipt
+// collected, so a `full_paid` visit becomes `partially_paid` and the patient is shown a
+// debt they never had. Across the two measured dumps it would invent ฿3,835 of debt over
+// eight invoices, and guard 3 would not catch any of it — it only looks for money ABOVE
+// the net, never below. That is the exact shape of the damage already sitting in
+// production from the rounding this file exists to stop.
+//
+// So the quantity moves into the price instead: 16.25 x ฿400 becomes 1 x ฿6,500. The bill
+// is worth the same to the satang, the receipt reconciles, the status stays `full_paid`,
+// and invoice_item.qty gets the whole number it needs.
+//
+// WHAT IT COSTS, SAID PLAINLY
+//
+// The unit price on that line is no longer the catalogue price. A receipt prints
+// "1 x ฿6,500" where the clinic sold 16.25 units at ฿400. catalog_item.price is untouched,
+// so only this historical invoice line reads that way, and every converted line is named
+// in the import report with both numbers. The item NAME is deliberately left alone — the
+// real quantity belongs in the report, not printed onto a receipt.
+//
+// Rounding half a satang: price x qty can carry more than two decimals (333.33 x 1.11 is
+// 369.9963) and invoice_item.price is numeric(12,2). The product is rounded here, half
+// away from zero, and the same rounded figure feeds the bill total — so the tool and the
+// database cannot disagree about what the bill is worth. Any residue is reported. Neither
+// measured dump has one: every product divides exactly.
+
+// foldedLine records one quantity that was moved into its price, for the report.
+type foldedLine struct {
+	invoiceNo string
+	code      string
+	name      string
+	srcPrice  string
+	srcQty    string
+	newPrice  string
+	residue   *big.Rat // what rounding to satang dropped; zero in every measured case
+}
+
+// foldFractionIntoPrice turns "16.25 at 400" into "1 at 6500".
+//
+// ok is false when either literal is not a plain number. Those are left exactly as they
+// were: checkLandedLineValues refuses the run over them by name, which is the right
+// outcome for a value nobody can read rather than a guess at what it meant.
+func foldFractionIntoPrice(price, qty string) (newPrice string, residue *big.Rat, ok bool) {
+	p, okP := new(big.Rat).SetString(strings.TrimSpace(price))
+	q, okQ := new(big.Rat).SetString(strings.TrimSpace(qty))
+	if !okP || !okQ {
+		return "", nil, false
+	}
+	exact := new(big.Rat).Mul(p, q)
+	// invoice_item.price is numeric(12,2); render at the column's scale so the literal in
+	// the file is exactly what the database will hold.
+	rendered := exact.FloatString(moneyScale)
+	back, _ := new(big.Rat).SetString(rendered)
+	return rendered, new(big.Rat).Sub(exact, back), true
+}
+
+// moneyScale is the number of decimal places every money column in V4 keeps.
+const moneyScale = 2
+
 // lineValueLost is price × (the quantity the source gave − the quantity that will be
 // stored), as an exact decimal. Positive means the invoice will be worth LESS than the
 // source says; negative means more.
@@ -209,4 +276,53 @@ func checkLandedLineValues(plans []billPlan, rep *Report) error {
 		len(problems), len(order),
 		strings.Join(perBill, " · "), total.FloatString(2),
 		strings.Join(lines, "\n  "))
+}
+
+// reportFoldedQuantities names every line whose quantity was moved into its price.
+//
+// One warning, not one per line, and a WARNING rather than a note: the unit price on these
+// lines is no longer the catalogue price, and a clinic reading its own invoice has to be
+// told that rather than discovering it.
+func reportFoldedQuantities(folded []foldedLine, rep *Report) {
+	if len(folded) == 0 || rep == nil {
+		return
+	}
+	sorted := make([]foldedLine, len(folded))
+	copy(sorted, folded)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].invoiceNo != sorted[j].invoiceNo {
+			return sorted[i].invoiceNo < sorted[j].invoiceNo
+		}
+		return sorted[i].code < sorted[j].code
+	})
+
+	bills := map[string]bool{}
+	residue := new(big.Rat)
+	lines := make([]string, 0, len(sorted))
+	for _, f := range sorted {
+		bills[f.invoiceNo] = true
+		residue.Add(residue, f.residue)
+		lines = append(lines, fmt.Sprintf("เลขที่ %s รายการ %s %q: %s × %s บาท → จำนวน 1 ราคา %s บาท",
+			f.invoiceNo, firstNonEmpty(f.code, "(ไม่มีรหัส)"), oneLine(f.name),
+			f.srcQty, f.srcPrice, f.newPrice))
+	}
+
+	msg := fmt.Sprintf("invoice_item: %d บรรทัดใน %d ใบมีจำนวนเป็นเศษ ซึ่ง invoice_item.qty "+
+		"(คอลัมน์จำนวนเต็ม) เก็บไม่ได้ จึงย้ายเศษไปไว้ที่ราคาตามมติเจ้าของคลินิก (5 ต.ค. 2569) — "+
+		"**ยอดบิลเท่าเดิมทุกสตางค์** ใบเสร็จยังกระทบยอดตรง และสถานะไม่เปลี่ยน · "+
+		"**ผลข้างเคียงที่ต้องรู้: ราคาต่อหน่วยในบรรทัดเหล่านี้ไม่ใช่ราคาในแคตตาล็อกอีกแล้ว** "+
+		"(ใบเสร็จจะพิมพ์ว่า 1 × ยอดรวม) · ราคาในแคตตาล็อก (catalog_item.price) ไม่ถูกแตะ "+
+		"และชื่อรายการไม่ถูกต่อท้าย จำนวนจริงอยู่ในรายการข้างล่างนี้ · %s",
+		len(sorted), len(bills), strings.Join(lines, " · "))
+	rep.warnf("%s", msg)
+
+	// Half a satang lost to the column's scale. Zero in both measured dumps; said out
+	// loud when it is not, because a bill total that moved at all is the operator's
+	// business and not the tool's to absorb quietly.
+	if residue.Sign() != 0 {
+		rep.warnf("invoice_item: การย้ายเศษไปที่ราคาทำให้ยอดรวมเคลื่อนไป %s บาท "+
+			"เพราะ invoice_item.price เก็บได้ %d ตำแหน่งทศนิยม และผลคูณราคา × จำนวนมีทศนิยมมากกว่านั้น "+
+			"— ปัดครึ่งขึ้นตามที่ Postgres ทำ",
+			residue.FloatString(4), moneyScale)
+	}
 }
