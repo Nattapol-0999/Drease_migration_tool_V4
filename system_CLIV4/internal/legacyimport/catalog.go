@@ -113,6 +113,12 @@ type mongoCatalog struct {
 	// mapped in linebind.go. Same database as points and page, so it arrives in the
 	// same dump and needs no flag of its own.
 	linePatients []mongodump.Doc
+	// pairLogs is mris.pair_logs — the EVENT log V2 writes beside those pairings
+	// (CREATE / DELETE / SET_ACTIVE per user_code + line_id). It is the SECOND source:
+	// read only when line_patients is absent or empty, by the owner's rule of 6 Oct 2026
+	// (line_patients first, pair_logs second, neither = skip the group). See
+	// bindsFromPairLogs for how a current pairing is reconstructed from it.
+	pairLogs []mongodump.Doc
 
 	// courseCode is course_items _id → the code MINTED for it (CS001…). It only helps an
 	// entitlement find its course when the CATALOG was imported by this same tool; a
@@ -167,6 +173,7 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 		pointLogs:   byName["point_logs"],
 
 		linePatients: byName["line_patients"],
+		pairLogs:     byName["pair_logs"],
 		courseCode:   map[string]string{},
 		courseName:   map[string]string{},
 		healName:     map[string]string{},
@@ -185,10 +192,12 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 	}
 	// line_patients is on this list because a dump taken for `-only linebind` holds
 	// nothing else, and the old guard rejected it as unsupported while naming five
-	// collections the operator had not asked for.
+	// collections the operator had not asked for. pair_logs is on it for the same reason:
+	// a box with no line_patients can still carry its pairings in the log alone.
 	if len(mc.items) == 0 && len(mc.listheals) == 0 && len(mc.courseItems) == 0 &&
-		len(mc.bills) == 0 && len(mc.points) == 0 && len(mc.linePatients) == 0 {
-		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills, points, line_patients)")
+		len(mc.bills) == 0 && len(mc.points) == 0 && len(mc.linePatients) == 0 &&
+		len(mc.pairLogs) == 0 {
+		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills, points, line_patients, pair_logs)")
 	}
 	return mc, nil
 }

@@ -490,15 +490,16 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 
 		// LINE bindings. Independent of everything above for the same reason loyalty is:
-		// its own collection, and every id it needs is resolved at the target. Refuses
-		// only when the dump has no `line_patients` collection at all — a clinic that
-		// never used LINE pairing in V2 has nothing here, and the export script treats a
-		// count of 0 as absent.
+		// its own collection, and every id it needs is resolved at the target.
+		//
+		// line_patients first, pair_logs when it is absent (owner's rule, 6 Oct 2026).
+		// Refuses only when the dump has neither — an empty collection counts as absent,
+		// because the export drops a count of 0 and the two cannot be told apart here.
 		if needLineBind {
-			if len(mc.linePatients) == 0 {
+			if len(mc.linePatients) == 0 && len(mc.pairLogs) == 0 {
 				return nil, nil, money, fmt.Errorf(
-					"เลือกกลุ่ม linebind แต่ mongo dump ไม่มี collection \"line_patients\" — " +
-						"ไม่มีการผูก LINE ให้นำเข้า (คลินิกที่ไม่เคยใช้การผูก LINE ใน V2 จะไม่มี collection นี้)")
+					"เลือกกลุ่ม linebind แต่ mongo dump ไม่มีทั้ง collection \"line_patients\" และ \"pair_logs\" — " +
+						"ไม่มีการผูก LINE ให้นำเข้า (คลินิกที่ไม่เคยใช้การผูก LINE ใน V2 จะไม่มี collection เหล่านี้)")
 			}
 			group, binding, pointer, lerr := buildLineBind(mc, in, rep)
 			if lerr != nil {

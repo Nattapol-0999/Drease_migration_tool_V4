@@ -12,7 +12,9 @@ import (
 )
 
 // LINE bindings: mris.line_patients → the clinic's own LINE OA group, the canonical
-// binding row, and the pointer on patient.
+// binding row, and the pointer on patient. When the dump has no line_patients, the
+// pairings are rebuilt from mris.pair_logs instead (linebind_pairlogs.go); with neither,
+// the group is skipped (build.go).
 //
 // # WHAT V2 KEEPS
 //
@@ -160,14 +162,26 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	eBind := rep.entity(EntPatientLineBinding)
 	ePtr := rep.entity(EntPatientLineID)
 
-	eBind.SourceRows = len(mc.linePatients)
-	ePtr.SourceRows = len(mc.linePatients)
+	// line_patients first; pair_logs only when it is absent or empty (owner's decision ก,
+	// 6 Oct 2026). build.go has already skipped the group when both are empty, so one of
+	// the two holds documents here.
+	src := lineSource{name: "mris.line_patients", docs: len(mc.linePatients)}
+	var binds []lineBind
+	var skippedInactive []string
+	if len(mc.linePatients) > 0 {
+		binds, skippedInactive = parseLineBinds(mc.linePatients, eBind)
+		src.unusedLog = len(mc.pairLogs)
+	} else {
+		src = lineSource{name: "mris.pair_logs", docs: len(mc.pairLogs), fromLog: true}
+		binds, skippedInactive = bindsFromPairLogs(mc.pairLogs, eBind)
+	}
+	eBind.SourceRows = src.docs
+	ePtr.SourceRows = src.docs
 
-	binds, skippedInactive := parseLineBinds(mc.linePatients, eBind)
 	if len(binds) == 0 {
 		return "", "", "", fmt.Errorf(
-			"mris.line_patients มี %d เอกสาร แต่ไม่มีแถวที่นำเข้าได้เลย "+
-				"(ไม่มี hn/line_id หรือ active = false ทั้งหมด)", len(mc.linePatients))
+			"%s มี %d เอกสาร แต่ไม่มีแถวที่นำเข้าได้เลย "+
+				"(ไม่มี hn/line_id หรือยกเลิกการผูกไปแล้วทั้งหมด)", src.name, src.docs)
 	}
 
 	// One HN may appear twice only in a broken export; one LINE id twice would break
@@ -176,14 +190,14 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	// keeps, and nothing in the document says which is right.
 	if dup := firstDuplicate(binds, func(b lineBind) string { return b.hn }); dup != "" {
 		return "", "", "", fmt.Errorf(
-			"mris.line_patients มี hn %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
+			"%s มี hn %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
 				"V4 บังคับหนึ่ง LINE ต่อหนึ่ง HN ต่อคลินิก (ux_patient_clinic_line_id) "+
-				"ต้องแก้ที่ต้นทางก่อน ตัวนำเข้าไม่เลือกให้ว่าจะเก็บอันไหน", dup)
+				"ต้องแก้ที่ต้นทางก่อน ตัวนำเข้าไม่เลือกให้ว่าจะเก็บอันไหน", src.name, dup)
 	}
 	if dup := firstDuplicate(binds, func(b lineBind) string { return b.lineID }); dup != "" {
 		return "", "", "", fmt.Errorf(
-			"mris.line_patients มี line_id %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
-				"LINE เดียวผูกได้คนเดียวต่อคลินิก ต้องแก้ที่ต้นทางก่อน", shortLineID(dup))
+			"%s มี line_id %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
+				"LINE เดียวผูกได้คนเดียวต่อคลินิก ต้องแก้ที่ต้นทางก่อน", src.name, shortLineID(dup))
 	}
 
 	// Deterministic order, same reason as loyalty: the artifact is meant to be diffed.
@@ -196,8 +210,16 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	binding = renderLineBindings(binds, clinic, eBind)
 	pointer = renderLinePointer(binds, clinic, ePtr)
 
-	reportLineBind(binds, skippedInactive, mc, in, rep)
+	reportLineBind(binds, skippedInactive, src, in, rep)
 	return group, binding, pointer, nil
+}
+
+// lineSource says which collection the pairings came from, for the report.
+type lineSource struct {
+	name      string
+	docs      int
+	fromLog   bool
+	unusedLog int // pair_logs documents present but not read, because line_patients was
 }
 
 // firstDuplicate returns the first key that appears twice, or "".
@@ -300,7 +322,9 @@ func renderLineBindings(binds []lineBind, clinic string, e *EntityResult) string
 	s.comment("patient_id อ่านจากปลายทางด้วย HN เหมือน loyalty_account: id เป็นของปลายทาง")
 	s.comment("และ uq_patient_clinic_hn ทำให้ค้นได้หนึ่งแถวหรือศูนย์แถว")
 	s.comment("verified_at = createdAt ของ V2 (เวลาที่ลูกค้าผูกจริง) ไม่ใช่ now()")
-	s.comment("verified_ref = line_patients._id เก็บที่มาไว้สืบย้อนกลับไปที่เอกสารต้นทาง")
+	s.comment("            จาก pair_logs คือเวลาของเหตุการณ์ล่าสุดที่ทำให้คู่นี้ยังผูกอยู่")
+	s.comment("verified_ref = _id ของเอกสารต้นทาง เก็บไว้สืบย้อนกลับ")
+	s.comment("            line_patients ใส่ _id ตรง ๆ · pair_logs ใส่ %s<_id ของเหตุการณ์ล่าสุด>", pairLogRefPrefix)
 	s.comment("verified_method = %s", LineBindVerifiedMethod)
 	s.comment("")
 	s.comment("NOT EXISTS สองชั้นคือรูปเดียวกับ partial unique index สองตัวของตาราง")
@@ -427,13 +451,33 @@ END $linebind_done$;
 
 // reportLineBind says what was read, what was left out, and the two things about this
 // collection an operator has to decide on rather than discover later.
-func reportLineBind(binds []lineBind, skippedInactive []string, mc *mongoCatalog, in Input, rep *Report) {
-	rep.notef("LINE: mris.line_patients %d เอกสาร → นำเข้า %d รายการ",
-		len(mc.linePatients), len(binds))
+func reportLineBind(binds []lineBind, skippedInactive []string, src lineSource, in Input, rep *Report) {
+	if src.fromLog {
+		// A WARNING, not a note: these pairings are reconstructed from an event log, not
+		// read off a list of pairings, and whoever checks the result has to know that.
+		rep.warnf("LINE: ไม่มี mris.line_patients (หรือมีแต่ว่าง) — สร้างการผูกจาก mris.pair_logs แทน "+
+			"ตามมติเจ้าของคลินิก (6 ต.ค. 2569: ใช้ line_patients ก่อน ถ้าไม่มีจึงใช้ pair_logs) · "+
+			"%d เหตุการณ์ → นำเข้า %d รายการ · แต่ละคู่ (HN + LINE) ตัดสินจากเหตุการณ์ล่าสุด: "+
+			"ยังผูกอยู่ถ้าไม่ใช่ DELETE และ active = true · verified_ref ขึ้นต้นด้วย %q",
+			src.docs, len(binds), pairLogRefPrefix)
+	} else {
+		rep.notef("LINE: %s %d เอกสาร → นำเข้า %d รายการ", src.name, src.docs, len(binds))
+		if src.unusedLog > 0 {
+			rep.notef("LINE: มี mris.pair_logs %d เอกสารด้วย แต่ไม่ได้ใช้ — "+
+				"line_patients เป็นแหล่งหลัก pair_logs ใช้เฉพาะเมื่อไม่มี line_patients (มติ 6 ต.ค. 2569)",
+				src.unusedLog)
+		}
+	}
 
 	if n := len(skippedInactive); n > 0 {
-		rep.warnf("LINE: ข้าม %d รายการที่ active = false ใน V2 (ลูกค้ายกเลิกการผูกแล้ว) — %s",
-			n, strings.Join(capList(skippedInactive, 20), ", "))
+		if src.fromLog {
+			rep.warnf("LINE: ข้าม %d คู่ที่เหตุการณ์ล่าสุดใน pair_logs คือยกเลิกการผูก "+
+				"(DELETE หรือ active = false — ลูกค้ายกเลิกการผูกแล้ว) — %s",
+				n, strings.Join(capList(skippedInactive, 20), ", "))
+		} else {
+			rep.warnf("LINE: ข้าม %d รายการที่ active = false ใน V2 (ลูกค้ายกเลิกการผูกแล้ว) — %s",
+				n, strings.Join(capList(skippedInactive, 20), ", "))
+		}
 	}
 
 	// The branch written in the document is NOT used to place the row: the HN is, and the
