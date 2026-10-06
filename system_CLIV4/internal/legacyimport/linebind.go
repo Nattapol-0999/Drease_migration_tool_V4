@@ -184,20 +184,29 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 				"(ไม่มี hn/line_id หรือยกเลิกการผูกไปแล้วทั้งหมด)", src.name, src.docs)
 	}
 
-	// One HN may appear twice only in a broken export; one LINE id twice would break
-	// ux_patient_clinic_line_id at the target. Both are refused rather than
-	// de-duplicated: picking a winner is a decision about whose LINE account a person
-	// keeps, and nothing in the document says which is right.
+	// One LINE id bound to several HNs: KEEP THE LATEST PAIRING (owner's decision ข,
+	// 6 Oct 2026). This used to refuse the run, on the ground that picking a winner is a
+	// decision about whose LINE account a person keeps. The owner made that decision:
+	// the most recent pairing is the one the account's holder last asked for, so it is
+	// the one carried over, and every pairing left behind is named in the report so the
+	// clinic can re-pair it in V4 if it was the right one after all.
+	//
+	// Measured on 10.0.133.87: 7 LINE ids, each held by exactly 2 HNs; 4 of the 7 pairs
+	// were made on the same day. pair_logs cannot settle any of them — both HNs carry a
+	// CREATE and neither a DELETE — which is why a rule is needed at all.
+	//
+	// Resolved BEFORE the duplicate-HN check below, so a document repeated whole (same HN,
+	// same LINE id) collapses to one instead of being refused as a duplicate HN.
+	binds, shared := keepLatestPerLineID(binds)
+
+	// One HN twice is still refused: it means one patient with two LINE accounts, and
+	// nothing has decided which of those to keep. ux_patient_clinic_line_id would not stop
+	// it, but patient.line_id holds only one.
 	if dup := firstDuplicate(binds, func(b lineBind) string { return b.hn }); dup != "" {
 		return "", "", "", fmt.Errorf(
-			"%s มี hn %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
-				"V4 บังคับหนึ่ง LINE ต่อหนึ่ง HN ต่อคลินิก (ux_patient_clinic_line_id) "+
-				"ต้องแก้ที่ต้นทางก่อน ตัวนำเข้าไม่เลือกให้ว่าจะเก็บอันไหน", src.name, dup)
-	}
-	if dup := firstDuplicate(binds, func(b lineBind) string { return b.lineID }); dup != "" {
-		return "", "", "", fmt.Errorf(
-			"%s มี line_id %s ซ้ำกันมากกว่าหนึ่งเอกสาร — "+
-				"LINE เดียวผูกได้คนเดียวต่อคลินิก ต้องแก้ที่ต้นทางก่อน", src.name, shortLineID(dup))
+			"%s มี hn %s ซ้ำกันมากกว่าหนึ่งรายการ (คนไข้คนเดียวมี LINE สองบัญชี) — "+
+				"V4 เก็บได้หนึ่ง LINE ต่อหนึ่ง HN ต่อคลินิก "+
+				"ต้องแก้ที่ต้นทางก่อน ตัวนำเข้าไม่เลือกให้ว่าจะเก็บบัญชีไหน", src.name, dup)
 	}
 
 	// Deterministic order, same reason as loyalty: the artifact is meant to be diffed.
@@ -211,6 +220,7 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	pointer = renderLinePointer(binds, clinic, ePtr)
 
 	reportLineBind(binds, skippedInactive, src, in, rep)
+	reportSharedLineIDs(shared, src, rep)
 	return group, binding, pointer, nil
 }
 
@@ -220,6 +230,92 @@ type lineSource struct {
 	docs      int
 	fromLog   bool
 	unusedLog int // pair_logs documents present but not read, because line_patients was
+}
+
+// sharedLineID is one pairing dropped because another HN holds the same LINE id more
+// recently.
+type sharedLineID struct {
+	lineID string
+	kept   lineBind
+	gone   lineBind
+}
+
+// pairedLater reports whether a is the more recent pairing of the two.
+//
+// A pairing with a time beats one without; between two with times the later wins; and
+// when the times are equal or both missing, the document _id decides (an ObjectId's
+// leading bytes are its creation second, so its hex text sorts by insertion order). The
+// order is total, so two runs of one dump keep the same pairing.
+func pairedLater(a, b lineBind) bool {
+	if a.hasPaired != b.hasPaired {
+		return a.hasPaired
+	}
+	if a.hasPaired && !a.pairedAt.Equal(b.pairedAt) {
+		return a.pairedAt.After(b.pairedAt)
+	}
+	if a.srcID != b.srcID {
+		return a.srcID > b.srcID
+	}
+	return a.hn > b.hn
+}
+
+// keepLatestPerLineID keeps, for every LINE id, only its most recent pairing.
+func keepLatestPerLineID(binds []lineBind) (kept []lineBind, shared []sharedLineID) {
+	best := map[string]int{}
+	var order []string
+	for i, b := range binds {
+		j, seen := best[b.lineID]
+		if !seen {
+			best[b.lineID] = i
+			order = append(order, b.lineID)
+			continue
+		}
+		if pairedLater(b, binds[j]) {
+			shared = append(shared, sharedLineID{lineID: b.lineID, kept: b, gone: binds[j]})
+			best[b.lineID] = i
+		} else {
+			shared = append(shared, sharedLineID{lineID: b.lineID, kept: binds[j], gone: b})
+		}
+	}
+	// A third holder of the same id can replace the winner recorded for the second, so
+	// what was "kept" is re-read from the final choice.
+	for i := range shared {
+		shared[i].kept = binds[best[shared[i].lineID]]
+	}
+	for _, id := range order {
+		kept = append(kept, binds[best[id]])
+	}
+	return kept, shared
+}
+
+// reportSharedLineIDs names every pairing left out because its LINE id went to another
+// HN. A WARNING: it changes which patient a LINE account belongs to in V4, and the
+// clinic has to be able to see every one of those.
+func reportSharedLineIDs(shared []sharedLineID, src lineSource, rep *Report) {
+	if len(shared) == 0 {
+		return
+	}
+	when := func(b lineBind) string {
+		if !b.hasPaired {
+			return "ไม่ระบุเวลา"
+		}
+		return b.pairedAt.UTC().Format("2006-01-02 15:04")
+	}
+	sort.Slice(shared, func(i, j int) bool {
+		if shared[i].kept.hn != shared[j].kept.hn {
+			return shared[i].kept.hn < shared[j].kept.hn
+		}
+		return shared[i].gone.hn < shared[j].gone.hn
+	})
+	lines := make([]string, 0, len(shared))
+	for _, s := range shared {
+		lines = append(lines, fmt.Sprintf("LINE %s: เก็บ HN %s (ผูก %s) · ไม่นำเข้า HN %s (ผูก %s)",
+			shortLineID(s.lineID), s.kept.hn, when(s.kept), s.gone.hn, when(s.gone)))
+	}
+	rep.warnf("LINE: %d การผูกใน %s ใช้ LINE บัญชีเดียวกับ HN อื่น — เก็บการผูกล่าสุดไว้ตามมติเจ้าของคลินิก "+
+		"(6 ต.ค. 2569) เพราะ V4 ให้ LINE หนึ่งบัญชีผูกได้คนเดียวต่อคลินิก · "+
+		"HN ที่ไม่ได้นำเข้าต้องให้คนไข้ผูก LINE ใหม่ใน V4 ถ้าเป็นเจ้าของบัญชีจริง · %s",
+		len(shared), src.name, strings.Join(lines, " · "))
 }
 
 // firstDuplicate returns the first key that appears twice, or "".

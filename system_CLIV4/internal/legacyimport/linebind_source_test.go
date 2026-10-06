@@ -152,6 +152,18 @@ func TestADumpWithOnlyPairLogsIsAccepted(t *testing.T) {
 	}
 }
 
+func TestTheSharedLineIDRuleAppliesToPairLogsToo(t *testing.T) {
+	shared := pairLogsSample +
+		pairLog("64b0a000000000000000000a", "CREATE", "PATIENT", "016800009", lineA, true, "2023-07-30T03:00:00.000Z")
+	_, binding, _, rep := buildLineBindOne(t, shared)
+	if !strings.Contains(binding, "'016800009'") || strings.Contains(binding, "'016800001'") {
+		t.Error("the later of two HNs on one LINE id was not the one kept")
+	}
+	if !hasWarning(rep, "ไม่นำเข้า HN 016800001") {
+		t.Errorf("the HN left behind is not named · %v", rep.Warnings)
+	}
+}
+
 // ── the group-level rule: neither collection means skip, not refuse ──────────────────
 
 // itemsOnly is a mongo dump with something the parser supports and nothing about LINE.

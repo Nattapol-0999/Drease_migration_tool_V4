@@ -7,7 +7,8 @@ package legacyimport
 //
 //	an unlinked pairing is NOT carried over          (consent, owner's decision ก)
 //	the OA group is created only when there is none   (and refuses to guess between two)
-//	a duplicate hn or line_id refuses the run         (never pick whose account wins)
+//	a duplicate hn refuses the run                    (one patient, two LINE accounts)
+//	a line_id held by two HNs keeps the LATEST one    (owner's decision ข, 6 Oct 2026)
 //	the HN decides the patient, not pair_branch       (owner's decision, 6 Oct 2026)
 //	an existing binding at the target always wins     (a real login beats an import)
 //	patient_line_link_log is never written            (an import is not a login)
@@ -277,7 +278,10 @@ db.line_patients.insert({
 	}
 }
 
-func TestLineBindRefusesADuplicateLineID(t *testing.T) {
+// One LINE id held by two HNs used to refuse the run. Owner's decision ข (6 Oct 2026):
+// keep the LATEST pairing and name the other in the report. The second document here
+// pairs 026700077 on 2025-01-02, after 026700031 paired the same id on 2024-10-21.
+func TestLineBindKeepsTheLatestPairingOfASharedLineID(t *testing.T) {
 	dup := linePatientsSample + `
 db.line_patients.insert({
     "_id": ObjectId("6716350ada59e5b842d3dbfe"),
@@ -287,16 +291,76 @@ db.line_patients.insert({
     "line_id": "U212cb71e81ff10f4304c5f9f8db31450",
     "pair_branch": "02"
 });`
-	mc, err := parseMongoCatalog([]byte(dup))
-	if err != nil {
-		t.Fatalf("parseMongoCatalog: %v", err)
+	_, binding, pointer, rep := buildLineBindOne(t, dup)
+
+	if !strings.Contains(binding, "'026700077'") {
+		t.Error("the latest pairing of the shared LINE id was not written")
 	}
-	_, _, _, err = buildLineBind(mc, Input{ClinicCode: "C2EC1E3"}, NewReport("C2EC1E3"))
-	if err == nil {
-		t.Fatal("one LINE id for two patients was accepted")
+	if strings.Contains(binding, "'026700031'") {
+		t.Error("the older pairing of the shared LINE id was written too — V4 holds one patient per LINE id")
 	}
-	if !strings.Contains(err.Error(), "line_id") {
-		t.Errorf("the refusal does not say which column collided: %v", err)
+	if strings.Contains(pointer, "'026700031'") {
+		t.Error("the older pairing was stamped onto patient.line_id")
+	}
+	if got := strings.Count(binding, "U212cb71e81ff10f4304c5f9f8db31450"); got != 2 {
+		// One INSERT names the id twice: the value and its NOT EXISTS guard.
+		t.Errorf("the shared id appears %d times in the binding batch, want 2 (one row)", got)
+	}
+	// The other pairings are untouched by the rule.
+	for _, hn := range []string{"'026700012'", "'016700099'"} {
+		if !strings.Contains(binding, hn) {
+			t.Errorf("an unrelated pairing %s was lost", hn)
+		}
+	}
+	// Reported loudly, naming both HNs, so the clinic can re-pair the right one.
+	if !hasWarning(rep, "เก็บการผูกล่าสุด") {
+		t.Fatalf("no warning says the latest pairing was kept · warnings = %v", rep.Warnings)
+	}
+	for _, want := range []string{"เก็บ HN 026700077", "ไม่นำเข้า HN 026700031", "6 ต.ค. 2569"} {
+		if !hasWarning(rep, want) {
+			t.Errorf("the warning does not carry %q · warnings = %v", want, rep.Warnings)
+		}
+	}
+}
+
+// Equal times are settled by the document _id, so the choice does not depend on the order
+// documents happen to sit in the dump.
+func TestASharedLineIDWithEqualTimesIsDecidedByTheDocumentID(t *testing.T) {
+	pair := func(id, hn string) string {
+		return `db.line_patients.insert({
+    "_id": ObjectId("` + id + `"),
+    "hn": "` + hn + `",
+    "active": true,
+    "createdAt": ISODate("2025-02-08T10:00:00.000Z"),
+    "line_id": "Udddddddddddddddddddddddddddddddd"
+});
+`
+	}
+	older := pair("67a7258000000000000000aa", "016800001")
+	newer := pair("67a7258000000000000000bb", "016800002")
+	for _, body := range []string{older + newer, newer + older} {
+		_, binding, _, _ := buildLineBindOne(t, body)
+		if !strings.Contains(binding, "'016800002'") || strings.Contains(binding, "'016800001'") {
+			t.Errorf("with equal times the higher _id must win in any document order:\n%s", body)
+		}
+	}
+}
+
+// The same pairing written twice whole is one pairing, not a duplicate HN: the shared-id
+// rule runs first and collapses it.
+func TestADocumentRepeatedWholeCollapsesInsteadOfRefusing(t *testing.T) {
+	again := linePatientsSample + `
+db.line_patients.insert({
+    "_id": ObjectId("6716350ada59e5b842d3dbfd"),
+    "hn": "026700031",
+    "active": true,
+    "createdAt": ISODate("2024-10-21T11:03:38.371Z"),
+    "line_id": "U212cb71e81ff10f4304c5f9f8db31450",
+    "pair_branch": "02"
+});`
+	_, binding, _, _ := buildLineBindOne(t, again)
+	if got := strings.Count(binding, "INSERT INTO patient_line_binding"); got != 3 {
+		t.Errorf("wrote %d bindings, want 3 (the repeat collapses into one)", got)
 	}
 }
 
