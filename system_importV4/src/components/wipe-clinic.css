@@ -1,0 +1,268 @@
+/* The delete-clinic button in the page header and the dialog it opens. Own file so
+   globals.css, page-header.css and clear-staging.css stay untouched. Every colour is a
+   theme variable, so this follows the light/dark switch like the rest of the tool. */
+
+.wipe-clinic-btn {
+  padding: 5px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--bad);
+  background: var(--bad);
+  color: var(--on-bad);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.wipe-clinic-btn:hover {
+  filter: brightness(1.08);
+}
+
+.wipe-clinic-btn:focus-visible {
+  outline: 2px solid var(--bad);
+  outline-offset: 2px;
+}
+
+.wc-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 16px;
+  overflow: auto;
+  z-index: 70;
+}
+
+.wc-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--card-shadow);
+  padding: 16px 18px 14px;
+  width: min(760px, 100%);
+  color: var(--text);
+}
+
+.wc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.wc-head h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.wc-close {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.wc-note {
+  margin: 8px 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.wc-field {
+  display: block;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.wc-field > span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+}
+
+.wc-field select,
+.wc-field input {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.wc-field input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.04em;
+}
+
+.wc-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.wc-actions .wc-spacer {
+  margin-right: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.wc-go,
+.wc-danger,
+.wc-ghost {
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+
+.wc-go {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.wc-ghost {
+  background: transparent;
+  color: var(--muted);
+}
+
+.wc-danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: var(--on-bad);
+}
+
+.wc-go:disabled,
+.wc-danger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The red band shown the moment production is the selected environment. Not a dialog the
+   operator dismisses — it stays on screen next to the button that does the work. */
+.wc-prod {
+  border: 1px solid var(--bad);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.wc-err {
+  border: 1px solid var(--bad);
+  background: color-mix(in srgb, var(--bad) 10%, transparent);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 12px;
+}
+
+.wc-ok {
+  border: 1px solid var(--good, #2f855a);
+  background: color-mix(in srgb, var(--good, #2f855a) 10%, transparent);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.wc-sum {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+.wc-sum dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 14px;
+  margin: 0;
+}
+
+.wc-sum dt {
+  color: var(--muted);
+}
+
+.wc-sum dd {
+  margin: 0;
+}
+
+.wc-tables {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.wc-tables table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.wc-tables th,
+.wc-tables td {
+  text-align: left;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.wc-tables th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.wc-tables td.num,
+.wc-tables th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.wc-tables tr:last-child td {
+  border-bottom: 0;
+}
+
+.wc-via {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.wc-log {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

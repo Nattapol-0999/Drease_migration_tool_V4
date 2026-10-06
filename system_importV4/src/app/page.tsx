@@ -3,6 +3,7 @@ import GenerateForm from "@/components/GenerateForm";
 import Logo from "@/components/Logo";
 import LogoutButton from "@/components/LogoutButton";
 import ThemeToggle from "@/components/ThemeToggle";
+import WipeClinicButton from "@/components/WipeClinicButton";
 
 import "./page-header.css";
 
@@ -16,6 +17,7 @@ export default function Home() {
         {/* Grouped so the header stays two columns: the title on the left and the
             controls together on the right, rather than three items spread apart. */}
         <div className="page-head-actions">
+          <WipeClinicButton />
           <ClearStagingButton />
           <ThemeToggle />
           <LogoutButton />

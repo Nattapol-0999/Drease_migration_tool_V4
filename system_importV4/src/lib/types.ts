@@ -809,3 +809,86 @@ export type PhotoImportResponse =
       seconds?: string;
       log?: string;
     });
+
+// ── ลบคลินิกออกจากปลายทาง (POST /api/clinic-wipe) ─────────────────────────────
+//
+// WHY THE UI IS TWO STEPS AND NOT ONE (owner's decision ②, 5 Oct 2026)
+//
+// A clinic code is seven characters of hex and nothing about it is readable. Measured on
+// the seven clinics removed by hand this week, what sits behind one of those codes ranges
+// from 8 rows (a shell whose import never ran) to 55,042 (C3D4A02, a tenant with its
+// patients and catalogue already in). Typing a code and pressing delete cannot tell those
+// apart, so the survey below is shown first and the delete button only exists after it:
+// the operator confirms a clinic NAME and a row count, not a string they typed.
+
+/** One base table holding rows for the clinic, and how many. */
+export interface ClinicWipeTableCount {
+  table: string;
+  rows: number;
+}
+
+/**
+ * A child table with no clinic_code of its own, reached through a foreign key.
+ *
+ * `via` spells the path out ("patient_consents.patient_id → patient.id") because these are
+ * rows the operator cannot find by searching for the clinic code, and a count with no
+ * explanation next to a delete button is not something anyone can check.
+ */
+export interface ClinicWipeOrphan {
+  table: string;
+  via: string;
+  rows: number;
+}
+
+/** What a wipe would remove. Produced by a read-only pass over the target. */
+export interface ClinicWipeSurvey {
+  /** False when no clinic identity row carries this code — "nothing to delete". */
+  found: boolean;
+  clinicCode: string;
+  engName: string;
+  thaName: string;
+  createdAt: string;
+  /** The branch rows under this clinic (clinic.code <> clinic.clinic_code). */
+  branches: { code: string; branchCode: string; thaName: string }[];
+  tables: ClinicWipeTableCount[];
+  orphans: ClinicWipeOrphan[];
+  /** Rows that would go. Excludes biz_event, which never does. */
+  totalRows: number;
+  baseTablesScanned: number;
+  /** Money on this clinic's receipts, as digits. A wipe removes the records of it. */
+  receiptMoney: string;
+  receipts: number;
+  /** Logins that will stop working the moment the rows go. */
+  liveSessions: number;
+  /** Append-only audit rows that are deliberately LEFT BEHIND. */
+  bizEventRows: number;
+}
+
+/** POST /api/clinic-wipe with action "survey". */
+export type ClinicWipeSurveyResponse =
+  | { ok: true; target: string; isProduction: boolean; survey: ClinicWipeSurvey; seconds: string }
+  | { ok: false; error: string };
+
+/** POST /api/clinic-wipe with action "wipe". */
+export type ClinicWipeRunResponse =
+  | {
+      ok: true;
+      target: string;
+      isProduction: boolean;
+      /** What the clinic looked like immediately before the delete. */
+      before: ClinicWipeSurvey;
+      /** Confirmed after the commit, from a fresh survey: every count must be zero. */
+      after: ClinicWipeSurvey;
+      deletedRows: number;
+      bizEventKept: number;
+      rehearsal: string;
+      applied: string;
+      seconds: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      /** Which run failed. "rehearsal" means nothing was changed. */
+      stage?: "rehearsal" | "commit";
+      rehearsal?: string;
+    };
