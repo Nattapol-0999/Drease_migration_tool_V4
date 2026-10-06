@@ -65,6 +65,9 @@ func buildAppointment(
 	e.SourceRows = len(rows)
 	tr := truncations{}
 	unbookable := map[string]int{}
+	// Room codes the appointments reference that the room master has no row for, with how
+	// many bookings each accounts for. Reported once at the end rather than per row.
+	missingRoom := map[string]int{}
 	br := newBranchResolver(in)
 	defer br.report(rep, "appointment")
 	// Appointments whose HN is not in the patient dump have nothing to derive a branch
@@ -107,8 +110,36 @@ func buildAppointment(
 			e.skip("no patient_name")
 		}
 		room := r.Get("clinic_code") // legacy "clinic_code" is the ROOM code
+		droppedRoom := ""
 		if room == "" {
 			e.skip("no room")
+		} else if branchOfRoom != nil {
+			if _, exists := branchOfRoom[room]; !exists {
+				// A room code the ROOM MASTER does not have at all (owner's decision ข,
+				// 6 Oct 2026).
+				//
+				// Not the same thing as a closed room: buildRoom already reopens one of
+				// those when a booking references it, because status 0 is still a row.
+				// This is a code with no row to reopen — the clinic recoded its rooms and
+				// an old booking kept the old code. Measured on master-clinic (C9C89A4):
+				// the room master holds R1..R5 while one appointment of 2,604 names "01",
+				// and its own doc records the room's name at the time as "ห้องตรวจ 1"
+				// against R1's current "ห้องพิเศษ 1" — the room was renamed as well as
+				// renumbered.
+				//
+				// validate_appointment_assignment RAISES on that, which failed the whole
+				// 241,181-line script at line 3801 over one row. Handled like the
+				// unbookable doctor immediately below: the appointment is real history and
+				// is kept, only the broken link is cleared, and the original code goes
+				// into doc.legacy_room_id so nothing the dump said is lost.
+				//
+				// The nil check matters. branchOfRoom is nil when this run never read the
+				// room dump, and "I cannot tell" must not clear every room_id in the file.
+				droppedRoom = room
+				room = ""
+				missingRoom[droppedRoom]++
+				e.skip("room not in the room master (kept as doc.legacy_room_id)")
+			}
 		}
 		doctor := r.Get("doctor_code")
 		droppedDoctor := ""
@@ -151,7 +182,7 @@ func buildAppointment(
 				ref, r.Get("appointment_time_end"), r.Get("appointment_time_start"))
 		}
 
-		doc, err := apptDoc(r, droppedDoctor)
+		doc, err := apptDoc(r, droppedDoctor, droppedRoom)
 		if err != nil {
 			return "", fmt.Errorf("appointment row %d (id=%s): build doc: %w", n+1, ref, err)
 		}
@@ -253,6 +284,29 @@ DO NOTHING;
 		rep.notef("appointment: ค้นรายการที่ถูกล้าง doctor_code ได้ด้วย  SELECT migrate_source_ref, doc->>'legacy_doctor_code' FROM appointment WHERE clinic_code = '%s' AND doc ? 'legacy_doctor_code';",
 			in.ClinicCode)
 	}
+
+	// Same shape, same reason, said separately: a missing ROOM and an unbookable DOCTOR
+	// are different problems at the source and need different fixes. A warning, because
+	// these bookings lose the room they were in — and with it their branch, since the
+	// trigger sets branch_code to NULL for a row with no room.
+	if len(missingRoom) > 0 {
+		total := 0
+		codes := make([]string, 0, len(missingRoom))
+		for code, n := range missingRoom {
+			total += n
+			codes = append(codes, fmt.Sprintf("%s (%d นัด)", code, n))
+		}
+		sort.Strings(codes)
+		rep.warnf("appointment: %d นัด อ้างรหัสห้องที่ไม่มีอยู่ในตารางห้องของต้นทางเลย — เก็บนัดไว้ตามมติเจ้าของคลินิก (6 ต.ค. 2569) "+
+			"แต่ล้าง room_id และบันทึกรหัสเดิมไว้ที่ doc.legacy_room_id · "+
+			"ไม่ใช่กรณีห้องปิด (ห้องที่ปิดอยู่จะถูกเปิดให้เองเพราะมีนัดอ้างถึง) แต่เป็นรหัสที่ไม่มีแถวห้องให้เปิด "+
+			"มักเกิดเมื่อคลินิกเปลี่ยนรหัสห้องแล้วนัดเก่ายังถือรหัสเดิมไว้ · "+
+			"**ผลข้างเคียง: นัดเหล่านี้จะได้ branch_code = NULL** เพราะ V4 เอาสาขาจากห้อง และเมื่อไม่มีห้องก็ตั้งเป็น NULL "+
+			"(validate_appointment_assignment) · %d รหัส: %s",
+			total, len(missingRoom), strings.Join(codes, ", "))
+		rep.notef("appointment: ค้นรายการที่ถูกล้าง room_id ได้ด้วย  SELECT migrate_source_ref, doc->>'legacy_room_id', doc->>'clinic_name' FROM appointment WHERE clinic_code = '%s' AND doc ? 'legacy_room_id';",
+			in.ClinicCode)
+	}
 	return s.String(), nil
 }
 
@@ -294,7 +348,12 @@ func buildBookableDoctors(doctorRows, userRows []legacydump.Row) map[string]bool
 // doctor no longer exists, or is not bookable). It is recorded here so the fact is not
 // lost: the appointment says who the old system had assigned, even though the column
 // had to be cleared for the row to be accepted at all.
-func apptDoc(r legacydump.Row, droppedDoctor string) (string, error) {
+// droppedRoom, when set, is a room code the source carried that the room master has no
+// row for. Recorded for the same reason as droppedDoctor: the booking still says which
+// room the old system had it in, even though the column had to be cleared for the row to
+// pass validate_appointment_assignment. The room's name at the time is usually in
+// doc.clinic_name already, which together with this is enough to identify it.
+func apptDoc(r legacydump.Row, droppedDoctor, droppedRoom string) (string, error) {
 	m := map[string]any{"migrate_source": "legacy appointment dump", "legacy_id": r.Get("id")}
 	for _, f := range apptDocFields {
 		if v := r.Get(f); v != "" {
@@ -304,6 +363,10 @@ func apptDoc(r legacydump.Row, droppedDoctor string) (string, error) {
 	if droppedDoctor != "" {
 		m["legacy_doctor_code"] = droppedDoctor
 		m["legacy_doctor_dropped_reason"] = "doctor ไม่มีในตาราง doctor หรือไม่ผูก clinic_staff role=doctor — V4 ปฏิเสธ doctor_code นี้"
+	}
+	if droppedRoom != "" {
+		m["legacy_room_id"] = droppedRoom
+		m["legacy_room_dropped_reason"] = "ไม่มีห้องรหัสนี้ในตารางห้องของต้นทาง — V4 ปฏิเสธ room_id ที่ไม่มีห้อง (validate_appointment_assignment)"
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
