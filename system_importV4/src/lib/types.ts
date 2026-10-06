@@ -128,6 +128,14 @@ export const MONGO_COLLECTIONS_USED = [
   // left out. Dropping it here instead would make that warning read "0 documents", which
   // says the ledger did not exist rather than that it was deliberately skipped.
   "point_logs",
+  // LINE pairings (internal/legacyimport/linebind.go). line_patients is the source; pair_logs
+  // is read only when a box has no line_patients, by the owner's rule of 6 Oct 2026, and a
+  // box with neither simply skips the group. Both have to be on this ALLOWLIST as well as on
+  // the pull list (LEGACY_MONGO_COLLECTIONS): the linebind group shipped with neither, so the
+  // pull never fetched line_patients — 10.0.133.87 holds 360 — and had it been fetched, this
+  // trim would have discarded it before the CLI saw it. Either gate alone hides it.
+  "line_patients",
+  "pair_logs",
 ] as const;
 
 // Groups the CLI can import separately (`-only`). Selecting a subset is how a target

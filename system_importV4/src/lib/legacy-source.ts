@@ -104,7 +104,14 @@ const DEFAULT_TABLES = "users,doctor,clinic,patient,appointment,branch";
 
 // The catalog collections the CLI reads out of the dbmongo half. `stocks` is here
 // because slot_stock (one row per lot) is built from it.
-const DEFAULT_COLLECTIONS = "category,items,listheals,course_items,stocks";
+//
+// line_patients and pair_logs are the LINE pairings (owner's rule, 6 Oct 2026: take
+// whichever the box has). Listing one a box does not have costs nothing — an empty or
+// missing collection comes back as "[]" and pullDumpsToFiles skips it by size.
+//
+// Production sets LEGACY_MONGO_COLLECTIONS, which REPLACES this list rather than adding to
+// it, so a collection added here must be added there too.
+const DEFAULT_COLLECTIONS = "category,items,listheals,course_items,stocks,line_patients,pair_logs";
 
 // Identifiers are interpolated into a remote command, so they are checked rather than
 // trusted — even though they come from env and not from a request.
