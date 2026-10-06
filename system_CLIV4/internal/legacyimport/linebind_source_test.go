@@ -4,6 +4,7 @@ package legacyimport
 //
 //	line_patients present        → line_patients, pair_logs ignored
 //	only pair_logs               → pairings rebuilt from the LAST event of each pair
+//	neither (or both empty)      → the group is SKIPPED, the run is not refused
 //
 // The pair_logs shapes are the ones measured on 10.0.133.87: action CREATE / DELETE /
 // SET_ACTIVE, type PATIENT / DOCTOR, user_code = the HN, no hn and no pair_branch.
@@ -148,5 +149,74 @@ func TestADumpWithOnlyPairLogsIsAccepted(t *testing.T) {
 	// count as supported, or a box with no line_patients could never be imported.
 	if _, err := parseMongoCatalog([]byte(pairLogsSample)); err != nil {
 		t.Fatalf("a dump holding only pair_logs was rejected: %v", err)
+	}
+}
+
+// ── the group-level rule: neither collection means skip, not refuse ──────────────────
+
+// itemsOnly is a mongo dump with something the parser supports and nothing about LINE.
+const itemsOnly = `db.items.insertMany([{"_id":"i1","clinic_code":"C0TEST1",` +
+	`"code":"ST000001","name":"Botox 100U","quantity":5,"price":3500,"active":true}]);` + "\n"
+
+func TestNoLINECollectionSkipsTheGroupInsteadOfRefusing(t *testing.T) {
+	// No -only: every group, linebind included, exactly what the web form sends when
+	// all of its boxes are ticked. pointsSample is here only because the LOYALTY group
+	// still refuses a dump with no `points` — a separate rule, not this one.
+	script, rep, err := BuildScript(Input{
+		ClinicCode:    "C0TEST1",
+		DefaultBranch: "BR00001",
+		MongoDump:     []byte(itemsOnly + pointsSample),
+	})
+	if err != nil {
+		t.Fatalf("a dump with no LINE collection refused the whole run: %v", err)
+	}
+	if strings.Contains(script, "INSERT INTO patient_line_binding") ||
+		strings.Contains(script, "INSERT INTO clinic_lineoa") {
+		t.Error("LINE statements were written although there was nothing to bind")
+	}
+	if !hasText(rep.Notes, "ข้ามกลุ่ม linebind") {
+		t.Errorf("the skip is not recorded · notes = %v", rep.Notes)
+	}
+	if hasWarning(rep, "ข้ามกลุ่ม linebind") {
+		t.Error("an implicit skip was raised as a warning — nobody asked for LINE by name")
+	}
+}
+
+func TestAskingForLinebindByNameAndGettingNothingIsAWarning(t *testing.T) {
+	// linebind named explicitly next to a group that does have data: the LINE group must
+	// not take the catalog down with it.
+	script, rep, err := BuildScript(Input{
+		ClinicCode:    "C0TEST1",
+		DefaultBranch: "BR00001",
+		Groups:        []string{"catalog", "linebind"},
+		MongoDump:     []byte(itemsOnly),
+	})
+	if err != nil {
+		t.Fatalf("a run naming linebind refused because there was no LINE collection: %v", err)
+	}
+	if !strings.Contains(script, "INSERT INTO catalog_item") {
+		t.Error("the catalog group was lost along with the empty LINE group")
+	}
+	if !hasWarning(rep, "เลือกกลุ่ม linebind ไว้แต่ไม่มีอะไรให้นำเข้า") {
+		t.Errorf("asking for the group by name and getting nothing is not a warning · %v", rep.Warnings)
+	}
+}
+
+// -only linebind ALONE with nothing to bind is still refused, by the older guard that
+// says the selected groups have nothing in this file. That is the right answer for a run
+// with no work in it at all: there is no script to hand back, and the operator has to
+// hear why rather than receive an empty file.
+func TestOnlyLinebindWithNothingToBindIsStillTheEmptyRunRefusal(t *testing.T) {
+	_, _, err := BuildScript(Input{
+		ClinicCode:    "C0TEST1",
+		DefaultBranch: "BR00001",
+		Groups:        []string{"linebind"},
+		MongoDump:     []byte(itemsOnly),
+	})
+	if err == nil {
+		t.Fatal("an empty run produced a script instead of saying it had nothing to do")
+	}
+	if !strings.Contains(err.Error(), "linebind") {
+		t.Errorf("the refusal does not name the group: %v", err)
 	}
 }

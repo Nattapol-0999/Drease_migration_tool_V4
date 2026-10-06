@@ -492,22 +492,33 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		// LINE bindings. Independent of everything above for the same reason loyalty is:
 		// its own collection, and every id it needs is resolved at the target.
 		//
-		// line_patients first, pair_logs when it is absent (owner's rule, 6 Oct 2026).
-		// Refuses only when the dump has neither — an empty collection counts as absent,
-		// because the export drops a count of 0 and the two cannot be told apart here.
+		// line_patients first, pair_logs when it is absent, and NEITHER MEANS SKIP
+		// (owner's rule, 6 Oct 2026). It used to refuse the whole run when line_patients
+		// was missing, which made every all-groups import of a clinic that never paired
+		// LINE in V2 impossible: 10.0.142.33 holds line_patients with no documents and no
+		// pair_logs at all. An empty collection counts as absent — the export drops a
+		// count of 0, so the two cannot be told apart from here anyway.
 		if needLineBind {
 			if len(mc.linePatients) == 0 && len(mc.pairLogs) == 0 {
-				return nil, nil, money, fmt.Errorf(
-					"เลือกกลุ่ม linebind แต่ mongo dump ไม่มีทั้ง collection \"line_patients\" และ \"pair_logs\" — " +
-						"ไม่มีการผูก LINE ให้นำเข้า (คลินิกที่ไม่เคยใช้การผูก LINE ใน V2 จะไม่มี collection เหล่านี้)")
+				msg := "LINE: mongo dump ไม่มีทั้ง mris.line_patients และ mris.pair_logs (หรือมีแต่ว่าง) — " +
+					"ข้ามกลุ่ม linebind ตามมติเจ้าของคลินิก (6 ต.ค. 2569) · " +
+					"คลินิกที่ไม่เคยใช้การผูก LINE ใน V2 จะเป็นแบบนี้ ไม่ใช่ข้อผิดพลาด"
+				if all {
+					rep.notef("%s", msg)
+				} else {
+					// Asked for by name and nothing came of it: said louder, because the
+					// operator selected this group expecting something.
+					rep.warnf("%s · เลือกกลุ่ม linebind ไว้แต่ไม่มีอะไรให้นำเข้า", msg)
+				}
+			} else {
+				group, binding, pointer, lerr := buildLineBind(mc, in, rep)
+				if lerr != nil {
+					return nil, nil, money, lerr
+				}
+				out[EntLineoaGroup] = group
+				out[EntPatientLineBinding] = binding
+				out[EntPatientLineID] = pointer
 			}
-			group, binding, pointer, lerr := buildLineBind(mc, in, rep)
-			if lerr != nil {
-				return nil, nil, money, lerr
-			}
-			out[EntLineoaGroup] = group
-			out[EntPatientLineBinding] = binding
-			out[EntPatientLineID] = pointer
 		}
 	}
 
