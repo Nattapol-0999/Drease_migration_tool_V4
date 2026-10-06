@@ -183,9 +183,12 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 			mc.healName[id] = n
 		}
 	}
+	// line_patients is on this list because a dump taken for `-only linebind` holds
+	// nothing else, and the old guard rejected it as unsupported while naming five
+	// collections the operator had not asked for.
 	if len(mc.items) == 0 && len(mc.listheals) == 0 && len(mc.courseItems) == 0 &&
-		len(mc.bills) == 0 && len(mc.points) == 0 {
-		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills, points)")
+		len(mc.bills) == 0 && len(mc.points) == 0 && len(mc.linePatients) == 0 {
+		return nil, fmt.Errorf("mongo dump ไม่มี collection ที่รองรับเลย (ต้องมีอย่างน้อยหนึ่ง: items, listheals, course_items, bills, points, line_patients)")
 	}
 	return mc, nil
 }
