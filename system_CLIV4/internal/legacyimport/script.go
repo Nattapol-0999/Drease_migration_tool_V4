@@ -381,6 +381,12 @@ var analyzeTargets = map[string][]string{
 	// items phase just inserted. Without this the planner keeps costing every one of
 	// those lookups against an empty table.
 	EntCourseBoughtItems: {"course_bought_items"},
+
+	// clinic_lineoa is looked up once per binding AND once per pointer — 2 × 691 on the
+	// first clinic to use this — by a scalar subquery over a table the same transaction
+	// may have just created the only row of. Without this the planner costs every one of
+	// those lookups against an empty table.
+	EntLineoaGroup: {"clinic_lineoa"},
 }
 
 // analyzeAfter renders the ANALYZE that must follow one entity's statements, or "" when

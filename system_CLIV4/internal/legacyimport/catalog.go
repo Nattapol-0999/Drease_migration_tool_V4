@@ -109,6 +109,10 @@ type mongoCatalog struct {
 	// visible instead of looking like the collection was never there.
 	points    []mongodump.Doc
 	pointLogs []mongodump.Doc
+	// linePatients is mris.line_patients — one document per paired LINE account,
+	// mapped in linebind.go. Same database as points and page, so it arrives in the
+	// same dump and needs no flag of its own.
+	linePatients []mongodump.Doc
 
 	// courseCode is course_items _id → the code MINTED for it (CS001…). It only helps an
 	// entitlement find its course when the CATALOG was imported by this same tool; a
@@ -161,9 +165,11 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 		courseBills: byName["course_bills"],
 		points:      byName["points"],
 		pointLogs:   byName["point_logs"],
-		courseCode:  map[string]string{},
-		courseName:  map[string]string{},
-		healName:    map[string]string{},
+
+		linePatients: byName["line_patients"],
+		courseCode:   map[string]string{},
+		courseName:   map[string]string{},
+		healName:     map[string]string{},
 	}
 	for _, d := range mc.listheals {
 		id := docObjectID(d, "_id")

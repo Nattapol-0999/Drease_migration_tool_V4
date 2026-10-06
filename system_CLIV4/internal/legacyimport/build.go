@@ -403,8 +403,10 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
 		EntCourseBoughtUsage)
 	needLoyalty := wants(EntLoyaltyAccount)
+	needLineBind := wants(EntLineoaGroup, EntPatientLineBinding, EntPatientLineID)
 
-	if len(in.MongoDump) > 0 && (needCatalog || needStock || needMoney || needEntitlements || needLoyalty) {
+	if len(in.MongoDump) > 0 &&
+		(needCatalog || needStock || needMoney || needEntitlements || needLoyalty || needLineBind) {
 		mc, err := parseMongoCatalog(in.MongoDump)
 		if err != nil {
 			return nil, nil, money, err
@@ -485,6 +487,26 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			if out[EntLoyaltyAccount], err = buildLoyalty(mc, in, rep); err != nil {
 				return nil, nil, money, err
 			}
+		}
+
+		// LINE bindings. Independent of everything above for the same reason loyalty is:
+		// its own collection, and every id it needs is resolved at the target. Refuses
+		// only when the dump has no `line_patients` collection at all — a clinic that
+		// never used LINE pairing in V2 has nothing here, and the export script treats a
+		// count of 0 as absent.
+		if needLineBind {
+			if len(mc.linePatients) == 0 {
+				return nil, nil, money, fmt.Errorf(
+					"เลือกกลุ่ม linebind แต่ mongo dump ไม่มี collection \"line_patients\" — " +
+						"ไม่มีการผูก LINE ให้นำเข้า (คลินิกที่ไม่เคยใช้การผูก LINE ใน V2 จะไม่มี collection นี้)")
+			}
+			group, binding, pointer, lerr := buildLineBind(mc, in, rep)
+			if lerr != nil {
+				return nil, nil, money, lerr
+			}
+			out[EntLineoaGroup] = group
+			out[EntPatientLineBinding] = binding
+			out[EntPatientLineID] = pointer
 		}
 	}
 

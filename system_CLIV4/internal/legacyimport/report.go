@@ -42,7 +42,8 @@ var order = append(append(append(append(append(append([]string{
 	EntUsers, EntClinicUser, EntClinicStaff,
 	EntDoctor, EntRoom, EntPatient,
 }, addressOrder...), []string{EntAppointment}...),
-	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), loyaltyOrder...), photoOrder...)
+	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), loyaltyOrder...),
+	append(linebindOrder, photoOrder...)...)
 
 // EntityOrder returns a copy of the order, for callers that render entities without
 // holding a Report. A copy, not the slice: the order is policy, and a caller must not
@@ -89,6 +90,11 @@ var entityGroups = map[string][]string{
 	// is its own group: a clinic can carry the point balances over without re-running any
 	// of the money or catalog work.
 	"loyalty": {EntLoyaltyAccount},
+	// linebind is indivisible for the same reason money is: the OA group, the canonical
+	// binding and the pointer on patient are three halves of one fact. A binding with no
+	// group cannot exist (NOT NULL FK), and a pointer with no binding is the old flow the
+	// owner closed — so the three travel together or not at all.
+	"linebind": {EntLineoaGroup, EntPatientLineBinding, EntPatientLineID},
 	// photos produces no SQL, so selecting it changes nothing in the .sql artifact — it
 	// is here so `-only photos` is not rejected as an unknown group when an operator
 	// wants the image manifest and nothing else.
@@ -115,6 +121,11 @@ var groupDependsOn = map[string][]string{
 	// HN with no patient row writes nothing (and is reported). Listed so the report says
 	// so before the run rather than after.
 	"loyalty": {"patients"},
+	// linebind is NOT advisory in effect: every binding INSERT selects FROM patient and
+	// every pointer UPDATE is keyed on the HN, so an HN with no patient row writes
+	// nothing (and the script's closing NOTICE counts the shortfall). Listed so the
+	// report says so before the run rather than after.
+	"linebind": {"patients"},
 }
 
 // GroupNames lists the selectable groups, sorted for a stable UI and help text.
