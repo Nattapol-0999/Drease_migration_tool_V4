@@ -312,3 +312,31 @@ func statusFromConfirmCheck(confirmCheck string) (status, confirmStatus string, 
 		return "reserve", "pending", false
 	}
 }
+
+// ── LINE bindings (mris.line_patients → clinic_lineoa + patient_line_binding) ──────
+
+// SkipInactiveLineBinding drops a V2 pairing whose `active` is false.
+//
+// It is TRUE, and the reason is consent rather than tidiness: active=false is the
+// customer having unlinked, so carrying the row over would re-link somebody who asked
+// not to be. Measured on the-gloss: 8 of 699.
+//
+// Importing them as revoked was the alternative and it does not work honestly —
+// ck_plb_revocation_complete requires revoked_at AND revoked_by together, and V2
+// records neither, so both would have to be invented.
+//
+// Owner's decision ก, 6 Oct 2026.
+const SkipInactiveLineBinding = true
+
+// LineBindVerifiedMethod is what patient_line_binding.verified_method says for a
+// binding this tool carried over.
+//
+// It is a distinct value on purpose. The column otherwise records HOW a human proved
+// they own the LINE account — 'phone_otp' and 'counter_otp' in the target today — and
+// an import proved nothing. Migration 0327 set the precedent with 'phone_otp_legacy'
+// for the rows it back-filled, so a migration-sourced label is an established shape and
+// not a new idea.
+//
+// Also the only handle the generated script has on its own output: the closing report
+// counts rows by this exact value. varchar(32); this is 15.
+const LineBindVerifiedMethod = "v2_line_pairing"
