@@ -26,9 +26,10 @@ OUT="${OUT:-/tmp/v2-import.js}"
 #   catalog.go  items · listheals · course_items · category · kind · item_types ·
 #               item_units · stocks · bills · payment_summary · course_bills
 #   page.go     page
-#   linebind.go line_patients
+#   linebind.go line_patients · pair_logs (pair_logs is read only when a box has no
+#               line_patients — owner's rule, 6 Oct 2026; a box with neither skips LINE)
 # A name not in this list is skipped by the parser, so exporting it is dead weight.
-COLS="category kind item_types item_units stocks items listheals course_items bills payment_summary course_bills page line_patients"
+COLS="category kind item_types item_units stocks items listheals course_items bills payment_summary course_bills page line_patients pair_logs"
 
 # 64 MB is the smallest ceiling on the upload path. The SQL dump shares that budget, so
 # warn well before it: ~50 MB of Mongo leaves room for a 10 MB mysqldump.
