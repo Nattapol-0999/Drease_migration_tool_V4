@@ -316,12 +316,16 @@ func renderLineBindings(binds []lineBind, clinic string, e *EntityResult) string
 		ref, cut := clip(b.srcID, 64)
 		tr.note("verified_ref", cut)
 
-		at := "now()"
+		// at is the SQL literal; shown is the same instant for the comment above it.
+		// Separate values on purpose — printing the literal put quotes in the middle of a
+		// sentence an operator reads, and "now()" where V2 had recorded no time at all.
+		at, shown := "now()", "ไม่ระบุ"
 		if b.hasPaired {
+			shown = b.pairedAt.UTC().Format("2006-01-02 15:04:05")
 			at = lit(b.pairedAt.UTC().Format("2006-01-02 15:04:05-07"))
 		}
 
-		s.comment("hn %s · ผูกเมื่อ %s · สาขาที่ผูกใน V2 %s", b.hn, at, orDash(b.branch))
+		s.comment("hn %s · ผูกเมื่อ %s UTC · สาขาที่ผูกใน V2 %s", b.hn, shown, orDash(b.branch))
 		s.addf(`INSERT INTO patient_line_binding
     (clinic_code, clinic_lineoa_id, line_user_id, patient_id,
      verified_method, verified_at, verified_ref)
