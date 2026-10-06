@@ -616,17 +616,34 @@ func planBillLines(d mongodump.Doc, mongoID, no string, rep *Report, eItem *Enti
 		price := line.Text("price")
 		qty := firstNonEmpty(line.Text("amount"), "1")
 
-		// A fractional quantity cannot reach invoice_item.qty, which is an integer
-		// column — Postgres would round it and commit, and the bill would quietly stop
-		// being worth what the source says. The fraction moves into the price instead,
-		// so 16.25 at ฿400 is written as 1 at ฿6,500: same value, whole quantity. See
-		// landedqty.go for why this and not rounding up.
-		if whole, measurable := qtySurvivesTheColumn(qty); measurable && !whole {
+		// Two columns cannot hold what V2 puts in front of them, and Postgres rounds
+		// both without a word:
+		//
+		//	invoice_item.qty    integer        — 16.25 lands as 16
+		//	invoice_item.price  numeric(12,2)  — 3.571428572 lands as 3.57
+		//
+		// Either one makes the bill stop being worth what the source says. The whole
+		// value of the line moves into a two-decimal price instead, so 16.25 at ฿400 and
+		// 28 at ฿3.571428572 are both written as 1 at the line's own total. Owner's
+		// decisions ค (5 Oct) and ก (6 Oct); see landedqty.go for the measurements and
+		// for why this and not rounding.
+		qtyWhole, qtyReadable := qtySurvivesTheColumn(qty)
+		priceFits, priceReadable := priceSurvivesTheColumn(price)
+		badQty := qtyReadable && !qtyWhole
+		badPrice := priceReadable && !priceFits
+		if badQty || badPrice {
+			why := foldForQty
+			switch {
+			case badQty && badPrice:
+				why = foldForBoth
+			case badPrice:
+				why = foldForPrice
+			}
 			if newPrice, residue, ok := foldFractionIntoPrice(price, qty); ok {
 				*folded = append(*folded, foldedLine{
 					invoiceNo: no, code: codeLit, name: nameLit,
 					srcPrice: strings.TrimSpace(price), srcQty: strings.TrimSpace(qty),
-					newPrice: newPrice, residue: residue,
+					newPrice: newPrice, residue: residue, why: why,
 				})
 				price, qty = newPrice, "1"
 			}

@@ -236,6 +236,24 @@ const (
 	kindNumeric limitKind = "numeric"
 	kindInteger limitKind = "integer"
 
+	// kindScale is a value with MORE decimal places than its numeric(p,s) column keeps.
+	//
+	// The same silent rounding as kindFraction, one column over. numericIntegerDigits
+	// counts only the digits left of the point, because that is what overflows — so a
+	// price of 3.571428572 into numeric(12,2) passed every check in this file, and
+	// Postgres stored 3.57.
+	//
+	// Measured on master-clinic (C9C89A4) 6 Oct 2026: bill 680028253 carried
+	// 28 x 3.571428572, worth 100.000000016 at the source and 99.96 in the column. Its
+	// receipt had collected ฿350 against a bill the database then thought was worth
+	// ฿349.96, and guard 3 refused a 241,181-line script over four satang — after the
+	// invoice, its items and its receipts had all been committed.
+	//
+	// planBillLines now folds a readable over-precise price into the line total, so this
+	// is the backstop for everything it cannot fold and for every OTHER numeric column
+	// this importer writes.
+	kindScale limitKind = "numeric-scale"
+
 	// kindFraction is a value with a fractional part written into a column that holds
 	// whole numbers only.
 	//
@@ -382,6 +400,19 @@ func scanScriptColumnLimits(script string) ([]limitViolation, limitCheckStats) {
 								sample: sampleForError(text),
 							})
 						}
+						// And the other end of the same column. Postgres does not refuse
+						// 3.571428572 into numeric(12,2) either: it rounds to the scale
+						// and commits. See the note on kindScale.
+						if extra, over := decimalsBeyondScale(text, lim.scale); over {
+							violations = append(violations, limitViolation{
+								table: table, column: col, kind: kindScale,
+								limit: fmt.Sprintf("numeric(%d,%d) — เก็บทศนิยมได้ %d ตำแหน่ง",
+									lim.precision, lim.scale, lim.scale),
+								got: fmt.Sprintf("มีทศนิยม %d ตำแหน่ง (Postgres จะปัดเป็น %s)",
+									extra, roundedToScaleForError(text, lim.scale)),
+								sample: sampleForError(text),
+							})
+						}
 					}
 					continue
 				}
@@ -473,6 +504,35 @@ func roundedForError(text string) string {
 		return q.String()
 	}
 	return "(อ่านค่าไม่ออก)"
+}
+
+// decimalsBeyondScale returns how many decimal places a literal really has, when that is
+// more than the column keeps.
+//
+// Trailing zeros do not count, for the same reason they do not count in fractionalPart:
+// 3.570 into numeric(12,2) is the same number the column will hold, and calling that a
+// violation would refuse every money literal written long.
+func decimalsBeyondScale(text string, scale int) (decimals int, over bool) {
+	s := strings.TrimSpace(text)
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return 0, false
+	}
+	frac := strings.TrimRight(s[dot+1:], "0")
+	if len(frac) <= scale {
+		return len(frac), false
+	}
+	return len(frac), true
+}
+
+// roundedToScaleForError shows what a numeric(p,s) column will hold, so the refusal names
+// the stored value next to the source one.
+func roundedToScaleForError(text string, scale int) string {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(text))
+	if !ok {
+		return "(อ่านค่าไม่ออก)"
+	}
+	return r.FloatString(scale)
 }
 
 // integerFits compares a numeric literal against a column's range exactly, using big.Int
@@ -575,6 +635,16 @@ func describeLimitViolations(v []limitViolation) string {
 				"มันจะปัดแล้ว commit เงียบ ๆ ทำให้ตัวเลขในฐานไม่ใช่ตัวเลขของต้นทาง · " +
 				"ถ้าเป็นจำนวนในบิล ให้แก้ที่ต้นทางเป็นจำนวนเต็มแล้วปรับราคาต่อหน่วยให้ยอดรวมเท่าเดิม " +
 				"(เช่น จำนวน 0.2 ราคา 500 → จำนวน 1 ราคา 100) แล้วดึงข้อมูลใหม่")
+			break
+		}
+	}
+	for _, k := range order {
+		if byCol[k].kind == kindScale {
+			b.WriteString("\nค่าที่ \"มีทศนิยมเกิน\" เป็นปัญหาเดียวกันคนละคอลัมน์: Postgres ไม่ปฏิเสธ มันปัดตามทศนิยม " +
+				"ที่คอลัมน์เก็บได้แล้ว commit เงียบ ๆ · ของบรรทัดในบิล เครื่องมือจะย้ายมูลค่าทั้งบรรทัดไปไว้ที่ราคา " +
+				"ให้เองอยู่แล้ว (จำนวน × ราคา → จำนวน 1 ราคารวม) ที่มาถึงตรงนี้คือค่าที่ย้ายไม่ได้ " +
+				"หรืออยู่ในคอลัมน์อื่นที่ไม่ใช่บรรทัดในบิล — ต้องแก้ที่ต้นทางหรือตัดสินใจทีละเคส " +
+				"เพราะเป็นตัวเลขที่กระทบยอดเงินและยอดสต็อก")
 			break
 		}
 	}
