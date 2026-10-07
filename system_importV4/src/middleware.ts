@@ -1,6 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-import { SESSION_COOKIE, verifySessionToken } from "@/lib/auth-token";
+import {
+  createSessionToken,
+  SESSION_COOKIE,
+  sessionCookie,
+  shouldRenewSession,
+  verifySessionToken,
+} from "@/lib/auth-token";
 
 // One gate in front of everything.
 //
@@ -103,9 +109,20 @@ export async function middleware(req: NextRequest): Promise<NextResponse> {
 
   const token = req.cookies.get(SESSION_COOKIE)?.value;
   const session = await verifySessionToken(token, secret);
+  // An expired or forged token is refused here and stays refused: renewal below only ever
+  // re-issues a session that is still valid.
   if (!session) return denied(req, "ยังไม่ได้เข้าสู่ระบบ หรือเซสชันหมดอายุ");
 
-  return NextResponse.next();
+  const res = NextResponse.next();
+  // A session in use is issued again, so it ends 8 hours after the operator last used the
+  // tool rather than 8 hours after they logged in (owner's decision 1ก, 7 Oct 2026). The job
+  // panel's polling counts as use, which is what keeps a long import's tab signed in until
+  // the job is done; an idle page sends nothing, so an idle session still closes.
+  if (shouldRenewSession(session)) {
+    const fresh = await createSessionToken(session.user, secret);
+    res.headers.append("set-cookie", sessionCookie(fresh, process.env.NODE_ENV === "production"));
+  }
+  return res;
 }
 
 export const config = {

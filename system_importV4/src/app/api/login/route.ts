@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createSessionToken, SESSION_COOKIE, SESSION_TTL_SECONDS } from "@/lib/auth-token";
+import { createSessionToken, sessionCookie } from "@/lib/auth-token";
 import { readAuthConfig, verifyPassword, verifyUsername } from "@/lib/auth-password";
 
 export const runtime = "nodejs"; // scrypt lives in node:crypto
@@ -112,20 +112,8 @@ export async function POST(req: Request): Promise<Response> {
 
   const token = await createSessionToken(config.user, config.secret);
   const res = Response.json({ ok: true });
-  res.headers.append(
-    "set-cookie",
-    [
-      `${SESSION_COOKIE}=${token}`,
-      "Path=/",
-      "HttpOnly",
-      "SameSite=Lax",
-      `Max-Age=${SESSION_TTL_SECONDS}`,
-      // Secure is wrong on plain-http localhost during development: the browser would
-      // drop the cookie and login would appear to succeed but never stick.
-      process.env.NODE_ENV === "production" ? "Secure" : "",
-    ]
-      .filter(Boolean)
-      .join("; "),
-  );
+  // The same cookie the middleware re-issues while the session is in use — built in one
+  // place so the two cannot disagree on its attributes.
+  res.headers.append("set-cookie", sessionCookie(token, process.env.NODE_ENV === "production"));
   return res;
 }

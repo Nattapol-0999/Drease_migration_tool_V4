@@ -65,6 +65,49 @@ function timingSafeEqualStrings(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * How old a session in use gets before it is issued again (owner's decision 1ก, 7 Oct 2026).
+ *
+ * The middleware re-mints the token once it is this old, so a session now ends
+ * SESSION_TTL_SECONDS after the operator last USED the tool, not after they logged in. That
+ * is what a long import needs: on 7 Oct a 57 GB photo run outlived a morning login by
+ * minutes and its tab lost the job. Nothing changes for a tab nobody touches — the page sends
+ * no requests of its own while idle, so an idle session still closes 8 hours after its last
+ * use, give or take this interval.
+ *
+ * Not on every request: the job panel polls every 2.5 s, and a Set-Cookie on each poll would
+ * be noise for no gain.
+ */
+export const SESSION_RENEW_AFTER_SECONDS = 10 * 60;
+
+/** shouldRenewSession reports whether a valid session is old enough to be issued again. */
+export function shouldRenewSession(
+  session: Session,
+  nowSeconds: number = Math.floor(Date.now() / 1000),
+): boolean {
+  return session.exp - nowSeconds <= SESSION_TTL_SECONDS - SESSION_RENEW_AFTER_SECONDS;
+}
+
+/**
+ * sessionCookie is the Set-Cookie value that carries a token. One place, so the login route
+ * and the renewal in the middleware cannot drift apart on HttpOnly / Secure / SameSite.
+ *
+ * `secure` is false only in development: on plain-http localhost the browser drops a Secure
+ * cookie, and login would appear to succeed but never stick.
+ */
+export function sessionCookie(token: string, secure: boolean): string {
+  return [
+    `${SESSION_COOKIE}=${token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${SESSION_TTL_SECONDS}`,
+    secure ? "Secure" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
 /** createSessionToken returns `payload.signature`, both base64url. */
 export async function createSessionToken(
   user: string,
