@@ -35,6 +35,11 @@ import {
   type TargetsResponse,
 } from "@/lib/types";
 
+import {
+  OWNER_EMAIL_DOMAIN,
+  OWNER_EMAIL_PREFIX,
+  ownerEmailFromClinicName,
+} from "@/lib/owner-email";
 import BusyOverlay, { type BusyState } from "./BusyOverlay";
 import DoneOverlay, { type DoneState } from "./DoneOverlay";
 import { GroupIcon } from "./GroupIcon";
@@ -337,6 +342,11 @@ export default function GenerateForm() {
   const [newThaName, setNewThaName] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [ownerEmail, setOwnerEmail] = useState("");
+  // The owner email follows the clinic name (cs+<name>@atiz.com) until the operator edits
+  // the email field themselves. From then on what they typed — an empty field included, which
+  // is how a clinic is created with no owner — is never overwritten by a keystroke in the
+  // name. "ใช้รูปแบบอัตโนมัติ" switches the following back on. Owner's choice 3ก, 7 Oct 2026.
+  const [ownerEmailAuto, setOwnerEmailAuto] = useState(true);
   // ── สาขา ────────────────────────────────────────────────────────────────────
   //
   // The upload now happens BEFORE the clinic is created, because the branch list has to be
@@ -1775,7 +1785,11 @@ export default function GenerateForm() {
               id="new-clinic-name"
               type="text"
               value={newThaName}
-              onChange={(e) => setNewThaName(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setNewThaName(v);
+                if (ownerEmailAuto) setOwnerEmail(ownerEmailFromClinicName(v));
+              }}
               placeholder="เช่น คลินิกตัวอย่าง"
             />
 
@@ -1808,13 +1822,52 @@ export default function GenerateForm() {
               id="owner-email"
               type="email"
               value={ownerEmail}
-              onChange={(e) => setOwnerEmail(e.target.value)}
-              placeholder="owner@example.com"
+              onChange={(e) => {
+                setOwnerEmail(e.target.value);
+                setOwnerEmailAuto(false);
+              }}
+              placeholder={`${OWNER_EMAIL_PREFIX}ชื่อคลินิก${OWNER_EMAIL_DOMAIN}`}
               autoComplete="off"
               spellCheck={false}
             />
+            {ownerEmailAuto ? (
+              ownerEmailFromClinicName(newThaName) === "" ? (
+                <div className="msg warn" style={{ marginTop: 4 }}>
+                  ใส่ชื่อคลินิกภาษาอังกฤษเพื่อสร้างอีเมล owner — ระบบเติมเป็น{" "}
+                  <code>
+                    {OWNER_EMAIL_PREFIX}ชื่อคลินิก{OWNER_EMAIL_DOMAIN}
+                  </code>{" "}
+                  ให้เอง
+                </div>
+              ) : (
+                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                  เติมจากชื่อคลินิกให้อัตโนมัติ (
+                  <code>
+                    {OWNER_EMAIL_PREFIX}ชื่อคลินิก{OWNER_EMAIL_DOMAIN}
+                  </code>
+                  ) · แก้เองได้
+                </div>
+              )
+            ) : (
+              <div className="row" style={{ marginTop: 4, alignItems: "center", gap: 8 }}>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  แก้เองแล้ว — ชื่อคลินิกจะไม่เติมทับช่องนี้
+                </span>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setOwnerEmailAuto(true);
+                    setOwnerEmail(ownerEmailFromClinicName(newThaName));
+                  }}
+                >
+                  ใช้รูปแบบอัตโนมัติ
+                </button>
+              </div>
+            )}
             <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-              อีเมลต้องไม่ถูกใช้โดยบัญชีของคลินิกอื่น — <code>users.email</code> ไม่ซ้ำได้ทั้งระบบ
+              อีเมลต้องไม่ถูกใช้โดยบัญชีของคลินิกอื่น — <code>users.email</code> ไม่ซ้ำได้ทั้งระบบ ·
+              ลบอีเมลออกให้ว่าง = สร้างคลินิกโดยไม่มีบัญชี owner
             </div>
 
             <div className="row" style={{ marginTop: 10 }}>
