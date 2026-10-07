@@ -376,6 +376,11 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 
 	var s sqlBuilder
 	seen := map[string]bool{}
+	// The first service written under each code, so a duplicate that is left out can name
+	// the row its code stayed with.
+	firstOf := map[string]mongodump.Doc{}
+	// Duplicates left out because their code has no number to move along.
+	var keptFirst []string
 	draft := 0
 	// Services whose legacy `point` turned out to be stored-value credit rather than a
 	// loyalty rate. Collected so the report can name each one instead of stating a count.
@@ -397,7 +402,22 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 			}
 			next := nextFreeCode(code, used)
 			if next == "" {
-				return "", fmt.Errorf("listheals: code %q ซ้ำ และหารหัสว่างถัดไปของ prefix นี้ไม่ได้", code)
+				// "Set ทำแผล", "Consultation": a code with no numeric tail has no next
+				// number to move to. Owner's decision ค (7 Oct 2026): keep the FIRST service
+				// under the code, leave the rest out, and name each one in the report.
+				// Refusing stopped the whole import over a price list, and inventing a code
+				// ("…2") or importing it flagged code_conflict were the options declined.
+				//
+				// healCode still maps this row's _id to the shared code — parseMongoCatalog
+				// filled it for every listheal — so a course line naming the left-out row
+				// lands on the kept service instead of being dropped as unresolved. Bill
+				// lines join by the code text and land there too; the invoice line keeps
+				// its own name and price either way.
+				first := firstOf[code]
+				keptFirst = append(keptFirst, fmt.Sprintf("%s: ไม่นำเข้า %s · เก็บ %s",
+					code, serviceInBrief(d), serviceInBrief(first)))
+				e.skip("listheals: code ซ้ำและไม่มีเลขท้ายให้ย้าย — นำเข้าเฉพาะรายการแรกของรหัส (มติ 7 ต.ค. 2569)")
+				continue
 			}
 			rep.warnf("listheals: code %q ซ้ำในไฟล์ — ย้ายรายการที่ซ้ำ (%s) ไปเป็น %q · รหัสนี้ต่างจากต้นทาง ต้องแจ้งคลินิก",
 				code, oneLine(firstNonEmpty(d.Text("name_th"), d.Text("name_en"))), next)
@@ -405,6 +425,9 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 			code = next
 		}
 		seen[code] = true
+		if _, ok := firstOf[code]; !ok {
+			firstOf[code] = d
+		}
 		healCodeOverride[docObjectID(d, "_id")] = code
 
 		nameTh := firstNonEmpty(d.Text("name_th"), d.Text("name_en"), code)
@@ -459,6 +482,13 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 	}
 
 	e.Statements = s.stmts
+	if len(keptFirst) > 0 {
+		rep.warnf("listheals: %d รายการใช้รหัสซ้ำกับรายการก่อนหน้า และรหัสไม่มีเลขท้ายให้ย้าย — "+
+			"นำเข้าเฉพาะรายการแรกของแต่ละรหัส ตามมติเจ้าของคลินิก (7 ต.ค. 2569) · "+
+			"บิลเก่ายังเก็บชื่อและราคาของตัวเอง แต่ผูกกับรายการแรกของรหัสนั้น · "+
+			"ถ้ายังใช้รายการที่ไม่ได้นำเข้า ให้สร้างใหม่ในจอ V4 ด้วยรหัสใหม่ · %s",
+			len(keptFirst), strings.Join(keptFirst, " · "))
+	}
 	if draft > 0 {
 		rep.warnf("catalog_item(service): %d รายการไม่มีราคา → status=draft (ขายไม่ได้จนกว่าจะใส่ราคา)", draft)
 	}
@@ -1566,6 +1596,13 @@ func nextFreeCode(base string, used map[string]bool) string {
 		}
 	}
 	return ""
+}
+
+// serviceInBrief names a listheal for a report line: its name and the price it charged,
+// which is what tells two services under one code apart.
+func serviceInBrief(d mongodump.Doc) string {
+	name := oneLine(firstNonEmpty(d.Text("name_th"), d.Text("name_en"), "-"))
+	return fmt.Sprintf("%s ราคา %s", name, moneyLit(d.Text("cost")))
 }
 
 // splitCode splits "LC033" into ("LC", 3). width 0 means the code has no numeric tail.

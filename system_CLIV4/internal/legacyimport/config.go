@@ -58,7 +58,10 @@ const (
 	//
 	// true  — the later row is moved to the next free number in its own prefix and the
 	//         change is reported. Nothing is lost. This follows the precedent set for
-	//         this clinic by the earlier gen_listheal run (LC033 → LC093).
+	//         this clinic by the earlier gen_listheal run (LC033 → LC093). A code with no
+	//         numeric tail ("Set ทำแผล", "Consultation") has no next number: the first row
+	//         keeps the code and the later ones are left out and named in the report
+	//         (owner's decision ค, 7 Oct 2026).
 	// false — the whole run is refused, matching the rule used for duplicate HNs.
 	RecodeDuplicateServiceCodes = true
 
