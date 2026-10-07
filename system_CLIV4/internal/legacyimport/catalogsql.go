@@ -2,6 +2,7 @@ package legacyimport
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -26,6 +27,19 @@ func moneyLit(s string) string {
 		return "0"
 	}
 	return t
+}
+
+// roundMoneyToScale rounds a money literal to scale decimal places exactly the way a
+// Postgres numeric(p,s) column rounds it on insert — half away from zero, which is also how
+// big.Rat.FloatString rounds — so what is written is the number the column would have
+// stored anyway, only said out loud. Still no float64 in the path. ok is false for text
+// that is not a number.
+func roundMoneyToScale(text string, scale int) (string, bool) {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(text))
+	if !ok {
+		return "", false
+	}
+	return r.FloatString(scale), true
 }
 
 // clampNonNegativeMoney renders a quantity the same way moneyLit does, except that a

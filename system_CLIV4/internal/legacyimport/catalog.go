@@ -642,6 +642,10 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 	// Quantities cut to fit their column, kept so the report can name every one. See
 	// clampnumeric.go for the rule and for what it costs.
 	var clamps qtyClamps
+	// SKU unit costs rounded to fit items.cost / catalog_item.cost (owner's decision ก,
+	// 7 Oct 2026), kept so the report can name every one.
+	var roundedCosts []string
+	skuScale := skuCostScale()
 
 	for n, d := range mc.items {
 		code := d.Text("code")
@@ -666,6 +670,23 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 			nameLit, _ := clip(name, 255)
 			unitLit, _ := clip(unit, 64)
 			catLit, _ := clip(category, 64)
+
+			// V2 keeps a unit cost to three places — 0.285 a tablet of multivitamin — while
+			// items.cost and catalog_item.cost are numeric(12,2), where Postgres would round
+			// it and commit without a word. Owner's decision ก (7 Oct 2026): round it HERE,
+			// exactly as Postgres would (half away from zero: 0.285 → 0.29, 0.625 → 0.63),
+			// and name every one in the report, instead of refusing the whole file. The
+			// SKU's cost only: selling prices and bill lines are not touched, and the lot
+			// below keeps the source figure, because slot_stock.cost_per_unit is
+			// numeric(14,4) and holds it as it is.
+			skuCost := moneyLit(cost)
+			if _, over := decimalsBeyondScale(skuCost, skuScale); over {
+				if r, ok := roundMoneyToScale(skuCost, skuScale); ok {
+					roundedCosts = append(roundedCosts, fmt.Sprintf("%s %s %s → %s",
+						code, oneLine(name), skuCost, r))
+					skuCost = r
+				}
+			}
 
 			// Drug label fields stay EMPTY on purpose. The export has no
 			// generic_name/strength/dosage_form/indication/warning, and filling them
@@ -746,11 +767,11 @@ UPDATE items SET
 
 `, lit(in.ClinicCode), lit(code), lit(nameLit),
 				defaultLit(catLit, "general"), defaultLit(unitLit, "ชิ้น"),
-				moneyLit(cost), moneyLit(price), boolLit(docBool(d, "active")),
+				skuCost, moneyLit(price), boolLit(docBool(d, "active")),
 				tsLit(d.Text("createdAt"), "now()"),
 				lit(in.ClinicCode), lit(code),
 				lit(nameLit), defaultLit(catLit, "general"), defaultLit(unitLit, "ชิ้น"),
-				moneyLit(cost), moneyLit(price),
+				skuCost, moneyLit(price),
 				lit(in.ClinicCode), lit(code))
 
 			// Every SKU needs a catalog_item or it cannot be sold at all. The whole collection
@@ -787,7 +808,7 @@ UPDATE items SET
 			}
 			sCatalog.comment("%s · %s → %s", code, oneLine(name), stockType)
 			sCatalog.addf("%s", upsertCatalogItem(in.ClinicCode, code, stockType, nameLit, "",
-				category, price, cost, status, "items",
+				category, price, skuCost, status, "items",
 				// NO `AND active` HERE. That one word cost two tenants their provenance.
 				//
 				// The subquery used to read `... AND code = Y AND active LIMIT 1`, so a SKU
@@ -965,6 +986,15 @@ SELECT %s, %s, %s, %s, %s, %s,
 	eCatalog.Statements = sCatalog.stmts
 	eCatalog.SourceRows = len(firstSeen)
 	eSlot.Statements = sSlot.stmts
+
+	if len(roundedCosts) > 0 {
+		rep.warnf("items/catalog_item: ต้นทุนต่อหน่วยของ %d SKU มีทศนิยมเกิน %d ตำแหน่ง — "+
+			"ปัดเป็น %d ตำแหน่งแบบเดียวกับที่ Postgres ปัด (ปัดครึ่งขึ้น เช่น 0.285 → 0.29) "+
+			"ตามมติเจ้าของคลินิก (7 ต.ค. 2569) · ใช้กับ items.cost และ catalog_item.cost เท่านั้น "+
+			"ราคาขายและบรรทัดบิลไม่ถูกแตะ · ต้นทุนในล็อต (slot_stock.cost_per_unit เก็บได้ 4 ตำแหน่ง) "+
+			"ยังเป็นค่าเดิมจาก V2 · %s",
+			len(roundedCosts), skuScale, skuScale, strings.Join(roundedCosts, " · "))
+	}
 
 	// Counted as "how many did V2 switch off", because that is now the only thing that
 	// decides it. The old message blamed a missing price and the five label fields, which
@@ -1596,6 +1626,17 @@ func nextFreeCode(base string, used map[string]bool) string {
 		}
 	}
 	return ""
+}
+
+// skuCostScale is how many decimal places a SKU's unit cost can keep: the tighter of the two
+// columns it is written to, read from the same table the width guard checks against, so
+// the rounding in buildItems and the guard can never disagree about what fits.
+func skuCostScale() int {
+	s := columnNumeric["items"]["cost"].scale
+	if c := columnNumeric["catalog_item"]["cost"].scale; c < s {
+		s = c
+	}
+	return s
 }
 
 // serviceInBrief names a listheal for a report line: its name and the price it charged,
