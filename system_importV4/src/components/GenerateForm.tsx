@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import {
   CLI_INPUTS,
   IMPORT_GROUPS,
@@ -40,6 +40,7 @@ import {
   OWNER_EMAIL_PREFIX,
   ownerEmailFromClinicName,
 } from "@/lib/owner-email";
+import { OWNER_CANDIDATES_SHOWN, OWNER_PRIORITY, pickOwnerUsername } from "@/lib/owner-pick";
 import BusyOverlay, { type BusyState } from "./BusyOverlay";
 import DoneOverlay, { type DoneState } from "./DoneOverlay";
 import { GroupIcon } from "./GroupIcon";
@@ -347,6 +348,31 @@ export default function GenerateForm() {
   // is how a clinic is created with no owner — is never overwritten by a keystroke in the
   // name. "ใช้รูปแบบอัตโนมัติ" switches the following back on. Owner's choice 3ก, 7 Oct 2026.
   const [ownerEmailAuto, setOwnerEmailAuto] = useState(true);
+  // owner_username and the owner name are filled from the users table the branch survey
+  // read (admin → ease → sorawit, src/lib/owner-pick.ts) until the operator edits each one
+  // by hand; then a second survey leaves it alone. Owner's choices 1ก–4ก, 7 Oct 2026.
+  //
+  // Each flag is mirrored in a ref because the survey is a job that finishes after an
+  // await: the handler holding a value read at click time would overwrite a field the
+  // operator edited while it was running.
+  const [ownerAuto, setOwnerAutoState] = useState(true);
+  const [ownerNameAuto, setOwnerNameAutoState] = useState(true);
+  const ownerAutoRef = useRef(true);
+  const ownerNameAutoRef = useRef(true);
+  function setOwnerAuto(v: boolean) {
+    ownerAutoRef.current = v;
+    setOwnerAutoState(v);
+  }
+  function setOwnerNameAuto(v: boolean) {
+    ownerNameAutoRef.current = v;
+    setOwnerNameAutoState(v);
+  }
+  /** Writes the pick into whichever of the two fields is still automatic. */
+  function applyOwnerPick(candidates: readonly string[] | undefined) {
+    const pick = pickOwnerUsername(candidates);
+    if (ownerAutoRef.current) setOwner(pick);
+    if (ownerNameAutoRef.current) setOwnerName(pick);
+  }
   // ── สาขา ────────────────────────────────────────────────────────────────────
   //
   // The upload now happens BEFORE the clinic is created, because the branch list has to be
@@ -506,6 +532,11 @@ export default function GenerateForm() {
     setSurveyErr(null);
     setPicked([]);
     setMainCode("");
+    // A pick made from the previous file names somebody in the previous file. Cleared only
+    // where it was filled automatically; anything typed by hand stays.
+    applyOwnerPick(undefined);
+    // applyOwnerPick reads refs and calls stable setters — it is not a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filesSig]);
 
   /**
@@ -700,6 +731,7 @@ export default function GenerateForm() {
       const json = { survey: surveyed };
 
       setSurvey(json.survey);
+      applyOwnerPick(json.survey.owner_candidates);
       setSurveySeconds(done.seconds);
       // No link: this read the dump and wrote nothing anywhere.
       setDoneState({
@@ -1812,10 +1844,36 @@ export default function GenerateForm() {
               id="owner-name"
               type="text"
               value={ownerName}
-              onChange={(e) => setOwnerName(e.target.value)}
+              onChange={(e) => {
+                setOwnerName(e.target.value);
+                setOwnerNameAuto(false);
+              }}
               placeholder="เช่น คุณสมชาย"
               autoComplete="off"
             />
+            {ownerNameAuto ? (
+              pickOwnerUsername(survey?.owner_candidates) !== "" ? (
+                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                  เติมจาก <code>users.code</code> อัตโนมัติ (ค่าเดียวกับ owner_username) · แก้เองได้
+                </div>
+              ) : null
+            ) : (
+              <div className="row" style={{ marginTop: 4, alignItems: "center", gap: 8 }}>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  แก้เองแล้ว — กดอ่านสาขาซ้ำจะไม่เติมทับช่องนี้
+                </span>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => {
+                    setOwnerNameAuto(true);
+                    setOwnerName(pickOwnerUsername(survey?.owner_candidates));
+                  }}
+                >
+                  ใช้ค่าอัตโนมัติ
+                </button>
+              </div>
+            )}
 
             <label htmlFor="owner-email">อีเมล owner (ใช้ล็อกอิน)</label>
             <input
@@ -1995,9 +2053,46 @@ export default function GenerateForm() {
         <input
           type="text"
           value={owner}
-          onChange={(e) => setOwner(e.target.value)}
+          onChange={(e) => {
+            setOwner(e.target.value);
+            setOwnerAuto(false);
+          }}
           placeholder="legacy users.code ของบัญชีที่จะเป็น owner"
         />
+        {ownerAuto ? (
+          survey?.owner_candidates && survey.owner_candidates.length > 0 ? (
+            pickOwnerUsername(survey.owner_candidates) !== "" ? (
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                เติมจาก <code>users.code</code> อัตโนมัติ (ลำดับ {OWNER_PRIORITY.join(" → ")}) · แก้เองได้
+              </div>
+            ) : (
+              <div className="msg warn" style={{ marginTop: 4 }}>
+                ไม่เจอ {OWNER_PRIORITY.join(" / ")} ในตาราง <code>users</code> — พิมพ์ code ที่จะเป็น
+                owner เอง · code ที่มีในไฟล์:{" "}
+                <code>{survey.owner_candidates.slice(0, OWNER_CANDIDATES_SHOWN).join(", ")}</code>
+                {survey.owner_candidates.length > OWNER_CANDIDATES_SHOWN
+                  ? ` … และอีก ${survey.owner_candidates.length - OWNER_CANDIDATES_SHOWN} code`
+                  : ""}
+              </div>
+            )
+          ) : null
+        ) : (
+          <div className="row" style={{ marginTop: 4, alignItems: "center", gap: 8 }}>
+            <span className="muted" style={{ fontSize: 12 }}>
+              แก้เองแล้ว — กดอ่านสาขาซ้ำจะไม่เติมทับช่องนี้
+            </span>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                setOwnerAuto(true);
+                setOwner(pickOwnerUsername(survey?.owner_candidates));
+              }}
+            >
+              ใช้ค่าอัตโนมัติ
+            </button>
+          </div>
+        )}
         <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
           บัญชีนี้ได้ role <code>owner</code> · ที่เหลือได้ <code>counter_staff</code> ·
           บัญชีที่เป็นหมอจะถูกทำเครื่องหมาย <code>doctor</code> ในทะเบียนพนักงานให้อัตโนมัติ

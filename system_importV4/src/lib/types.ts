@@ -651,6 +651,11 @@ export interface BranchSurvey {
   total_appointments: number;
   /** False when the dump has no `branch` table at all — nothing to map, single branch. */
   has_branch_table: boolean;
+  /**
+   * The legacy users.code values -owner would accept, in the CLI's order. Absent when the
+   * dump has no users table. The form picks owner_username from it (src/lib/owner-pick.ts).
+   */
+  owner_candidates?: string[];
 }
 
 /**
