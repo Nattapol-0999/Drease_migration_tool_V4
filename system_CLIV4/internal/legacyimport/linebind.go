@@ -184,29 +184,36 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 				"(ไม่มี hn/line_id หรือยกเลิกการผูกไปแล้วทั้งหมด)", src.name, src.docs)
 	}
 
-	// One LINE id bound to several HNs: KEEP THE LATEST PAIRING (owner's decision ข,
-	// 6 Oct 2026). This used to refuse the run, on the ground that picking a winner is a
-	// decision about whose LINE account a person keeps. The owner made that decision:
-	// the most recent pairing is the one the account's holder last asked for, so it is
-	// the one carried over, and every pairing left behind is named in the report so the
-	// clinic can re-pair it in V4 if it was the right one after all.
+	// V4 holds one LINE id per patient and one patient per LINE id, per clinic:
+	// patient.line_id is a single column, and ux_patient_clinic_line_id,
+	// ux_plb_live_patient and ux_plb_live_line_user say the rest. V2 enforces neither, so
+	// both conflicts are settled here, by the owner's decisions:
+	//
+	//	ข   6 Oct 2026  one LINE id on several HNs → keep the latest pairing
+	//	1ข  7 Oct 2026  one HN on several LINE ids → keep the latest too, in line_patients
+	//	                and pair_logs alike. This used to refuse the whole run.
+	//	2ก  7 Oct 2026  "latest" is the pairing's own time on both sides: createdAt in
+	//	                line_patients, the newest event of the pair in pair_logs — the
+	//	                time verified_at is given
+	//	3ข  7 Oct 2026  both settled in ONE pass, newest first (keepLatestPairings)
+	//
+	// Every pairing left behind is named in the report, so the clinic can re-pair it in V4
+	// if it was the right one after all.
 	//
 	// Measured on 10.0.133.87: 7 LINE ids, each held by exactly 2 HNs; 4 of the 7 pairs
 	// were made on the same day. pair_logs cannot settle any of them — both HNs carry a
-	// CREATE and neither a DELETE — which is why a rule is needed at all.
-	//
-	// Resolved BEFORE the duplicate-HN check below, so a document repeated whole (same HN,
-	// same LINE id) collapses to one instead of being refused as a duplicate HN.
-	binds, shared := keepLatestPerLineID(binds)
-
-	// One HN twice is still refused: it means one patient with two LINE accounts, and
-	// nothing has decided which of those to keep. ux_patient_clinic_line_id would not stop
-	// it, but patient.line_id holds only one.
-	if dup := firstDuplicate(binds, func(b lineBind) string { return b.hn }); dup != "" {
-		return "", "", "", fmt.Errorf(
-			"%s มี hn %s ซ้ำกันมากกว่าหนึ่งรายการ (คนไข้คนเดียวมี LINE สองบัญชี) — "+
-				"V4 เก็บได้หนึ่ง LINE ต่อหนึ่ง HN ต่อคลินิก "+
-				"ต้องแก้ที่ต้นทางก่อน ตัวนำเข้าไม่เลือกให้ว่าจะเก็บบัญชีไหน", src.name, dup)
+	// CREATE and neither a DELETE — which is why a rule is needed at all. The pair_logs-only
+	// dump behind the 7 Oct decisions (5,135 events, 4,978 live pairs) has 158 shared LINE
+	// ids and 65 patients still on 2 or 3 LINE accounts after them; one pass keeps 4,736.
+	binds, lost := keepLatestPairings(binds)
+	for range lost.repeats {
+		eBind.skip("การผูกเดียวกัน (HN และ LINE เดียวกัน) ซ้ำในต้นทาง — นับเป็นการผูกเดียว")
+	}
+	for range lost.byHN {
+		eBind.skip("HN นี้มี LINE อีกบัญชีที่ผูกล่าสุดกว่า — เก็บการผูกล่าสุดของ HN (มติ 7 ต.ค. 2569)")
+	}
+	for range lost.byLine {
+		eBind.skip("LINE นี้ผูกกับ HN อื่นที่ล่าสุดกว่า — เก็บการผูกล่าสุดของ LINE (มติ 6 ต.ค. 2569)")
 	}
 
 	// Deterministic order, same reason as loyalty: the artifact is meant to be diffed.
@@ -220,7 +227,8 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	pointer = renderLinePointer(binds, clinic, ePtr)
 
 	reportLineBind(binds, skippedInactive, src, in, rep)
-	reportSharedLineIDs(shared, src, rep)
+	reportSharedLineIDs(lost.byLine, src, rep)
+	reportSharedHNs(lost.byHN, src, rep)
 	return group, binding, pointer, nil
 }
 
@@ -238,6 +246,20 @@ type sharedLineID struct {
 	lineID string
 	kept   lineBind
 	gone   lineBind
+}
+
+// sharedHN is one pairing dropped because the same HN holds another LINE id more recently.
+type sharedHN struct {
+	hn   string
+	kept lineBind
+	gone lineBind
+}
+
+// lostPairings is what keepLatestPairings left out, by reason.
+type lostPairings struct {
+	byLine  []sharedLineID // the LINE id went to a more recent pairing of another HN
+	byHN    []sharedHN     // the HN kept a more recent pairing with another LINE id
+	repeats int            // the same HN + LINE id written again: one pairing, not two
 }
 
 // pairedLater reports whether a is the more recent pairing of the two.
@@ -259,33 +281,96 @@ func pairedLater(a, b lineBind) bool {
 	return a.hn > b.hn
 }
 
-// keepLatestPerLineID keeps, for every LINE id, only its most recent pairing.
-func keepLatestPerLineID(binds []lineBind) (kept []lineBind, shared []sharedLineID) {
-	best := map[string]int{}
-	var order []string
-	for i, b := range binds {
-		j, seen := best[b.lineID]
-		if !seen {
-			best[b.lineID] = i
-			order = append(order, b.lineID)
+// newerPairing is pairedLater made total. Two pairings that tie on time, document id and
+// HN are one HN on two LINE ids, and the LINE id settles it — so the same dump always
+// walks in the same order and keeps the same pairings.
+func newerPairing(a, b lineBind) bool {
+	if pairedLater(a, b) {
+		return true
+	}
+	if pairedLater(b, a) {
+		return false
+	}
+	return a.lineID > b.lineID
+}
+
+// keepLatestPairings walks the pairings from the most recent to the oldest and keeps one
+// when neither its HN nor its LINE id is already held by a pairing kept before it
+// (owner's decision 3ข, 7 Oct 2026). What is left holds every HN once and every LINE id
+// once, which patient.line_id, ux_patient_clinic_line_id, ux_plb_live_patient and
+// ux_plb_live_line_user require together.
+//
+// One pass, not a LINE pass followed by an HN pass. Two passes strand a pairing: when the
+// latest holder of a LINE id goes on to keep a newer LINE id of its own, the LINE pass has
+// already turned the older holder away, and the id ends up bound to nobody. Measured on
+// the 7 Oct dump that is 3 patients — one of them 016701866, whose LINE id 016701865
+// paired one minute later and gave up 42 minutes after that for a LINE id of its own.
+// Walked newest first, the id is still free when the older pairing is reached, so 016701866
+// keeps it.
+//
+// A pairing that loses on both sides — its HN and its LINE id each held by someone else —
+// is reported once, under its HN.
+func keepLatestPairings(binds []lineBind) (kept []lineBind, lost lostPairings) {
+	order := make([]lineBind, len(binds))
+	copy(order, binds)
+	sort.SliceStable(order, func(i, j int) bool { return newerPairing(order[i], order[j]) })
+
+	byHN := map[string]lineBind{}
+	byLine := map[string]lineBind{}
+	for _, b := range order {
+		if h, held := byHN[b.hn]; held {
+			if h.lineID == b.lineID {
+				lost.repeats++
+			} else {
+				lost.byHN = append(lost.byHN, sharedHN{hn: b.hn, kept: h, gone: b})
+			}
 			continue
 		}
-		if pairedLater(b, binds[j]) {
-			shared = append(shared, sharedLineID{lineID: b.lineID, kept: b, gone: binds[j]})
-			best[b.lineID] = i
-		} else {
-			shared = append(shared, sharedLineID{lineID: b.lineID, kept: binds[j], gone: b})
+		if l, held := byLine[b.lineID]; held {
+			lost.byLine = append(lost.byLine, sharedLineID{lineID: b.lineID, kept: l, gone: b})
+			continue
 		}
+		byHN[b.hn] = b
+		byLine[b.lineID] = b
+		kept = append(kept, b)
 	}
-	// A third holder of the same id can replace the winner recorded for the second, so
-	// what was "kept" is re-read from the final choice.
-	for i := range shared {
-		shared[i].kept = binds[best[shared[i].lineID]]
+	return kept, lost
+}
+
+// pairedWhen is a pairing's time as a report line shows it.
+func pairedWhen(b lineBind) string {
+	if !b.hasPaired {
+		return "ไม่ระบุเวลา"
 	}
-	for _, id := range order {
-		kept = append(kept, binds[best[id]])
+	return b.pairedAt.UTC().Format("2006-01-02 15:04")
+}
+
+// reportSharedHNs names every pairing left out because its HN kept a more recent LINE id.
+// A WARNING for the same reason as the shared LINE ids: it decides which LINE account can
+// open the patient's record in V4, and the clinic has to be able to see every one of them.
+func reportSharedHNs(shared []sharedHN, src lineSource, rep *Report) {
+	if len(shared) == 0 {
+		return
 	}
-	return kept, shared
+	sort.Slice(shared, func(i, j int) bool {
+		if shared[i].hn != shared[j].hn {
+			return shared[i].hn < shared[j].hn
+		}
+		return newerPairing(shared[i].gone, shared[j].gone)
+	})
+	patients := map[string]bool{}
+	lines := make([]string, 0, len(shared))
+	for _, s := range shared {
+		patients[s.hn] = true
+		lines = append(lines, fmt.Sprintf("HN %s: เก็บ LINE %s (ผูก %s) · ไม่นำเข้า LINE %s (ผูก %s)",
+			s.hn, shortLineID(s.kept.lineID), pairedWhen(s.kept),
+			shortLineID(s.gone.lineID), pairedWhen(s.gone)))
+	}
+	rep.warnf("LINE: %d การผูกใน %s เป็น LINE บัญชีที่สองขึ้นไปของคนไข้คนเดียวกัน (%d HN) — "+
+		"เก็บการผูกล่าสุดของแต่ละ HN ไว้ตามมติเจ้าของคลินิก (7 ต.ค. 2569) "+
+		"เพราะ V4 ให้คนไข้หนึ่งคนผูก LINE ได้บัญชีเดียวต่อคลินิก · "+
+		"ถ้าบัญชีที่ไม่ได้นำเข้าเป็นบัญชีที่คนไข้ใช้อยู่จริง ให้คนไข้ผูก LINE ใหม่ใน V4 · %s",
+		len(shared), src.name, len(patients), strings.Join(lines, " · "))
 }
 
 // reportSharedLineIDs names every pairing left out because its LINE id went to another
@@ -294,12 +379,6 @@ func keepLatestPerLineID(binds []lineBind) (kept []lineBind, shared []sharedLine
 func reportSharedLineIDs(shared []sharedLineID, src lineSource, rep *Report) {
 	if len(shared) == 0 {
 		return
-	}
-	when := func(b lineBind) string {
-		if !b.hasPaired {
-			return "ไม่ระบุเวลา"
-		}
-		return b.pairedAt.UTC().Format("2006-01-02 15:04")
 	}
 	sort.Slice(shared, func(i, j int) bool {
 		if shared[i].kept.hn != shared[j].kept.hn {
@@ -310,25 +389,12 @@ func reportSharedLineIDs(shared []sharedLineID, src lineSource, rep *Report) {
 	lines := make([]string, 0, len(shared))
 	for _, s := range shared {
 		lines = append(lines, fmt.Sprintf("LINE %s: เก็บ HN %s (ผูก %s) · ไม่นำเข้า HN %s (ผูก %s)",
-			shortLineID(s.lineID), s.kept.hn, when(s.kept), s.gone.hn, when(s.gone)))
+			shortLineID(s.lineID), s.kept.hn, pairedWhen(s.kept), s.gone.hn, pairedWhen(s.gone)))
 	}
 	rep.warnf("LINE: %d การผูกใน %s ใช้ LINE บัญชีเดียวกับ HN อื่น — เก็บการผูกล่าสุดไว้ตามมติเจ้าของคลินิก "+
 		"(6 ต.ค. 2569) เพราะ V4 ให้ LINE หนึ่งบัญชีผูกได้คนเดียวต่อคลินิก · "+
 		"HN ที่ไม่ได้นำเข้าต้องให้คนไข้ผูก LINE ใหม่ใน V4 ถ้าเป็นเจ้าของบัญชีจริง · %s",
 		len(shared), src.name, strings.Join(lines, " · "))
-}
-
-// firstDuplicate returns the first key that appears twice, or "".
-func firstDuplicate(binds []lineBind, key func(lineBind) string) string {
-	seen := map[string]bool{}
-	for _, b := range binds {
-		k := key(b)
-		if seen[k] {
-			return k
-		}
-		seen[k] = true
-	}
-	return ""
 }
 
 // renderLineoaGroup writes the empty OA group, and the guard that refuses to guess.

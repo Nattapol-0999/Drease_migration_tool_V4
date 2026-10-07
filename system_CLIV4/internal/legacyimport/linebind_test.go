@@ -7,8 +7,9 @@ package legacyimport
 //
 //	an unlinked pairing is NOT carried over          (consent, owner's decision ก)
 //	the OA group is created only when there is none   (and refuses to guess between two)
-//	a duplicate hn refuses the run                    (one patient, two LINE accounts)
+//	an hn on two LINE ids keeps the LATEST one        (owner's decision 1ข, 7 Oct 2026)
 //	a line_id held by two HNs keeps the LATEST one    (owner's decision ข, 6 Oct 2026)
+//	both are settled in one pass, newest first        (owner's decision 3ข, 7 Oct 2026)
 //	the HN decides the patient, not pair_branch       (owner's decision, 6 Oct 2026)
 //	an existing binding at the target always wins     (a real login beats an import)
 //	patient_line_link_log is never written            (an import is not a login)
@@ -255,7 +256,11 @@ func TestLineBindNeverWritesTheLinkLog(t *testing.T) {
 	}
 }
 
-func TestLineBindRefusesADuplicateHN(t *testing.T) {
+// One HN on two LINE ids used to refuse the run. Owner's decision 1ข (7 Oct 2026): keep
+// the LATEST pairing — in line_patients as in pair_logs — and name the other in the
+// report. The second document pairs 026700031 again on 2025-01-02, with another LINE id,
+// after its first pairing on 2024-10-21.
+func TestAnHNOnTwoLineIDsKeepsTheLatest(t *testing.T) {
 	dup := linePatientsSample + `
 db.line_patients.insert({
     "_id": ObjectId("6716350ada59e5b842d3dbff"),
@@ -265,16 +270,24 @@ db.line_patients.insert({
     "line_id": "Ucccccccccccccccccccccccccccccccc",
     "pair_branch": "02"
 });`
-	mc, err := parseMongoCatalog([]byte(dup))
-	if err != nil {
-		t.Fatalf("parseMongoCatalog: %v", err)
+	_, binding, pointer, rep := buildLineBindOne(t, dup)
+
+	if !strings.Contains(binding, "Ucccccccccccccccccccccccccccccccc") {
+		t.Error("the latest LINE id of the HN was not written")
 	}
-	_, _, _, err = buildLineBind(mc, Input{ClinicCode: "C2EC1E3"}, NewReport("C2EC1E3"))
-	if err == nil {
-		t.Fatal("two documents for one HN were accepted — V4 allows one LINE per HN per clinic")
+	if strings.Contains(binding, "U212cb71e81ff10f4304c5f9f8db31450") {
+		t.Error("the older LINE id of the same HN was written too — V4 holds one LINE per HN")
 	}
-	if !strings.Contains(err.Error(), "026700031") {
-		t.Errorf("the refusal does not name the duplicated HN: %v", err)
+	if strings.Contains(pointer, "U212cb71e81ff10f4304c5f9f8db31450") {
+		t.Error("the older LINE id was stamped onto patient.line_id")
+	}
+	if got := strings.Count(binding, "INSERT INTO patient_line_binding"); got != 3 {
+		t.Errorf("wrote %d bindings, want 3 (026700031 once, and the two unrelated pairings)", got)
+	}
+	for _, want := range []string{"HN 026700031: เก็บ LINE Ucccccc", "ไม่นำเข้า LINE U212cb71", "7 ต.ค. 2569"} {
+		if !hasWarning(rep, want) {
+			t.Errorf("the warning does not carry %q · warnings = %v", want, rep.Warnings)
+		}
 	}
 }
 
