@@ -164,6 +164,127 @@ func TestTheSharedLineIDRuleAppliesToPairLogsToo(t *testing.T) {
 	}
 }
 
+// ── one HN on several LINE ids (owner's decisions 1ข 2ก 3ข, 7 Oct 2026) ─────────────────
+
+const (
+	lineF = "Uffffffffffffffffffffffffffffff6"
+	lineG = "Ugggggggggggggggggggggggggggggg7"
+	lineH = "Uhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh8"
+	lineI = "Uiiiiiiiiiiiiiiiiiiiiiiiiiiiiii9"
+	lineJ = "Ujjjjjjjjjjjjjjjjjjjjjjjjjjjjjj0"
+	lineK = "Ukkkkkkkkkkkkkkkkkkkkkkkkkkkkkka"
+	lineL = "Ullllllllllllllllllllllllllllllb"
+)
+
+// boundTogether reports whether one INSERT of the binding batch pairs hn with lineID. The
+// comment above each INSERT names its HN unquoted, so only the statement itself matches.
+func boundTogether(binding, hn, lineID string) bool {
+	for _, stmt := range strings.Split(binding, "INSERT INTO patient_line_binding")[1:] {
+		if strings.Contains(stmt, "'"+hn+"'") && strings.Contains(stmt, "'"+lineID+"'") {
+			return true
+		}
+	}
+	return false
+}
+
+func skippedTotal(e *EntityResult) int {
+	n := 0
+	for _, c := range e.Skipped {
+		n += c
+	}
+	return n
+}
+
+// The refusal in the 7 Oct screenshot: 016600084 paired a second LINE id four days after
+// the first. The later one is kept, the earlier one is named, and the run goes on.
+func TestPairLogsKeepsTheLatestLineIDOfAnHN(t *testing.T) {
+	second := pairLogsSample +
+		pairLog("64b0a000000000000000000b", "CREATE", "PATIENT", "016800001", lineF, true, "2023-08-10T03:00:00.000Z")
+	_, binding, pointer, rep := buildLineBindOne(t, second)
+
+	if !boundTogether(binding, "016800001", lineF) {
+		t.Error("the later LINE id of 016800001 was not bound")
+	}
+	if strings.Contains(binding, lineA) || strings.Contains(pointer, lineA) {
+		t.Error("the earlier LINE id of 016800001 was written too — V4 holds one LINE per HN")
+	}
+	for _, want := range []string{"HN 016800001: เก็บ LINE Ufffffff", "ไม่นำเข้า LINE Uaaaaaaa",
+		"mris.pair_logs", "7 ต.ค. 2569"} {
+		if !hasWarning(rep, want) {
+			t.Errorf("the warning does not carry %q · warnings = %v", want, rep.Warnings)
+		}
+	}
+
+	// Still accounted for: 10 events = 3 bindings written + 7 skips, the new one included.
+	e := rep.Entities[EntPatientLineBinding]
+	written := strings.Count(binding, "INSERT INTO patient_line_binding")
+	if written != 3 || e.SourceRows != 10 || written+skippedTotal(e) != e.SourceRows {
+		t.Errorf("written %d + skipped %d ≠ source %d (want 3 + 7 = 10) · %v",
+			written, skippedTotal(e), e.SourceRows, e.Skipped)
+	}
+}
+
+// Decision 2ก: "latest" is the newest event of the pair, the time verified_at gets — not
+// the first CREATE. Real: 016516285 paired U2635b90… on 2023-11-30 and again on 2024-08-03,
+// and U0e0918f… once on 2024-03-25 in between. The re-paired account is kept.
+func TestARepairedPairingCountsFromItsNewestEvent(t *testing.T) {
+	body := pairLog("65686b5a0000000000000001", "CREATE", "PATIENT", "016800010", lineG, true, "2023-11-30T11:34:30.000Z") +
+		pairLog("66016190000000000000000a", "CREATE", "PATIENT", "016800010", lineH, true, "2024-03-25T11:35:57.000Z") +
+		pairLog("66ad9e48000000000000000b", "CREATE", "PATIENT", "016800010", lineG, true, "2024-08-03T03:04:40.000Z")
+	_, binding, _, rep := buildLineBindOne(t, body)
+
+	if !boundTogether(binding, "016800010", lineG) || strings.Contains(binding, lineH) {
+		t.Errorf("the pairing re-made on 2024-08-03 did not win over the one of 2024-03-25:\n%s", binding)
+	}
+	if !strings.Contains(binding, "'2024-08-03 03:04:40+00'") {
+		t.Error("the kept pairing is not stamped with its newest event")
+	}
+	if !hasWarning(rep, "ไม่นำเข้า LINE Uhhhhhhh… (ผูก 2024-03-25 11:35)") {
+		t.Errorf("the pairing left out is not named with its time · %v", rep.Warnings)
+	}
+}
+
+// Decision 3ข: one pass, newest first. Real: 016701865 paired 016701866's LINE id one
+// minute after it, then its own 42 minutes later. 016701865 keeps its own, and the id it
+// gave up goes back to 016701866 — two passes would have left it bound to nobody.
+func TestALineIDGivenUpByItsLatestHolderGoesBackToTheOlderOne(t *testing.T) {
+	body := pairLog("6720d5000000000000000001", "CREATE", "PATIENT", "016800020", lineI, true, "2024-10-29T12:29:04.000Z") +
+		pairLog("6720d54c0000000000000002", "CREATE", "PATIENT", "016800021", lineI, true, "2024-10-29T12:30:04.000Z") +
+		pairLog("6720df320000000000000003", "CREATE", "PATIENT", "016800021", lineJ, true, "2024-10-29T13:12:18.000Z")
+	_, binding, pointer, rep := buildLineBindOne(t, body)
+
+	if !boundTogether(binding, "016800021", lineJ) {
+		t.Error("016800021 lost its own, newest LINE id")
+	}
+	if !boundTogether(binding, "016800020", lineI) {
+		t.Errorf("the LINE id 016800021 gave up did not go back to 016800020:\n%s", binding)
+	}
+	if boundTogether(binding, "016800021", lineI) {
+		t.Error("016800021 kept two LINE ids")
+	}
+	if got := strings.Count(pointer, "UPDATE patient p"); got != 2 {
+		t.Errorf("stamped %d patients, want 2", got)
+	}
+	if !hasWarning(rep, "HN 016800021: เก็บ LINE Ujjjjjjj") {
+		t.Errorf("the pairing 016800021 gave up is not named · %v", rep.Warnings)
+	}
+	if hasWarning(rep, "ไม่นำเข้า HN 016800020") {
+		t.Error("016800020 is reported as left out although it kept the LINE id")
+	}
+}
+
+// Two LINE ids of one HN at the same instant: the document _id settles it, in either order.
+func TestAnHNWithTwoLineIDsAtTheSameTimeIsDecidedByTheDocumentID(t *testing.T) {
+	older := pairLog("67a72580000000000000aa01", "CREATE", "PATIENT", "016800030", lineK, true, "2025-02-08T10:00:00.000Z")
+	newer := pairLog("67a72580000000000000bb02", "CREATE", "PATIENT", "016800030", lineL, true, "2025-02-08T10:00:00.000Z")
+	for _, body := range []string{older + newer, newer + older} {
+		_, binding, _, _ := buildLineBindOne(t, body)
+		if !boundTogether(binding, "016800030", lineL) || strings.Contains(binding, lineK) {
+			t.Errorf("with equal times the higher _id must win in any document order:\n%s", body)
+		}
+	}
+}
+
 // ── the group-level rule: neither collection means skip, not refuse ──────────────────
 
 // itemsOnly is a mongo dump with something the parser supports and nothing about LINE.

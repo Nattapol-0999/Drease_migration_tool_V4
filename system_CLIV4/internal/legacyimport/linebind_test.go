@@ -371,9 +371,24 @@ db.line_patients.insert({
     "line_id": "U212cb71e81ff10f4304c5f9f8db31450",
     "pair_branch": "02"
 });`
-	_, binding, _, _ := buildLineBindOne(t, again)
+	_, binding, _, rep := buildLineBindOne(t, again)
 	if got := strings.Count(binding, "INSERT INTO patient_line_binding"); got != 3 {
 		t.Errorf("wrote %d bindings, want 3 (the repeat collapses into one)", got)
+	}
+	// The same pairing twice is not a conflict: a skip with its reason, not a pairing
+	// "left out" in a warning the clinic would go and chase.
+	if hasWarning(rep, "ไม่นำเข้า HN 026700031") || hasWarning(rep, "ไม่นำเข้า LINE") {
+		t.Errorf("a repeated document is reported as a pairing left out · %v", rep.Warnings)
+	}
+	repeats := 0
+	for reason, n := range rep.Entities[EntPatientLineBinding].Skipped {
+		if strings.Contains(reason, "ซ้ำในต้นทาง") {
+			repeats += n
+		}
+	}
+	if repeats != 1 {
+		t.Errorf("the repeat is skipped %d times, want 1 · %v",
+			repeats, rep.Entities[EntPatientLineBinding].Skipped)
 	}
 }
 
