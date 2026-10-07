@@ -103,6 +103,14 @@ type BranchSurvey struct {
 	TotalPatients     int  `json:"total_patients"`
 	TotalAppointments int  `json:"total_appointments"`
 	HasBranchTable    bool `json:"has_branch_table"`
+
+	// OwnerCandidates are the legacy users.code values that -owner would ACCEPT for this
+	// file — the same list, filtered and sorted the same way, that the import's own refusal
+	// prints (ownerCandidates in membership.go). Reported here so the web form can fill
+	// owner_username the moment the branches are read instead of the operator digging the
+	// code out of the dump (owner's request, 7 Oct 2026). Omitted when the file has no
+	// users table: then no owner is asked for at all.
+	OwnerCandidates []string `json:"owner_candidates,omitempty"`
 }
 
 const maxListed = 25
@@ -150,6 +158,19 @@ func SurveyBranches(in Input) (*BranchSurvey, error) {
 				stockOwner[sid] = code
 			}
 		}
+	}
+
+	// ── who can be named as owner ──
+	//
+	// The same rows and the same filter the import uses, so a code offered here is one
+	// -owner will accept. A users table that cannot be read is an error like the branch
+	// table's: an empty list would look like "no accounts" when the truth is "not read".
+	if len(in.UsersDump) > 0 {
+		_, users, err := legacydump.Parse(string(in.UsersDump), "users")
+		if err != nil {
+			return nil, fmt.Errorf("อ่านตาราง users ไม่ได้: %w", err)
+		}
+		s.OwnerCandidates = ownerCandidates(users)
 	}
 
 	// count records a hit against a known branch, or against UnknownInData when the code
