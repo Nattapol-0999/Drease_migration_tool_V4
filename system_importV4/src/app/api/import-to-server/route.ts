@@ -1,9 +1,9 @@
 import "server-only";
 
-import { open } from "node:fs/promises";
 
 import { requireSession } from "@/lib/require-session";
 import { getJob, startJob, type JobHandle } from "@/lib/jobs";
+import { clinicGuard, scriptHasGuard } from "@/lib/script-guard";
 import { executePhotoImport, PhotoRunError } from "@/lib/photo-run";
 import { dropSession, sessionExists, stagedSize } from "@/lib/upload-staging";
 import type { TargetId } from "@/lib/types";
@@ -49,8 +49,6 @@ interface Body {
   photoSessionId?: string;
 }
 
-/** How much of the script's head is checked for the clinic guard. */
-const GUARD_PEEK_BYTES = 64 * 1024;
 
 /** How many characters of psql's own output are put in front of the operator. */
 const PSQL_TAIL_CHARS = 1600;
@@ -115,21 +113,13 @@ export async function POST(req: Request): Promise<Response> {
     return fail(`สคริปต์นี้เป็นของ ${genJob.clinicCode} ไม่ใช่ ${clinic} — สร้างใหม่ก่อนนำเข้า`);
   }
 
-  // The artifact must be the one the generator produced for THIS clinic. Checked by
-  // reading only the head of the file: the guard is emitted near the top, and the file
-  // itself may be hundreds of megabytes.
+  // The artifact must be the one the generator produced for THIS clinic. The guard sits
+  // right after the header, and the header grows with every warning of the run, so the
+  // file is scanned until the guard turns up (src/lib/script-guard.ts) instead of only its
+  // first 64 KB being read — that fixed peek refused premier-hoslistic's correct script
+  // on 8 Oct 2026, its guard at byte 67,210. The file itself is never read whole.
   const sqlPath = genJob.sqlPath;
-  const guard = `SET LOCAL app.clinic_code = '${clinic}'`;
-  const fh = await open(sqlPath, "r");
-  let head: string;
-  try {
-    const buf = Buffer.alloc(Math.min(GUARD_PEEK_BYTES, genJob.sqlBytes ?? GUARD_PEEK_BYTES));
-    await fh.read(buf, 0, buf.length, 0);
-    head = buf.toString("utf8");
-  } finally {
-    await fh.close();
-  }
-  if (!head.includes(guard)) {
+  if (!(await scriptHasGuard(sqlPath, clinicGuard(clinic)))) {
     return fail(`สคริปต์นี้ไม่ใช่ของ ${clinic} — สร้างใหม่ก่อนนำเข้า`);
   }
 
