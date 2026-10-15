@@ -75,6 +75,11 @@ func main() {
 		// Read-only mode. Writes nothing and needs no -clinic, because it answers the
 		// question that comes BEFORE a clinic exists: how many branches does this tenant
 		// have, do they belong to one company, and what would splitting them cost.
+		lineOAToken = flag.Bool("line-oa-token", false,
+			"คัดลอก LINE channel access token จาก V2 ลงไฟล์ .sql ด้วย — ปิดไว้เป็นค่าเริ่มต้นเพราะ token เป็นความลับ "+
+				"และการวางเองที่ Settings → LINE OA ดีกว่า (ระบบเข้ารหัสให้ ส่วนเครื่องมือนี้ทำได้แค่ plaintext) · "+
+				"เปิดแล้วห้าม commit ไฟล์ และให้ปิดผนึกต่อด้วย cmd/lineoaencrypt --apply")
+
 		surveyBranches = flag.Bool("survey-branches", false, "สำรวจสาขาจากไฟล์ dump แล้วรายงาน (อ่านอย่างเดียว ไม่สร้างไฟล์ ไม่ต้องมี -clinic)")
 		surveyJSON     = flag.Bool("json", false, "ใช้กับ -survey-branches: พิมพ์ผลเป็น JSON")
 	)
@@ -126,6 +131,7 @@ func main() {
 		DefaultBranch:     strings.TrimSpace(*defaultBranch),
 		DocNoBranchMarker: strings.TrimSpace(*docNoMarker),
 		StockItemType:     strings.TrimSpace(*stockItemType),
+		LineOACarryToken:  *lineOAToken,
 		UsersDump:         mustRead("users", *users),
 		DoctorDump:        mustRead("doctor", *doctor),
 		RoomDump:          mustRead("room", *room),
