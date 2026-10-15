@@ -119,6 +119,13 @@ type mongoCatalog struct {
 	// (line_patients first, pair_logs second, neither = skip the group). See
 	// bindsFromPairLogs for how a current pairing is reconstructed from it.
 	pairLogs []mongodump.Doc
+	// lineChannel is mris.lineChannel and lineSetting is mris.lineSetting - the
+	// clinic's own LINE OA configuration (LIFF id, channel access token, and in
+	// lineChannel the branch the OA serves). Read in lineoaconfig.go so the group row
+	// comes out usable instead of empty; see that file for which of the two wins and
+	// why. Same database as line_patients, so they arrive in the same dump.
+	lineChannel []mongodump.Doc
+	lineSetting []mongodump.Doc
 
 	// courseCode is course_items _id → the code MINTED for it (CS001…). It only helps an
 	// entitlement find its course when the CATALOG was imported by this same tool; a
@@ -174,6 +181,8 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 
 		linePatients: byName["line_patients"],
 		pairLogs:     byName["pair_logs"],
+		lineChannel:  byName["lineChannel"],
+		lineSetting:  byName["lineSetting"],
 		courseCode:   map[string]string{},
 		courseName:   map[string]string{},
 		healName:     map[string]string{},
