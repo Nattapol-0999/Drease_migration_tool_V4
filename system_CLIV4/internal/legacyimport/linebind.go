@@ -222,7 +222,26 @@ func buildLineBind(mc *mongoCatalog, in Input, rep *Report) (group, binding, poi
 	clinic := lit(in.ClinicCode)
 	groupID := legacyOAGroupID(in.ClinicCode)
 
-	group = renderLineoaGroup(in.ClinicCode, groupID, eGroup)
+	// The OA configuration and the branch it serves. The resolver is the same one every
+	// other entity uses, so a legacy code V2 spells '01' lands on whatever branch_code
+	// POST /v3/import/clinics allocated for it - writing '01' through would point at a
+	// branch that does not exist.
+	cfg := readLineOAConfig(mc, rep)
+	oaBranch := ""
+	if cfg.usable() {
+		// Only when V2 NAMED a branch. br.resolve("") would hand back the default
+		// branch, and writing that would assert "this OA serves branch X" on a source
+		// that never said so - sticky, because ux_clinic_lineoa_branch is unique per
+		// (clinic, audience, branch) and remapping one later is a human decision.
+		// mris.lineSetting has no BRANCH field at all, so this is the normal path for a
+		// box that only has that document.
+		if strings.TrimSpace(cfg.v2Branch) != "" {
+			br := newBranchResolver(in)
+			oaBranch = br.resolve(cfg.v2Branch)
+		}
+		reportLineOAConfig(cfg, oaBranch, in.LineOACarryToken, rep)
+	}
+	group = renderLineoaGroup(in.ClinicCode, groupID, cfg, oaBranch, in.LineOACarryToken, eGroup)
 	binding = renderLineBindings(binds, clinic, eBind)
 	pointer = renderLinePointer(binds, clinic, ePtr)
 
@@ -397,8 +416,24 @@ func reportSharedLineIDs(shared []sharedLineID, src lineSource, rep *Report) {
 		len(shared), src.name, strings.Join(lines, " · "))
 }
 
-// renderLineoaGroup writes the empty OA group, and the guard that refuses to guess.
-func renderLineoaGroup(clinicCode, groupID string, e *EntityResult) string {
+// renderLineoaGroup writes the OA group, its branch mapping, and the guard that
+// refuses to guess which group a binding belongs to.
+//
+// cfg carries whatever mris.lineChannel / mris.lineSetting held (lineoaconfig.go).
+// When it is the zero value this writes exactly what it always wrote - a group with
+// only clinic_code and group_name - so a dump without those collections produces the
+// same file as before.
+//
+// branch is the ALREADY-RESOLVED V4 branch_code, or ” when V2 named no branch. The
+// mapping row is what makes the group usable: CountLineoaGroupBranches treats a group
+// with no branch as "not ready", and the settings screen lists the branch under
+// "สาขาลูกค้าที่ยังไม่กำหนดกลุ่ม" until this row exists.
+//
+// carryToken gates the credential, not the configuration: the LIFF id and the login
+// channel id always travel because neither is secret, while the channel access token
+// only lands when the operator asked for it with -line-oa-token.
+func renderLineoaGroup(clinicCode, groupID string, cfg lineOAConfig, branch string,
+	carryToken bool, e *EntityResult) string {
 	var s sqlBuilder
 	clinic := lit(clinicCode)
 
@@ -419,15 +454,29 @@ func renderLineoaGroup(clinicCode, groupID string, e *EntityResult) string {
 	// id is generated here and not by the database: clinic_lineoa.id is app-minted by
 	// design, and deriving it from the clinic code keeps two runs of the same dump
 	// byte-identical.
-	s.addf(`INSERT INTO clinic_lineoa (id, clinic_code, group_name)
+	// The three carried columns are listed even when empty, so the statement has one
+	// shape whatever the dump held and two runs stay diffable. An empty literal is the
+	// column default anyway, which is what the previous version relied on.
+	//
+	// line_channel_token_enc / token_enc_version / token_key_id are NOT listed: the
+	// plaintext-only triple ('' / 0 / '') is the only combination
+	// ck_clinic_lineoa_token_enc accepts without a key, this tool has no key, and the
+	// column defaults already produce it. cmd/lineoaencrypt --apply seals it afterwards.
+	tokenLit := lit("")
+	if carryToken && cfg.hasToken() {
+		tokenLit = lit(cfg.token)
+	}
+	s.addf(`INSERT INTO clinic_lineoa (id, clinic_code, group_name,
+                           line_liff_id, line_login_channel_id, line_channel_token)
 SELECT %s, %s,
-       COALESCE(NULLIF(btrim(c.tha_name), ''), NULLIF(btrim(c.eng_name), ''), c.clinic_code) || '_old'
+       COALESCE(NULLIF(btrim(c.tha_name), ''), NULLIF(btrim(c.eng_name), ''), c.clinic_code) || '_old',
+       %s, %s, %s
   FROM clinic c
  WHERE c.clinic_code = %s
    AND c.code = c.clinic_code
    AND NOT EXISTS (SELECT 1 FROM clinic_lineoa g WHERE g.clinic_code = %s);
 
-`, lit(groupID), clinic, clinic, clinic)
+`, lit(groupID), clinic, lit(cfg.liffID), lit(cfg.loginChannelID), tokenLit, clinic, clinic)
 
 	// The refusal has to live in the SQL, not in Go: how many groups the clinic has is a
 	// fact about the TARGET, and this side has never seen it.
@@ -454,6 +503,28 @@ BEGIN
 END $linebind_group$;
 
 `, clinic, clinic, clinic)
+
+	// The branch mapping. Written AFTER the guard on purpose: it points at "the one group
+	// of this clinic", which only means something once the guard has established there is
+	// exactly one.
+	//
+	// ux_clinic_lineoa_branch is UNIQUE (clinic_code, audience, branch), so NOT EXISTS is
+	// matched to the real constraint rather than to the group id - remapping a branch from
+	// one group to another is a decision for a human, and this import must not silently
+	// take it.
+	if strings.TrimSpace(branch) != "" {
+		s.comment("")
+		s.comment("ผูกสาขาเข้ากับกลุ่ม · ไม่มีแถวนี้ กลุ่มจะยังใช้งานไม่ได้และหน้าตั้งค่า")
+		s.comment("จะขึ้นสาขานี้ไว้ใต้ \"สาขาลูกค้าที่ยังไม่กำหนดกลุ่ม\"")
+		s.comment("")
+		s.addf(`INSERT INTO clinic_lineoa_branch (clinic_lineoa_id, clinic_code, branch, audience)
+SELECT %s, %s, %s, 'customer'
+ WHERE NOT EXISTS (
+     SELECT 1 FROM clinic_lineoa_branch b
+      WHERE b.clinic_code = %s AND b.audience = 'customer' AND b.branch = %s);
+
+`, lineoaGroupExpr(clinic), clinic, lit(branch), clinic, lit(branch))
+	}
 
 	e.SourceRows = 1
 	e.Statements = s.stmts
