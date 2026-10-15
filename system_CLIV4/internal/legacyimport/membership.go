@@ -132,8 +132,44 @@ ON CONFLICT (user_id, clinic_code) DO NOTHING;
 
 `, userIDByLegacy(id), lit(in.ClinicCode), rolePresetIDByKey(roleKey))
 	}
+	// HOW MANY OWNERS THE TARGET ENDS UP WITH IS A FACT ABOUT THE TARGET
+	//
+	// The inserts above are the right shape: exactly one account gets the owner role and
+	// every other gets counter_staff. What they cannot see is what is ALREADY there -
+	// and because they are insert-only (ON CONFLICT DO NOTHING, deliberately, so a re-run
+	// never rewrites a membership an operator narrowed by hand) a clinic that already
+	// holds extra owners keeps them, silently.
+	//
+	// That is not hypothetical. C9D4865 was found holding 19 owner memberships while its
+	// users screen printed only 7, because the screen reads clinic_staff.role_id and the
+	// permission layer reads clinic_user.role_preset_id. Nobody noticed until somebody
+	// counted. Every one of those 19 could edit settings, void bills and manage users.
+	//
+	// So the number is reported from the database, after the writes, where it is true.
+	// A WARNING and not an exception: the import itself is correct and refusing it would
+	// strand the rest of the migration, and 44 clinics in the target legitimately run on
+	// two owners today. The operator is told; the decision stays theirs.
+	s.addf(`DO $clinic_user_owners$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n
+      FROM clinic_user cu
+      JOIN role_presets rp ON rp.id = cu.role_preset_id
+     WHERE cu.clinic_code = %s AND rp.key = 'owner' AND rp.clinic_code IS NULL;
+    IF n > 1 THEN
+        RAISE WARNING 'คลินิก %% มีเจ้าของ %% คนหลังนำเข้า (ตัวนำเข้าตั้งให้คนเดียวเสมอ '
+            'ส่วนที่เกินมีอยู่ที่ปลายทางก่อนแล้ว และตัวนำเข้าไม่เขียนทับของเดิม) — '
+            'เจ้าของทุกคนแก้ตั้งค่า ยกเลิกบิล และจัดการผู้ใช้ได้ · '
+            'หน้าผู้ใช้งานอ่าน clinic_staff.role_id ส่วนสิทธิ์จริงอ่าน clinic_user.role_preset_id '
+            'จำนวนบนจอจึงน้อยกว่าของจริงได้', %s, n;
+    END IF;
+END $clinic_user_owners$;
+`, lit(in.ClinicCode), lit(in.ClinicCode))
+
 	e.Statements = s.stmts
 	rep.notef("clinic_user: owner=%q, %d other account(s) as %s", in.OwnerUsername, others, RoleKeyStaff)
+	rep.notef("clinic_user: สคริปต์จะเตือน (RAISE WARNING) ถ้าปลายทางมีเจ้าของเกิน 1 คนหลังนำเข้า — " +
+		"ตัวนำเข้าเขียนแบบ insert-only จึงไม่ลดเจ้าของที่มีอยู่ก่อนให้")
 	return s.String(), nil
 }
 
