@@ -119,29 +119,39 @@ func TestLineBindingWritesAllThreeTablesForALivePairing(t *testing.T) {
 	group, binding, pointer, _ := buildLineBindOne(t, linePatientsSample)
 
 	// The group is created, and only when the clinic has none.
-	if !strings.Contains(group, "INSERT INTO clinic_lineoa (id, clinic_code, group_name)") {
+	if !strings.Contains(group, "INSERT INTO clinic_lineoa (id, clinic_code, group_name,") {
 		t.Error("the OA group is not created")
 	}
 	if !strings.Contains(group, "NOT EXISTS (SELECT 1 FROM clinic_lineoa g WHERE g.clinic_code") {
 		t.Error("the group INSERT is not gated on the clinic having no group yet")
 	}
-	// Only the three columns the owner asked for. Pinned on the INSERT's column list and
-	// not on the batch text, because the comment above the statement NAMES the defaulted
-	// columns in order to explain them — searching the whole batch failed on its own
-	// documentation.
+	// The column list is fixed, whatever the dump held, so two runs stay diffable.
 	//
-	// Any fourth column here would be a value this tool invented for a config it has
-	// never seen: a token, a LIFF id or a webhook secret that no LINE channel issued.
-	const head = "INSERT INTO clinic_lineoa ("
-	i := strings.Index(group, head)
-	if i < 0 {
-		t.Fatal("no INSERT INTO clinic_lineoa")
+	// WHAT MUST NOT BE ON IT: line_oa_id (V2 has only a bot user id, never an @basic id),
+	// portal_liff_id and line_channel_secret (absent from every V2 box inspected), and
+	// the three seal columns — line_channel_token_enc / token_enc_version / token_key_id
+	// — because the plaintext-only triple is the only combination
+	// ck_clinic_lineoa_token_enc accepts without a key and the column defaults already
+	// produce it. Anything else here would be a value invented for a config nobody saw.
+	cols := groupInsertColumns(t, group)
+	const want = "id, clinic_code, group_name,\n                           " +
+		"line_liff_id, line_login_channel_id, line_channel_token"
+	if cols != want {
+		t.Errorf("the group INSERT writes (%s)\nwant (%s)", cols, want)
 	}
-	cols := group[i+len(head):]
-	cols = cols[:strings.Index(cols, ")")]
-	if cols != "id, clinic_code, group_name" {
-		t.Errorf("the group INSERT writes (%s) — it must create an EMPTY group with only "+
-			"id, clinic_code, group_name and let every other column default", cols)
+	for _, forbidden := range []string{
+		"line_oa_id", "portal_liff_id", "line_channel_secret",
+		"line_channel_token_enc", "token_enc_version", "token_key_id",
+	} {
+		if strings.Contains(cols, forbidden) {
+			t.Errorf("the group INSERT writes %s — V2 has no truthful value for it", forbidden)
+		}
+	}
+	// This dump carries no lineChannel/lineSetting, so the three carried columns must
+	// come out EMPTY. That is the original guarantee of this test, kept: with nothing to
+	// read, the tool still invents nothing.
+	if !strings.Contains(group, "       '', '', ''\n") {
+		t.Error("with no OA config in the dump, liff / login channel / token are not all empty")
 	}
 	// group_name is read from the target, because this side only knows the clinic code.
 	if !strings.Contains(group, "'_old'") {
@@ -477,5 +487,159 @@ func TestLineBindIsASelectableGroupThatDependsOnPatients(t *testing.T) {
 	// read from must be analysed first.
 	if tables := analyzeTargets[EntLineoaGroup]; len(tables) != 1 || tables[0] != "clinic_lineoa" {
 		t.Errorf("analyzeTargets[%s] = %v, want [clinic_lineoa]", EntLineoaGroup, tables)
+	}
+}
+
+// groupInsertColumns returns the column list of the clinic_lineoa INSERT. Pinned on the
+// list and not on the batch text because the comments above the statement name columns
+// in order to explain them, and searching the whole batch matched its own documentation.
+func groupInsertColumns(t *testing.T, group string) string {
+	t.Helper()
+	const head = "INSERT INTO clinic_lineoa ("
+	i := strings.Index(group, head)
+	if i < 0 {
+		t.Fatal("no INSERT INTO clinic_lineoa")
+	}
+	cols := group[i+len(head):]
+	j := strings.Index(cols, ")")
+	if j < 0 {
+		t.Fatal("unterminated column list")
+	}
+	return cols[:j]
+}
+
+// lineChannelSample is wanaka's own configuration (10.0.142.133), with the token
+// replaced by a base64 string of the same shape. It is the branch-aware document: it
+// carries CHANNEL_NAME and BRANCH, which is how the OA is tied to a V4 branch.
+const lineChannelSample = `db.lineChannel.insert({
+    "_id": ObjectId("69315b524c51f0242e612609"),
+    "LINE_LIFF_ID": "2008631059-drXwEKvE",
+    "LINE_CHANNEL_TOKEN": "TOKENabcdefghijklmnopqrstuvwxyz0123456789+/=",
+    "LINE_OA_ID": "Uf646c8123651d054569fc14092d982ed",
+    "CHANNEL_NAME": "Wanaka Sanctuary",
+    "BRANCH": "02"
+});`
+
+func buildLineBindCfg(t *testing.T, body string, carryToken bool) (group string, rep *Report) {
+	t.Helper()
+	mc, err := parseMongoCatalog([]byte(body))
+	if err != nil {
+		t.Fatalf("parseMongoCatalog: %v", err)
+	}
+	rep = NewReport("C2EC1E3")
+	in := Input{
+		ClinicCode:       "C2EC1E3",
+		BranchMap:        map[string]string{"01": "BR00001", "02": "BR00002"},
+		LineOACarryToken: carryToken,
+	}
+	group, _, _, err = buildLineBind(mc, in, rep)
+	if err != nil {
+		t.Fatalf("buildLineBind: %v", err)
+	}
+	return group, rep
+}
+
+// The configuration V2 really holds is carried, and the branch is RESOLVED rather than
+// written through: V2 spells the branch "02" and V4 calls the same branch BR00002, so a
+// literal "02" would point at a branch that does not exist.
+func TestLineOAConfigIsCarriedAndTheBranchIsMapped(t *testing.T) {
+	group, rep := buildLineBindCfg(t, linePatientsSample+"\n"+lineChannelSample, false)
+
+	if !strings.Contains(group, "'2008631059-drXwEKvE'") {
+		t.Error("the LIFF id from mris.lineChannel is not carried")
+	}
+	// Derived from the LIFF id, because no V2 document carries it as a field.
+	if !strings.Contains(group, "'2008631059'") {
+		t.Error("line_login_channel_id is not derived from the LIFF id")
+	}
+	if !strings.Contains(group, "INSERT INTO clinic_lineoa_branch") {
+		t.Fatal("the branch is not mapped \u2014 the group stays unusable without this row")
+	}
+	if !strings.Contains(group, "'BR00002'") {
+		t.Error("the branch was not resolved through BranchMap (V2 '02' \u2192 V4 BR00002)")
+	}
+	if strings.Contains(group, "'customer', '02'") || strings.Contains(group, ", '02',") {
+		t.Error("the legacy branch code was written through instead of being mapped")
+	}
+	// Matched to ux_clinic_lineoa_branch (clinic_code, audience, branch), so remapping a
+	// branch from one group to another stays a human decision.
+	if !strings.Contains(group, "b.audience = 'customer' AND b.branch =") {
+		t.Error("the branch INSERT is not guarded on the real unique constraint")
+	}
+	// The bot user id must never reach line_oa_id.
+	if strings.Contains(group, "Uf646c8123651d054569fc14092d982ed") {
+		t.Error("V2's bot user id was written as an @basic id")
+	}
+	if !hasNote(rep, "Wanaka Sanctuary") {
+		t.Errorf("the report does not name the channel it read \u00b7 notes = %v", rep.Notes)
+	}
+}
+
+// The token is a credential, so it travels only when the operator asked for it. The rest
+// of the configuration travels either way.
+func TestLineOATokenOnlyTravelsWhenAsked(t *testing.T) {
+	const token = "TOKENabcdefghijklmnopqrstuvwxyz0123456789+/="
+	body := linePatientsSample + "\n" + lineChannelSample
+
+	off, repOff := buildLineBindCfg(t, body, false)
+	if strings.Contains(off, token) {
+		t.Error("the channel access token was written without -line-oa-token")
+	}
+	if !strings.Contains(off, "'2008631059-drXwEKvE'") {
+		t.Error("withholding the token also withheld the LIFF id, which is not a secret")
+	}
+	if !hasNote(repOff, "-line-oa-token") {
+		t.Errorf("the report does not say the token was found and withheld \u00b7 notes = %v", repOff.Notes)
+	}
+
+	on, repOn := buildLineBindCfg(t, body, true)
+	if !strings.Contains(on, token) {
+		t.Error("-line-oa-token was passed and the token was still not written")
+	}
+	// A file that now holds a credential has to say so, loudly, and name the sealing step.
+	if !hasWarning(repOn, "lineoaencrypt") {
+		t.Errorf("no warning names the sealing step \u00b7 warnings = %v", repOn.Warnings)
+	}
+}
+
+// Two OA documents mean two channels. A LINE id is issued BY a channel, so guessing
+// which channel a pairing came from would bind people to the wrong OA. Nothing is
+// carried, and the operator is told why.
+func TestTwoOAChannelsCarryNothingAndSayWhy(t *testing.T) {
+	second := strings.Replace(lineChannelSample,
+		"69315b524c51f0242e612609", "69315b524c51f0242e61260a", 1)
+	second = strings.Replace(second, "Wanaka Sanctuary", "Wanaka Second", 1)
+	group, rep := buildLineBindCfg(t, linePatientsSample+"\n"+lineChannelSample+"\n"+second, true)
+
+	if strings.Contains(group, "'2008631059-drXwEKvE'") {
+		t.Error("a LIFF id was chosen between two channels")
+	}
+	if strings.Contains(group, "INSERT INTO clinic_lineoa_branch") {
+		t.Error("a branch was mapped despite not knowing which channel serves it")
+	}
+	if !hasWarning(rep, "มากกว่าหนึ่งช่อง") {
+		t.Errorf("no warning explains the two channels \u00b7 warnings = %v", rep.Warnings)
+	}
+}
+
+// lineSetting is the fallback for a box that has no lineChannel. It carries no BRANCH,
+// so no mapping row can be written \u2014 and that absence must not be filled with a guess.
+func TestLineSettingIsTheFallbackAndCarriesNoBranch(t *testing.T) {
+	const setting = `db.lineSetting.insert({
+    "_id": ObjectId("693158734c51f0242e6125ce"),
+    "LINE_LIFF_ID": "2008631059-A0pJabqa",
+    "LINE_CHANNEL_TOKEN": "TOKENabcdefghijklmnopqrstuvwxyz0123456789+/=",
+    "LINE_OA_ID": "Uf646c8123651d054569fc14092d982ed"
+});`
+	group, rep := buildLineBindCfg(t, linePatientsSample+"\n"+setting, false)
+
+	if !strings.Contains(group, "'2008631059-A0pJabqa'") {
+		t.Error("the LIFF id from mris.lineSetting is not carried")
+	}
+	if strings.Contains(group, "INSERT INTO clinic_lineoa_branch") {
+		t.Error("a branch was mapped although lineSetting names none")
+	}
+	if !hasNote(rep, "mris.lineSetting") {
+		t.Errorf("the report does not name lineSetting as the source \u00b7 notes = %v", rep.Notes)
 	}
 }
