@@ -78,6 +78,29 @@ type Input struct {
 	// choosing how to map it.
 	BranchDump []byte
 
+	/*
+		LineOACarryToken decides whether the clinic's LINE channel access token is written
+		into the generated .sql. Default false.
+
+		WHY IT IS A CHOICE AND NOT A RULE
+
+		Everything else the OA lane carries - the LIFF id, the login channel id, the branch
+		- is public configuration. The channel access token is a CREDENTIAL: whoever holds
+		it can send messages as the clinic. The generated file is downloaded, e-mailed and
+		kept in folders, so putting a credential in it by default would be a decision made
+		for the operator rather than by them.
+
+		With it off, the group is still created with its LIFF id and branch mapping, and the
+		report says a token was found and where to paste it. Pasting it in Settings is also
+		STRICTLY BETTER than writing it here: the application seals it (sealToken produces
+		token_enc_version = 1), while this tool has no key and can only produce the
+		plaintext-only triple. Two of the-gloss's groups still sit unsealed because they
+		were written by hand that way.
+
+		With it on, the report says loudly that the file now contains a credential, and
+		names cmd/lineoaencrypt --apply as the step that seals it afterwards.
+	*/
+	LineOACarryToken bool
 	// BranchMap turns a legacy branch code ("01".."08") into the V4 branch_code that
 	// POST /v3/import/clinics allocated for it ("BR00001"…). Empty keeps the original
 	// single-branch behaviour: every row is stamped with BranchCode, which is what the
