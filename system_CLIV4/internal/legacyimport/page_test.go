@@ -1,6 +1,7 @@
 package legacyimport
 
 import (
+	"path"
 	"strings"
 	"testing"
 )
@@ -423,5 +424,136 @@ func TestPageReportsKindBreakdown(t *testing.T) {
 	}
 	if !strings.Contains(found, "note 1") {
 		t.Errorf("note %q should count this fixture's single OPD page as note", found)
+	}
+}
+
+// ── PhotoNameSalt ────────────────────────────────────────────────────────────
+//
+// A clinic can be RENAMED between two imports of the same clinic. The imported file
+// name is hash(salt + rev_id) and it is the ONLY link from a V2 revision to the photos
+// row V4 already holds, because the owner declined a migrate_source_ref column. So a
+// top-up run for a renamed clinic has to salt with the OLD code or it renames every
+// page and re-imports scans that are already there.
+//
+// Measured on the-gloss (C2EC1E3) on 20 Oct 2026: BR00001's 14,385 photo rows are named
+// under CD1B8AF, BR00002's 10,734 under C2EC1E3 — the two branches were imported either
+// side of the rename. Salting BR00001 with the current code matched 0 of its rows.
+
+// Default behaviour is unchanged: no salt means the clinic code, which is what every
+// import before this flag existed did. If this breaks, every past manifest stops
+// reproducing.
+func TestPhotoNameSaltDefaultsToClinicCode(t *testing.T) {
+	rep := NewReport("C9D4865")
+	withSalt, err := buildPhotos([]byte(realSample), Input{ClinicCode: "C9D4865", PhotoNameSalt: ""}, rep)
+	if err != nil {
+		t.Fatalf("buildPhotos: %v", err)
+	}
+	rep2 := NewReport("C9D4865")
+	plain, err := buildPhotos([]byte(realSample), Input{ClinicCode: "C9D4865"}, rep2)
+	if err != nil {
+		t.Fatalf("buildPhotos: %v", err)
+	}
+	if withSalt.Files[0].TargetPath != plain.Files[0].TargetPath {
+		t.Errorf("empty salt changed the name: %q vs %q",
+			withSalt.Files[0].TargetPath, plain.Files[0].TargetPath)
+	}
+	// and it is the clinic-code-salted name, explicitly
+	want := "C9D4865/opd-photo/" + photoFileName("C9D4865", "6a69bb1ed60ec9308fa19098") + ".jpg"
+	if plain.Files[0].TargetPath != want {
+		t.Errorf("target_path = %q, want %q", plain.Files[0].TargetPath, want)
+	}
+}
+
+// The property that makes dedup possible: salting clinic B with A's code reproduces the
+// name A's own import produced. Without this, a renamed clinic can never be topped up.
+func TestPhotoNameSaltReproducesTheOldClinicsName(t *testing.T) {
+	rep := NewReport("CD1B8AF")
+	asOld, err := buildPhotos([]byte(realSample), Input{ClinicCode: "CD1B8AF"}, rep)
+	if err != nil {
+		t.Fatalf("buildPhotos old: %v", err)
+	}
+	oldName := path.Base(asOld.Files[0].TargetPath)
+
+	rep2 := NewReport("C2EC1E3")
+	topUp, err := buildPhotos([]byte(realSample),
+		Input{ClinicCode: "C2EC1E3", PhotoNameSalt: "CD1B8AF"}, rep2)
+	if err != nil {
+		t.Fatalf("buildPhotos top-up: %v", err)
+	}
+	newName := path.Base(topUp.Files[0].TargetPath)
+
+	if newName != oldName {
+		t.Fatalf("salted name = %q, want the name the old clinic code produced (%q) — "+
+			"dedup against the existing rows is impossible otherwise", newName, oldName)
+	}
+}
+
+// The salt must move the NAME and nothing else. If it leaked into the directory or into
+// photos.clinic_code, the bytes would land in another tenant's folder and the rows would
+// be stamped with the wrong tenant — far worse than a duplicate.
+func TestPhotoNameSaltDoesNotChangeWhereBytesLandOrTheTenant(t *testing.T) {
+	rep := NewReport("C2EC1E3")
+	man, err := buildPhotos([]byte(realSample),
+		Input{ClinicCode: "C2EC1E3", PhotoNameSalt: "CD1B8AF"}, rep)
+	if err != nil {
+		t.Fatalf("buildPhotos: %v", err)
+	}
+	if man.ClinicCode != "C2EC1E3" {
+		t.Errorf("manifest clinic_code = %q, want the real tenant C2EC1E3", man.ClinicCode)
+	}
+	if man.UploadsSubdir != "C2EC1E3/opd-photo" {
+		t.Errorf("uploads_subdir = %q, want C2EC1E3/opd-photo", man.UploadsSubdir)
+	}
+	if man.UploadsThumbSubdir != "C2EC1E3/opd-photo-thumb" {
+		t.Errorf("uploads_thumb_subdir = %q, want C2EC1E3/opd-photo-thumb", man.UploadsThumbSubdir)
+	}
+	f := man.Files[0]
+	if f.ClinicCode != "C2EC1E3" {
+		t.Errorf("file clinic_code = %q, want C2EC1E3", f.ClinicCode)
+	}
+	if !strings.HasPrefix(f.TargetPath, "C2EC1E3/opd-photo/") {
+		t.Errorf("target_path = %q, want it under the real tenant's dir", f.TargetPath)
+	}
+	if !strings.HasPrefix(f.ThumbTargetPath, "C2EC1E3/opd-photo-thumb/") {
+		t.Errorf("thumb_target_path = %q, want it under the real tenant's thumb dir", f.ThumbTargetPath)
+	}
+	// image and thumbnail keep the SAME name, so the pair stays obvious on disk
+	if path.Base(f.TargetPath) != path.Base(f.ThumbTargetPath) {
+		t.Errorf("image %q and thumb %q no longer share a name",
+			path.Base(f.TargetPath), path.Base(f.ThumbTargetPath))
+	}
+	// the source side is untouched by the salt
+	if !strings.HasPrefix(f.SourcePath, "nas-doctorease/mris_images/page/") {
+		t.Errorf("source_path = %q, want it under the legacy page tree", f.SourcePath)
+	}
+}
+
+// Using a salt that is not the clinic code is unusual enough that it must appear in the
+// report. A silent rename rule is how 14,385 duplicate scans get written.
+func TestPhotoNameSaltOverrideIsReported(t *testing.T) {
+	rep := NewReport("C2EC1E3")
+	if _, err := buildPhotos([]byte(realSample),
+		Input{ClinicCode: "C2EC1E3", PhotoNameSalt: "CD1B8AF"}, rep); err != nil {
+		t.Fatalf("buildPhotos: %v", err)
+	}
+	var said bool
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "CD1B8AF") && strings.Contains(n, "salt") {
+			said = true
+		}
+	}
+	if !said {
+		t.Errorf("the salt override was not reported; notes = %v", rep.Notes)
+	}
+
+	// and the ordinary case must NOT produce that note, or it becomes noise
+	rep2 := NewReport("C2EC1E3")
+	if _, err := buildPhotos([]byte(realSample), Input{ClinicCode: "C2EC1E3"}, rep2); err != nil {
+		t.Fatalf("buildPhotos plain: %v", err)
+	}
+	for _, n := range rep2.Notes {
+		if strings.Contains(n, "salt") {
+			t.Errorf("unsalted run still mentioned the salt: %q", n)
+		}
 	}
 }
