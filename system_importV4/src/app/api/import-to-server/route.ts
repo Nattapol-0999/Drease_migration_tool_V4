@@ -47,8 +47,22 @@ interface Body {
    * images can be filed. SQL first, images second, in that job.
    */
   photoSessionId?: string;
+  /**
+   * Optional. What the imported image file names are hashed from, when it must not be the
+   * clinic code — see PhotoRunOptions.photoNameSalt. Only a clinic that was RENAMED
+   * between two imports needs it, and getting it wrong on such a clinic re-imports every
+   * scan it already has rather than failing.
+   */
+  photoNameSalt?: string;
 }
 
+
+/**
+ * Shape of a clinic_code. Declared here the same way /api/generate and
+ * /api/import-photos declare it, rather than shared: three one-line copies of a regex
+ * are cheaper to read than an import that makes each route's input rules live elsewhere.
+ */
+const CLINIC_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 /** How many characters of psql's own output are put in front of the operator. */
 const PSQL_TAIL_CHARS = 1600;
@@ -147,6 +161,16 @@ export async function POST(req: Request): Promise<Response> {
     }
   }
 
+  // Checked here with the other photo inputs rather than inside the job: a malformed salt
+  // is an immediate answer on the button, not a surprise after the SQL has committed.
+  const photoNameSalt = (body.photoNameSalt ?? "").trim();
+  if (photoNameSalt && !CLINIC_RE.test(photoNameSalt)) {
+    return fail("photoNameSalt ไม่ถูกรูป — ต้องเป็นรูปแบบ clinic_code (A-Z a-z 0-9 _ - ยาวไม่เกิน 64)");
+  }
+  if (photoNameSalt && !photoSessionId) {
+    return fail("ส่ง photoNameSalt มาแต่ไม่ได้แนบไฟล์รูป — salt ใช้กับการนำเข้ารูปเท่านั้น");
+  }
+
   const bytes = genJob.sqlBytes ?? 0;
   const importJobId = await startJob(
     "import",
@@ -164,6 +188,7 @@ export async function POST(req: Request): Promise<Response> {
         user: auth.session.user,
         photoSessionId,
         photoImageBytes,
+        photoNameSalt,
       }),
   );
 
@@ -185,9 +210,11 @@ async function runImport(
     user: string;
     photoSessionId: string;
     photoImageBytes: number;
+    photoNameSalt: string;
   },
 ): Promise<void> {
-  const { target, clinic, sqlPath, bytes, user, photoSessionId, photoImageBytes } = args;
+  const { target, clinic, sqlPath, bytes, user, photoSessionId, photoImageBytes, photoNameSalt } =
+    args;
 
   const started = Date.now();
   const r = await runSSHFromFile(sshArgs(target, psqlCommand(target)), sqlPath);
@@ -272,6 +299,14 @@ async function runImport(
   // operator their data did not land, which would be false.
   const cli = process.env.IMPORT_CLI_PATH ?? "";
   h.addLog(`เริ่มนำเข้ารูป — ไฟล์รูป ${(photoImageBytes / 1048576).toFixed(1)} MB`);
+  // Said in the log, not only in the request: which naming rule was used decides whether a
+  // later top-up sees these rows or imports them again, and the log is what survives.
+  if (photoNameSalt && photoNameSalt !== clinic) {
+    h.addLog(
+      `ชื่อไฟล์รูปใช้ salt "${photoNameSalt}" ไม่ใช่ "${clinic}" — ใช้เมื่อคลินิกเปลี่ยนโค้ดหลังนำเข้ารอบก่อน ` +
+        `เพื่อให้ชื่อไฟล์ตรงกับแถวที่ปลายทางมีอยู่แล้ว (ไฟล์ยังลงใต้ ${clinic} และ photos.clinic_code ยังเป็น ${clinic})`,
+    );
+  }
   try {
     const photo = await executePhotoImport({
       cli,
@@ -280,6 +315,7 @@ async function runImport(
       sessionId: photoSessionId,
       mode: "apply",
       user,
+      photoNameSalt,
       onPhase: (p) => h.setPhase(p),
     });
     h.setPhotoResult({

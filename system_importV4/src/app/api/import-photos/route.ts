@@ -65,6 +65,16 @@ export async function POST(req: Request): Promise<Response> {
     );
   }
 
+  // Optional: what the imported file names are hashed from, when it must not be the
+  // clinic code. Needed for a clinic that was RENAMED between two imports — the name is
+  // the only identity `photos` keeps, so a top-up has to re-derive the names the existing
+  // rows were given or it imports every scan a second time. Validated to the same shape
+  // as a clinic code because that is what it always is.
+  const photoNameSalt = String(form.get("photoNameSalt") ?? "").trim();
+  if (photoNameSalt && !CLINIC_RE.test(photoNameSalt)) {
+    return fail("photoNameSalt ไม่ถูกรูป — ต้องเป็นรูปแบบ clinic_code (A-Z a-z 0-9 _ - ยาวไม่เกิน 64)");
+  }
+
   // apply retypes the clinic_code, the same gate the SQL import uses. It is the last thing
   // standing between "wrong tenant selected ten minutes ago" and rows in a real patient
   // record.
@@ -83,6 +93,7 @@ export async function POST(req: Request): Promise<Response> {
       sessionId,
       mode,
       user: auth.session.user,
+      photoNameSalt,
     });
     return Response.json({ ok: true, ...result });
   } catch (err) {
