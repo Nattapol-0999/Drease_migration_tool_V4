@@ -64,11 +64,18 @@ func main() {
 		// Per-SITE, not per-clinic: each site of a multi-site tenant runs its own V2 and
 		// issues the same running numbers, while V4 keeps one number space per clinic.
 		docNoMarker = flag.String("doc-no-branch-marker", "",
-			"เลขหลักเดียว 1-9 แทรกเป็นตัวที่ 3 ของเลขที่เอกสารเดิม (670017358 → 672017358 · C670017358 → C672017358) — ใช้เมื่อนำเข้าหลายสาขาที่ระบบเก่าออกเลขชุดเดียวกัน (เว้นว่าง = ใช้เลขเดิม)")
+			"เลขหลักเดียว 1-9 ที่จะไป*แทนที่* หลักที่ 3 ของส่วนตัวเลขในเลขที่เอกสารเดิม — ไม่ใช่แทรก ความยาวเท่าเดิมเสมอ (670017358 → 672017358 · C670017358 → C672017358) · ทำเฉพาะเมื่อหลักนั้นเป็น 0 อยู่แล้ว ดู applyDocNoBranchMarker · ใช้เมื่อนำเข้าหลายสาขาที่ระบบเก่าออกเลขชุดเดียวกัน (เว้นว่าง = ใช้เลขเดิม)")
 
 		// V2 keeps one stock list; V4 has two kinds of stock and treats them differently at
 		// the till. Default stays 'drug' so no existing command line changes meaning — see
 		// Input.StockItemType for the measured reason this had to become an option.
+		// Separates the photo file-name salt from the clinic code. Needed when a clinic
+		// was RENAMED between two imports: the name is the only link from a V2 revision
+		// to the photos row V4 already holds, so a top-up has to salt with whatever the
+		// existing rows were named under or it re-imports every scan. See
+		// legacyimport.Input.PhotoNameSalt.
+		photoNameSalt = flag.String("photo-name-salt", "",
+			"ค่าที่ใช้ผสมกับ rev_id เพื่อตั้งชื่อไฟล์รูป (เว้นว่าง = ใช้ -clinic ซึ่งเป็นค่าที่ถูกสำหรับการนำเข้าครั้งแรก) — ตั้งเป็นโค้ดคลินิก*เดิม*เมื่อเติมรูปให้คลินิกที่เคยเปลี่ยนโค้ด ไม่งั้นรูปที่มีอยู่แล้วจะถูกนำเข้าซ้ำทั้งหมด · ไม่กระทบที่เก็บไฟล์และไม่กระทบ photos.clinic_code")
 		stockItemType = flag.String("stock-item-type", "drug",
 			"ประเภทของรหัสในคลัง: drug (ยา ต้องมีฉลาก 5 ช่องก่อนขาย) หรือ goods (สินค้า ขายได้ทันที) — ดัมพ์ V2 ไม่มีข้อมูลฉลากเลย ถ้าคลังไม่ใช่ยาจริงให้ใช้ goods")
 
@@ -125,6 +132,7 @@ func main() {
 
 	in := legacyimport.Input{
 		ClinicCode:        strings.TrimSpace(*clinic),
+		PhotoNameSalt:     strings.TrimSpace(*photoNameSalt),
 		OwnerUsername:     strings.TrimSpace(*owner),
 		Groups:            splitCSV(*only),
 		BranchMap:         parsedBranchMap,

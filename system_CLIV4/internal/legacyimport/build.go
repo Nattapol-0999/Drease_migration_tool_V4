@@ -41,6 +41,22 @@ type Input struct {
 	// ClinicCode is the tenant every generated row is stamped with. The clinic must
 	// already exist in V4 — see BuildScript's guard.
 	ClinicCode string
+	// PhotoNameSalt is what photoFileName() hashes with the revision id to name an
+	// imported image on disk. Empty means ClinicCode, which is what every first-time
+	// import wants and what every past import did.
+	//
+	// It exists because a clinic's code can CHANGE between two imports of the same
+	// clinic, and the file name is the only thing tying a V2 revision to the row V4
+	// already holds. Measured on the-gloss (C2EC1E3) on 20 Oct 2026: its BR00001 photos
+	// were named under the clinic's old code CD1B8AF and its BR00002 photos under
+	// C2EC1E3, because the two branches were imported either side of the rename. A
+	// top-up run that salted BR00001 with the current code would give all 14,526 of its
+	// pages new names and re-import 14,385 scans V4 already has.
+	//
+	// So this is a dedup control, not a cosmetic one: set it to whatever the EXISTING
+	// rows for that branch were named under. It never affects where the bytes land
+	// (that is ClinicCode + photoCategory) nor photos.clinic_code.
+	PhotoNameSalt string
 	// OwnerUsername is the legacy `users.code` (login name) of the ONE account that
 	// becomes the clinic owner. Every other imported account becomes counter_staff.
 	// Required whenever a users dump is supplied; a users dump with no matching row is

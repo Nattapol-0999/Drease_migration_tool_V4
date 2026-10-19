@@ -257,6 +257,22 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 		UploadsThumbSubdir: path.Join(in.ClinicCode, photoThumbCategory),
 	}
 
+	// What the file NAME is salted with. Defaults to the clinic code, which is what it
+	// has always been and what a first import wants. It is overridable only because a
+	// clinic can be renamed between two imports, and the name is the sole link from a V2
+	// revision to a photos row already at the target — see Input.PhotoNameSalt. Note
+	// this changes the NAME only: the bytes still land under in.ClinicCode above, and
+	// photos.clinic_code is still in.ClinicCode.
+	nameSalt := strings.TrimSpace(in.PhotoNameSalt)
+	if nameSalt == "" {
+		nameSalt = in.ClinicCode
+	}
+	if nameSalt != in.ClinicCode {
+		rep.notef("photos: ตั้งชื่อไฟล์โดยใช้ salt %q ไม่ใช่ %q — ใช้เมื่อคลินิกเปลี่ยนโค้ดหลังนำเข้ารอบก่อน "+
+			"เพื่อให้ชื่อไฟล์ตรงกับแถวที่ V4 มีอยู่แล้ว (ไฟล์ยังลงใต้ %q และ photos.clinic_code ยังเป็น %q)",
+			nameSalt, in.ClinicCode, man.UploadsSubdir, in.ClinicCode)
+	}
+
 	// dedupe within the manifest itself. Two revisions cannot share a rev_id, but a
 	// malformed export could repeat a document, and copying the same bytes twice would
 	// produce two rows for one image.
@@ -325,7 +341,7 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				ext = ".jpg"
 			}
 
-			target := path.Join(man.UploadsSubdir, photoFileName(in.ClinicCode, revID)+ext)
+			target := path.Join(man.UploadsSubdir, photoFileName(nameSalt, revID)+ext)
 			if seenTarget[target] {
 				e.skip("rev ซ้ำในไฟล์ต้นทาง (rev_id เดียวกันปรากฏสองครั้ง)")
 				continue
@@ -380,7 +396,7 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				// derived from clinic + rev_id.
 				ThumbSourcePath: path.Join(nasFolder, legacyThumbSubdir, url),
 				ThumbTargetPath: path.Join(man.UploadsThumbSubdir,
-					photoFileName(in.ClinicCode, revID)+ext),
+					photoFileName(nameSalt, revID)+ext),
 				HN:         hn,
 				ClinicCode: in.ClinicCode,
 				TakenAt:    takenAt,
