@@ -53,6 +53,25 @@ export interface PhotoRunOptions {
   sessionId: string;
   /** survey plans and reports; apply also ships bytes and writes rows. */
   mode: "survey" | "apply";
+  /**
+   * What the CLI hashes with the revision id to NAME each imported image, when it must
+   * not be the clinic code. Empty is the normal case and means the clinic code.
+   *
+   * It exists because `photos` has no migrate_source_ref column — the owner declined one
+   * — so the file name is the only thing that tells "already imported" from "import
+   * again" by identity. A clinic whose CODE changed between two imports therefore has
+   * rows named under the OLD code, and a top-up that re-derives names from the current
+   * one matches none of them.
+   *
+   * Measured on the-gloss (C2EC1E3) on 20 Oct 2026: BR00001's 14,385 rows are named under
+   * CD1B8AF and BR00002's 10,734 under C2EC1E3, the two branches having been imported
+   * either side of the rename. Left unset for BR00001, a top-up gives all 14,526 of its
+   * pages fresh names.
+   *
+   * Only the name moves: the bytes still land under the clinic's own uploads dir and
+   * photos.clinic_code is still the clinic.
+   */
+  photoNameSalt?: string;
   /** Recorded in the audit line, so "who did this" survives in the log. */
   user: string;
   /** Optional progress sink — the job-based caller shows these to the operator. */
@@ -82,6 +101,14 @@ export interface PhotoRunResult {
   rows: number;
   report: string;
   trim: string;
+  /**
+   * The value the file names were actually derived from — the clinic code unless the
+   * operator overrode it. Reported rather than assumed: this is the field that decides
+   * whether a top-up recognises the rows already at the target.
+   */
+  photoNameSalt: string;
+  /** True when the salt is not the clinic code, so the UI can say so loudly. */
+  photoNameSaltOverridden: boolean;
   source: "staged";
   sourceBytes: { page: number; images: number };
   /** survey only: the INSERT statements that apply would run. */
@@ -121,6 +148,7 @@ export class PhotoRunError extends Error {
 export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRunResult> {
   const { cli, clinic, targetId, sessionId, mode, user, onPhase } = opts;
   const phase = (s: string) => onPhase?.(s);
+  const photoNameSalt = (opts.photoNameSalt ?? "").trim();
 
   // Where the rows go (database host) and where the bytes go (backend host) are two
   // different machines, and BOTH must be configured before anything is unpacked.
@@ -186,10 +214,18 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       );
     }
 
-    phase("อ่านแผนคัดลอกรูปจาก CLI");
+    phase(
+      photoNameSalt
+        ? `อ่านแผนคัดลอกรูปจาก CLI (salt ชื่อไฟล์ ${photoNameSalt})`
+        : "อ่านแผนคัดลอกรูปจาก CLI",
+    );
     let report: string;
     try {
-      const { stdout } = await run(cli, ["-clinic", clinic, "-page", pagePath, "-out", work], {
+      // The salt is passed ONLY when the operator asked for one, so the command line of
+      // an ordinary run is byte-identical to every run before this option existed.
+      const cliArgs = ["-clinic", clinic, "-page", pagePath, "-out", work];
+      if (photoNameSalt) cliArgs.push("-photo-name-salt", photoNameSalt);
+      const { stdout } = await run(cli, cliArgs, {
         maxBuffer: 32 * 1024 * 1024,
         windowsHide: true,
       });
@@ -235,6 +271,11 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       trim: trimLog,
       source: "staged",
       sourceBytes: { page: stagedPageBytes, images: stagedImageBytes },
+      // Echoed back so the operator can see on screen which naming rule the run used.
+      // A salt that silently differs from the clinic code is how a top-up writes a second
+      // copy of every scan the clinic already has.
+      photoNameSalt: photoNameSalt || clinic,
+      photoNameSaltOverridden: photoNameSalt !== "" && photoNameSalt !== clinic,
     };
 
     if (mode === "survey") {

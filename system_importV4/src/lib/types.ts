@@ -782,6 +782,15 @@ interface PhotoImportBase {
   rows: number;
   /** The CLI's own stdout: counts, skipped revisions, warnings. */
   report: string;
+  /**
+   * What the file names were actually derived from — the clinic code unless the operator
+   * overrode it for a clinic that was renamed after an earlier import. Echoed back rather
+   * than assumed, because it is the value that decides whether this run recognises the
+   * rows already at the target or imports a second copy of all of them.
+   */
+  photoNameSalt: string;
+  /** True when that value is not the clinic code, so the screen can say so. */
+  photoNameSaltOverridden: boolean;
 }
 
 /** One image the live upload endpoint would turn away, with the reason in Thai. */
