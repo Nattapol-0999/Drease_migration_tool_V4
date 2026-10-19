@@ -448,6 +448,13 @@ export default function GenerateForm() {
   const [photoDone, setPhotoDone] = useState<string | null>(null);
   const [photoLog, setPhotoLog] = useState<string | null>(null);
   const [photoConfirm, setPhotoConfirm] = useState("");
+  /**
+   * What the imported image file names are derived from. Blank — the normal case — means
+   * the clinic code. Filled only for a clinic whose code CHANGED after an earlier photo
+   * import: `photos` keeps no source reference, so the file name is the only identity, and
+   * re-deriving it from the new code makes every scan already at the target look new.
+   */
+  const [photoNameSalt, setPhotoNameSalt] = useState("");
   // The upload the photo step's two files were put in, kept so survey → apply does not
   // send 530 MB twice. Cleared whenever either file changes (see the effect below), so a
   // reused session can only ever hold the files currently attached.
@@ -1045,6 +1052,10 @@ export default function GenerateForm() {
       body.append("targetId", targetId);
       body.append("clinicCode", clinic.trim());
       body.append("sessionId", sid);
+      // Empty is the normal case and means "name the files after this clinic". It is only
+      // filled for a clinic that was RENAMED after an earlier photo import — see the note
+      // beside the field.
+      if (photoNameSalt.trim()) body.append("photoNameSalt", photoNameSalt.trim());
       if (mode === "apply") body.append("confirm", photoConfirm.trim());
 
       setPhotoBusy(mode);
@@ -1595,6 +1606,8 @@ export default function GenerateForm() {
           // Empty means "SQL only" on the server side too, so the decision above is the
           // only place it is made.
           photoSessionId: withPhotos ? photoSession : "",
+          // Only meaningful alongside images, and the server rejects it without them.
+          photoNameSalt: withPhotos ? photoNameSalt.trim() : "",
         }),
       });
       const text = await res.text();
@@ -2470,6 +2483,42 @@ export default function GenerateForm() {
                 if (!imgFile && !pulledImages) need.push("ไฟล์รูป (.tar.gz)");
                 return (
                   <>
+                    {/*
+                      Only a clinic that was RENAMED after an earlier photo import needs
+                      this, and it has to be set BEFORE the survey, because the survey is
+                      what reveals how many names match what the target already holds.
+                      Left blank it behaves exactly as it always did.
+                    */}
+                    <details style={{ marginBottom: 8 }}>
+                      <summary className="muted" style={{ fontSize: 12, cursor: "pointer" }}>
+                        เติมรูปให้คลินิกที่เคยเปลี่ยน clinic_code (ปกติไม่ต้องแตะ)
+                      </summary>
+                      <div style={{ marginTop: 6 }}>
+                        <label>clinic_code เดิมที่ใช้ตั้งชื่อไฟล์รูปรอบก่อน</label>
+                        <input
+                          type="text"
+                          value={photoNameSalt}
+                          onChange={(e) => setPhotoNameSalt(e.target.value)}
+                          placeholder={`เว้นว่าง = ${clinic.trim()} (ค่าปกติ)`}
+                        />
+                        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                          ชื่อไฟล์รูปที่นำเข้าคือ hash ของ clinic_code + rev_id และเป็น
+                          <b>สิ่งเดียว</b>ที่บอกว่ารูปนั้นนำเข้าไปแล้วหรือยัง เพราะตาราง{" "}
+                          <code>photos</code> ไม่มีคอลัมน์อ้างอิงต้นทาง · ถ้าคลินิกเปลี่ยนโค้ด
+                          หลังนำเข้ารูปรอบก่อน ต้องกรอกโค้ด<b>เดิม</b>ที่นี่ ไม่งั้นรูปที่มีอยู่แล้ว
+                          จะถูกมองว่าเป็นรูปใหม่และนำเข้าซ้ำทั้งหมด · ตัวนี้เปลี่ยนแค่
+                          <b>ชื่อไฟล์</b> ไฟล์ยังลงใต้ <code>{clinic.trim() || "clinic"}</code> และ{" "}
+                          <code>photos.clinic_code</code> ยังเป็นคลินิกนี้
+                        </div>
+                        {photoNameSalt.trim() && photoNameSalt.trim() !== clinic.trim() && (
+                          <div className="msg warn" style={{ marginTop: 6 }}>
+                            ชื่อไฟล์จะถูกตั้งจาก <code>{photoNameSalt.trim()}</code> ไม่ใช่{" "}
+                            <code>{clinic.trim()}</code> — กด “ตรวจก่อน” แล้วดูว่าจำนวนไฟล์ที่ตรงกับ
+                            ต้นทางสมเหตุสมผลก่อนนำเข้าจริง
+                          </div>
+                        )}
+                      </div>
+                    </details>
                     <div className="row" style={{ marginBottom: 4 }}>
                       <button
                         className="secondary"
