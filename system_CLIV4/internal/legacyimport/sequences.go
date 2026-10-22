@@ -6,7 +6,7 @@ import "fmt"
 buildSequenceBump advances the per-clinic running-number counters past the codes this
 import just wrote.
 
-WHY THIS EXISTS
+# WHY THIS EXISTS
 
 V4 mints a new code by bumping `sequences` and formatting the result: a new course is
 `CS%05d` from sequences.type='course', a new service is `LH%05d` from type='listheal'
@@ -35,7 +35,7 @@ WHAT IT DOES NOT TOUCH, AND WHY
   - requisition (RQ) — no requisition documents come from V2.
   - room / doctor / branch — already advanced by the people phase.
 
-HOW THE VALUE IS CHOSEN
+# HOW THE VALUE IS CHOSEN
 
 Read back out of `catalog_item` with max() rather than passed in from Go. The counter
 then reflects what is ACTUALLY at the target, including rows from an earlier run of this
