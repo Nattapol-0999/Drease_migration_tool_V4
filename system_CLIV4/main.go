@@ -270,9 +270,12 @@ var combinedTables = []struct {
 	{"patient", "patient", func(in *legacyimport.Input) *[]byte { return &in.PatientDump }},
 	{"patient_address", "patient_address (ที่อยู่คนไข้)", func(in *legacyimport.Input) *[]byte { return &in.AddressDump }},
 	{"appointment", "appointment", func(in *legacyimport.Input) *[]byte { return &in.AppointmentDump }},
-	// Not imported — read only by -survey-branches, which is why the entity column says
-	// so out loud. See knownUnsupported below for the same fact from the other side.
-	{"branch", "ทะเบียนสาขา (อ่านเพื่อสำรวจเท่านั้น ไม่นำเข้า)", func(in *legacyimport.Input) *[]byte { return &in.BranchDump }},
+	// No table is written FROM branch, but it is not optional either: branch.stock_id is
+	// what decides the branch of every slot_stock lot (see stockOwners). Calling it
+	// survey-only is what invited leaving it out, and leaving it out used to send a whole
+	// clinic's inventory to the central warehouse while still reporting success. buildItems
+	// now refuses that, so the label has to say why the table is wanted.
+	{"branch", "ทะเบียนสาขา (ไม่ได้เขียนลงตารางใด แต่ branch.stock_id เป็นตัวกำหนดสาขาของทุกล็อตสต็อก — จำเป็นเมื่อนำเข้าคลัง)", func(in *legacyimport.Input) *[]byte { return &in.BranchDump }},
 }
 
 // knownUnsupported are tables an operator will reasonably expect to be imported when
@@ -280,8 +283,10 @@ var combinedTables = []struct {
 // difference between a limitation and a silent data loss.
 var knownUnsupported = map[string]string{
 	"patient_diag": "การวินิจฉัย — เวชระเบียนยังไม่อยู่ในเฟสนี้",
-	"branch":       "สาขา — V4 ใช้ตาราง clinic เป็นทะเบียนสาขา สร้างตอนตั้งคลินิก",
-	"clinic_room":  "ชนิดห้อง (lookup) — V4 ไม่มีตารางเทียบ",
+	// Read, and needed — just not copied into a table of its own. Said here too because an
+	// operator who skips it on the strength of this list breaks the stock import.
+	"branch":      "สาขา — V4 ใช้ตาราง clinic เป็นทะเบียนสาขา สร้างตอนตั้งคลินิก · แต่ยังต้องส่งตารางนี้มา เพราะ branch.stock_id เป็นตัวกำหนดสาขาของทุกล็อตสต็อก",
+	"clinic_room": "ชนิดห้อง (lookup) — V4 ไม่มีตารางเทียบ",
 }
 
 func combinedTableNames() []string {
