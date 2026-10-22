@@ -37,7 +37,10 @@ func TestASKUCostWithThreePlacesIsRoundedTheWayPostgresWould(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	in := Input{ClinicCode: "C01B42B"}
+	// Carries the branch registry because buildItems refuses an export whose lots name a
+	// stock with no registry to resolve it. These lots' stock belongs to no branch in the
+	// fixture, so they land in MAIN_STOCK exactly as before; this test is about rounding.
+	in := Input{ClinicCode: "C01B42B", BranchDump: branchRegistryWithStocks()}
 	rep := NewReport(in.ClinicCode)
 	itemsSQL, catalogSQL, slotSQL, _, err := buildItems(mc, in, rep)
 	if err != nil {
@@ -99,6 +102,7 @@ func TestTheWidthGuardLetsARoundedCostThroughButStillStopsAThreePlacePrice(t *te
 		DefaultBranch: "BR00001",
 		Groups:        []string{"catalog"},
 		MongoDump:     []byte(threePlaceCosts),
+		BranchDump:    branchRegistryWithStocks(),
 	})
 	if err != nil {
 		t.Fatalf("a three-place cost still refuses the file: %v", err)
@@ -110,6 +114,7 @@ func TestTheWidthGuardLetsARoundedCostThroughButStillStopsAThreePlacePrice(t *te
 		DefaultBranch: "BR00001",
 		Groups:        []string{"catalog"},
 		MongoDump:     []byte(price),
+		BranchDump:    branchRegistryWithStocks(),
 	})
 	if err == nil {
 		t.Fatal("a three-place SELLING price went through — decision ก covers the cost only")

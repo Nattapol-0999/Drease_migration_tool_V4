@@ -625,6 +625,34 @@ func buildItems(mc *mongoCatalog, in Input, rep *Report) (itemsSQL, catalogSQL, 
 	if oerr != nil {
 		return "", "", "", "", oerr
 	}
+	// An ABSENT branch table is a different answer from an unparsable one, and it is the
+	// more dangerous of the two because nothing goes wrong on the way out: every lot falls
+	// through to "no branch claims this stock", the whole clinic's inventory lands in
+	// MAIN_STOCK, and the run reports success.
+	//
+	// stockOwners' own contract already says an empty map means "cannot tell, NOT everything
+	// is central". This is the caller, so this is where that has to be enforced.
+	//
+	// Measured on C6C936C: a run whose -sql omitted the branch table sent all 3,504 lots to
+	// the central warehouse, and the only sign was a note saying 0 branches had a stock
+	// bound. The mirror of the same mistake, reading stocks.stock_branch instead of the
+	// reference, put the warehouse's 566 lots on one branch's shelf and took ฿15.8M of stock
+	// value with them.
+	//
+	// Conditional on a document actually naming a stock: a lot with no stock reference is a
+	// separate case the loop below drops row by row, and a clinic whose export has no stock
+	// at all must still be importable.
+	if len(stockOwner) == 0 {
+		for _, d := range mc.items {
+			if docObjectID(d, "stock") == "" {
+				continue
+			}
+			return "", "", "", "", fmt.Errorf(
+				"ตาราง branch ไม่มีสาขาใดผูกคลังไว้เลย (ไม่มีคอลัมน์ stock_id หรือไม่ได้ส่งตารางมา) " +
+					"แต่ items อ้างถึงคลัง — ถ้านำเข้าต่อ ล็อตสต็อกทั้งหมดจะไปกองอยู่คลังกลาง (MAIN_STOCK) " +
+					"โดยที่รายงานยังขึ้นว่าสำเร็จ · ใส่ตาราง branch ที่มีคอลัมน์ stock_id ลงใน -sql แล้วรันอีกครั้ง")
+		}
+	}
 
 	// One value for the whole stock collection, resolved by BuildAll (which also rejects an
 	// unknown one), so every row below agrees and the report can name it once.

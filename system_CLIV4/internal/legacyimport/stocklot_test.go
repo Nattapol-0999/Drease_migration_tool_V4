@@ -192,6 +192,62 @@ func TestWithNoBranchMapEveryLotStillLandsOnTheSingleBranch(t *testing.T) {
 	}
 }
 
+func TestWithNoBranchTableTheBuildRefusesInsteadOfSendingEveryLotToMainStock(t *testing.T) {
+	// The failure this guards is silent, which is the whole reason it needs a test of its
+	// own. With no branch table stockOwners returns an empty map, every lot falls through to
+	// "no branch claims this stock", the clinic's entire inventory lands in MAIN_STOCK, and
+	// the run reports success. Measured on C6C936C: 3,504 lots sent to the central warehouse
+	// with nothing but a note saying 0 branches had a stock bound.
+	//
+	// TestStockOwnersWithNoBranchTableCannotTellRatherThanGuessing already pins the helper.
+	// This pins the CALLER, which is where the damage was done.
+	mc, err := parseMongoCatalog(lotsAcrossThreeKindsOfStock())
+	if err != nil {
+		t.Fatalf("parse mongo: %v", err)
+	}
+	_, _, slotSQL, _, err := buildItems(mc, Input{
+		ClinicCode: "MBLOT1",
+		BranchMap:  tickedSeven(),
+	}, NewReport("MBLOT1"))
+
+	if err == nil {
+		t.Fatalf("buildItems accepted an export with no branch table and wrote %d lot(s) instead of refusing",
+			strings.Count(slotSQL, "INSERT INTO slot_stock"))
+	}
+	// The operator has to be able to act on it, so the message names the table, the column
+	// that carries the answer, and where the lots would otherwise have gone.
+	for _, want := range []string{"branch", "stock_id", MainStockBranchCode} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q, so nobody can tell what to fix: %v", want, err)
+		}
+	}
+	// A caller that logs the error but uses the strings anyway must get nothing to write.
+	if slotSQL != "" {
+		t.Errorf("SQL was returned alongside the refusal:\n%s", slotSQL)
+	}
+}
+
+func TestALotWithNoStockReferenceIsDroppedRowByRowNotRefusedWholesale(t *testing.T) {
+	// The refusal above is about an export whose lots DO name a location while the registry
+	// that resolves it is missing. A document with no stock reference at all is a different
+	// case the loop drops one row at a time, and it must not take the whole import down -
+	// otherwise one malformed item would block a clinic that has no stock worth importing.
+	mc, err := parseMongoCatalog([]byte(`db.getCollection("items").insert([
+  { _id: ObjectId("aa0000000000000000000009"), code: "NO-STOCK", name1: "ยาที่ไม่ได้ระบุคลัง", quantity: "1", quantity_total: "1", cost: "5", price: "9", active: true }
+]);
+`))
+	if err != nil {
+		t.Fatalf("parse mongo: %v", err)
+	}
+	_, _, slotSQL, _, err := buildItems(mc, Input{ClinicCode: "MBLOT1"}, NewReport("MBLOT1"))
+	if err != nil {
+		t.Fatalf("an item with no stock reference must be dropped, not refused: %v", err)
+	}
+	if strings.Contains(slotSQL, "NO-STOCK") {
+		t.Errorf("a lot with no stock reference was written anyway:\n%s", slotSQL)
+	}
+}
+
 // lotHasBranch reports whether the statement that mentions lotCode also carries branchCode.
 // Matching within the one statement matters: the file holds several, and a substring search
 // across the whole script would pass on another lot's branch.

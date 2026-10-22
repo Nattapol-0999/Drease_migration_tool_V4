@@ -65,7 +65,12 @@ func TestDrugCatalogRowResolvesItsCategory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	in := Input{ClinicCode: "CCAT01", BranchMap: map[string]string{"01": "BR00001"}}
+	// The branch registry is supplied because buildItems now refuses an export whose lots
+	// name a stock while nothing says which branch owns it. This fixture's lot sits in the
+	// warehouse stock, which the registry deliberately leaves unclaimed, so the lot still
+	// goes to MAIN_STOCK and nothing about the category assertions changes.
+	in := Input{ClinicCode: "CCAT01", BranchMap: map[string]string{"01": "BR00001"},
+		BranchDump: branchRegistryWithStocks()}
 	catSQL, _ := buildCategoryOne(t, twoKindsOfCategory)
 	_, drugSQL, _, _, err := buildItems(mc, in, NewReport(in.ClinicCode))
 	if err != nil {
