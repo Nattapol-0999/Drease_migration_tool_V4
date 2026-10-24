@@ -18,7 +18,7 @@ export const CLI_INPUTS = [
     // (mris): the parser selects by collection name and ignores the rest, so appending one
     // export to the other is all it takes. One attachment, two things read out of it.
     label: "MongoDB (.js)",
-    hint: "แคตตาล็อก: category → catalog_category · items → items + catalog_item(drug) + slot_stock · listheals → บริการ · course_items → คอร์ส · page → รูปหน้าเวชระเบียน (photos)",
+    hint: "แคตตาล็อก: category → catalog_category · items → items + catalog_item(drug) + slot_stock · listheals → บริการ · listheal_medicine → สูตรวัสดุของบริการ · course_items → คอร์ส (+ ทะเบียน courses) · page → รูปหน้าเวชระเบียน (photos)",
   },
 ] as const;
 
@@ -146,7 +146,11 @@ export const IMPORT_GROUPS = [
   { group: "rooms", label: "ห้อง", detail: "room" },
   { group: "patients", label: "คนไข้", detail: "patient" },
   { group: "appointments", label: "นัด", detail: "appointment" },
-  { group: "catalog", label: "แคตตาล็อก", detail: "catalog_category · บริการ · items · ยา · คอร์ส" },
+  {
+    group: "catalog",
+    label: "แคตตาล็อก",
+    detail: "catalog_category · บริการ + สูตรวัสดุ · items · ยา · คอร์ส (+ ทะเบียน courses)",
+  },
   { group: "stock", label: "สต็อก (ล็อต)", detail: "slot_stock" },
   {
     group: "money",

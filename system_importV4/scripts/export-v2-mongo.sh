@@ -4,8 +4,8 @@
 # WHY THIS EXISTS
 # Exporting a whole legacy Mongo database produces a file far larger than the upload path
 # accepts (nginx client_max_body_size 64m, and the route buffers the body in ~900 MB of
-# RAM). Everything outside the twelve collections below is discarded by the CLI parser
-# anyway, so sending it costs upload time and buys nothing.
+# RAM). Everything outside the collections below is discarded by the CLI parser anyway,
+# so sending it costs upload time and buys nothing.
 #
 # WHERE TO RUN IT
 # On the legacy (V2) server, as a user that can reach mongod. It only reads.
@@ -25,11 +25,13 @@ OUT="${OUT:-/tmp/v2-import.js}"
 # The collections system_CLIV4 actually reads. Verified against the source, not guessed:
 #   catalog.go  items · listheals · course_items · category · kind · item_types ·
 #               item_units · stocks · bills · payment_summary · course_bills
+#   servicebom.go listheal_medicine (a service's material recipe → catalog_item_child
+#               relation_kind='bom', owner's decision 24 Oct 2026)
 #   page.go     page
 #   linebind.go line_patients · pair_logs (pair_logs is read only when a box has no
 #               line_patients — owner's rule, 6 Oct 2026; a box with neither skips LINE)
 # A name not in this list is skipped by the parser, so exporting it is dead weight.
-COLS="category kind item_types item_units stocks items listheals course_items bills payment_summary course_bills page line_patients pair_logs"
+COLS="category kind item_types item_units stocks items listheals listheal_medicine course_items bills payment_summary course_bills page line_patients pair_logs"
 
 # 64 MB is the smallest ceiling on the upload path. The SQL dump shares that budget, so
 # warn well before it: ~50 MB of Mongo leaves room for a 10 MB mysqldump.

@@ -109,9 +109,13 @@ const DEFAULT_TABLES = "users,doctor,clinic,patient,appointment,branch";
 // whichever the box has). Listing one a box does not have costs nothing — an empty or
 // missing collection comes back as "[]" and pullDumpsToFiles skips it by size.
 //
+// listheal_medicine is each service's material recipe, imported as catalog_item_child
+// relation_kind='bom' (owner's decision, 24 Oct 2026).
+//
 // Production sets LEGACY_MONGO_COLLECTIONS, which REPLACES this list rather than adding to
 // it, so a collection added here must be added there too.
-const DEFAULT_COLLECTIONS = "category,items,listheals,course_items,stocks,line_patients,pair_logs";
+const DEFAULT_COLLECTIONS =
+  "category,items,listheals,listheal_medicine,course_items,stocks,line_patients,pair_logs";
 
 // Identifiers are interpolated into a remote command, so they are checked rather than
 // trusted — even though they come from env and not from a request.

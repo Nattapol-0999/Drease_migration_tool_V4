@@ -31,10 +31,11 @@ $ErrorActionPreference = 'Stop'
 
 # 12 collection ที่ system_CLIV4 อ่านจริง อ่านจากซอร์สไม่ใช่จากความจำ:
 #   internal/legacyimport/catalog.go บรรทัด 132-143
+#   internal/legacyimport/servicebom.go (listheal_medicine = สูตรวัสดุของบริการ · 24 ต.ค. 2569)
 #   internal/legacyimport/page.go    บรรทัด 145
 $Keep = @(
   'category', 'kind', 'item_types', 'item_units', 'stocks',
-  'items', 'listheals', 'course_items',
+  'items', 'listheals', 'listheal_medicine', 'course_items',
   'bills', 'payment_summary', 'course_bills',
   'page'
 )
