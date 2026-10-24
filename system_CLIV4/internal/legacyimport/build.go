@@ -436,7 +436,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	// ── the Mongo half: catalog, then the money that references it ──────────────
 
 	needCatalog := wants(EntCatalogCategory, EntCatalogService, EntItems, EntCatalogDrug,
-		EntCatalogCourse, EntCatalogCourseLine)
+		EntCatalogServiceBOM, EntCatalogCourse, EntCatalogCourseLine)
 	needStock := wants(EntSlotStock)
 	needMoney := wants(EntInvoice, EntInvoiceItem, EntReceipt, EntReceiptPayment, EntInvoiceSettle)
 	needEntitlements := wants(EntCourseBoughtPurge, EntCourseBought, EntCourseBoughtItems,
@@ -455,6 +455,9 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 			if out[EntCatalogService], err = buildCatalogServices(mc, in, rep); err != nil {
 				return nil, nil, money, err
 			}
+			// After the services, because it resolves each recipe to the service code that
+			// was WRITTEN — buildCatalogServices re-codes duplicates in mc.healCode.
+			out[EntCatalogServiceBOM] = buildServiceBOM(mc, in, rep)
 			if out[EntCatalogCourse], out[EntCatalogCourseLine], err = buildCourses(mc, in, rep); err != nil {
 				return nil, nil, money, err
 			}

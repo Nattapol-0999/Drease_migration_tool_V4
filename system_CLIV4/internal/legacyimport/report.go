@@ -65,7 +65,7 @@ var entityGroups = map[string][]string{
 	"appointments": {EntAppointment},
 	"catalog": {
 		EntCatalogCategory, EntCatalogService, EntItems, EntCatalogDrug,
-		EntCatalogCourse, EntCatalogCourseLine,
+		EntCatalogServiceBOM, EntCatalogCourse, EntCatalogCourseLine,
 	},
 	// stock is the lots AND their receive ledger, together for the same reason money is
 	// indivisible: V4 opens no lot without a stock_movement row, so importing one without

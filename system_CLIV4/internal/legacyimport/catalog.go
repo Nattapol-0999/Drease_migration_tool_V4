@@ -40,6 +40,7 @@ const (
 	EntSlotStock         = "slot_stock"
 	EntStockMovement     = "stock_movement"
 	EntCatalogService    = "catalog_item(service)"
+	EntCatalogServiceBOM = "catalog_item_child(bom)"
 	EntCatalogCourse     = "catalog_item(course)"
 	EntCatalogCourseLine = "catalog_course_line"
 	EntCatalogPublish    = "catalog_item_channel"
@@ -50,6 +51,8 @@ var catalogOrder = []string{
 	EntCatalogService,
 	EntItems,
 	EntCatalogDrug,
+	// After both of its ends: a recipe edge names a service AND a stock SKU by id.
+	EntCatalogServiceBOM,
 	EntSlotStock,
 	// After the lots, because it resolves each lot's id from slot_stock.mongo_id.
 	EntStockMovement,
@@ -81,13 +84,16 @@ func catalogStatus(itemType string, sellPrice string, labelComplete bool) int {
 
 // mongoCatalog is one parsed export, indexed for lookup.
 type mongoCatalog struct {
-	items        []mongodump.Doc
-	listheals    []mongodump.Doc
-	courseItems  []mongodump.Doc
-	categoryName map[string]string // _id → name
-	kindName     map[string]string // _id → name
-	itemTypeName map[string]string // _id → name
-	itemUnitName map[string]string // _id → name
+	items       []mongodump.Doc
+	listheals   []mongodump.Doc
+	courseItems []mongodump.Doc
+	// listhealMedicine is mris.listheal_medicine: a service's material recipe
+	// ({listheal_id, medicine: [{item_id, numoftime, fixed, …}]}), mapped in servicebom.go.
+	listhealMedicine []mongodump.Doc
+	categoryName     map[string]string // _id → name
+	kindName         map[string]string // _id → name
+	itemTypeName     map[string]string // _id → name
+	itemUnitName     map[string]string // _id → name
 	// No stockBranch index here on purpose. Where a lot lives is decided by
 	// branch.stock_id in the SQL `branch` table (see stockOwners), not by the
 	// stocks.stock_branch string — keeping a second, weaker source of the same answer is
@@ -164,13 +170,14 @@ func parseMongoCatalog(body []byte) (*mongoCatalog, error) {
 	}
 
 	mc := &mongoCatalog{
-		items:        byName["items"],
-		listheals:    byName["listheals"],
-		courseItems:  byName["course_items"],
-		categoryName: indexNames(byName, "category", "name"),
-		kindName:     indexNames(byName, "kind", "name"),
-		itemTypeName: indexNames(byName, "item_types", "name"),
-		itemUnitName: indexNames(byName, "item_units", "name"),
+		items:            byName["items"],
+		listheals:        byName["listheals"],
+		courseItems:      byName["course_items"],
+		listhealMedicine: byName["listheal_medicine"],
+		categoryName:     indexNames(byName, "category", "name"),
+		kindName:         indexNames(byName, "kind", "name"),
+		itemTypeName:     indexNames(byName, "item_types", "name"),
+		itemUnitName:     indexNames(byName, "item_units", "name"),
 
 		healCode:    map[string]string{},
 		bills:       byName["bills"],
