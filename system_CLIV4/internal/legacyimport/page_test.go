@@ -1,6 +1,7 @@
 package legacyimport
 
 import (
+	"encoding/json"
 	"path"
 	"strings"
 	"testing"
@@ -555,5 +556,157 @@ func TestPhotoNameSaltOverrideIsReported(t *testing.T) {
 		if strings.Contains(n, "salt") {
 			t.Errorf("unsalted run still mentioned the salt: %q", n)
 		}
+	}
+}
+
+// ── visit_date ───────────────────────────────────────────────────────────────
+//
+// Images are filed one visit per patient per DAY (owner's decision, 24 Oct 2026). The day
+// is decided here and travels in the manifest as visit_date; the web tool only groups by it.
+
+// withVdFirst swaps the fixture's วันตรวจ for raw, spliced in verbatim so a test can hand
+// over a non-string (null) as well as a string.
+func withVdFirst(raw string) string {
+	return strings.Replace(realSample, `"vd_first": "2026-07-29",`, `"vd_first": `+raw+`,`, 1)
+}
+
+// latestScanAt moves the newest revision's timestamp — the scan the fallback reads.
+func latestScanAt(body, iso string) string {
+	return strings.Replace(body, `ISODate("2026-07-29T08:34:38.796Z")`, `ISODate("`+iso+`")`, 1)
+}
+
+func reportLine(lines []string, needle string) string {
+	for _, s := range lines {
+		if strings.Contains(s, needle) {
+			return s
+		}
+	}
+	return ""
+}
+
+// The day an image is filed under is the page's own วันตรวจ.
+func TestPageVisitDateIsTheV2VisitDate(t *testing.T) {
+	man, rep := buildOne(t, realSample)
+	if got := man.Files[0].VisitDate; got != "2026-07-29" {
+		t.Errorf("visit_date = %q, want the page's vd_first 2026-07-29", got)
+	}
+	line := reportLine(rep.Notes, "วันของ visit")
+	for _, want := range []string{"(vd_first) 1 รูป", "แทน 0 รูป", "→ 1 visit"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("visit-day note = %q, missing %q", line, want)
+		}
+	}
+}
+
+// vd_first wins when the scan came later: a form scanned weeks after the visit belongs to
+// the visit. Scanning late is ordinary, so it is not warned about either.
+func TestPageVisitDateKeepsVdFirstWhenScannedLater(t *testing.T) {
+	man, rep := buildOne(t, withVdFirst(`"2026-07-01"`))
+	if got := man.Files[0].VisitDate; got != "2026-07-01" {
+		t.Errorf("visit_date = %q, want vd_first 2026-07-01 rather than the 2026-07-29 scan", got)
+	}
+	if w := reportLine(rep.Warnings, "หลังวันที่สแกน"); w != "" {
+		t.Errorf("a page scanned after its visit was warned about: %q", w)
+	}
+}
+
+// With no usable vd_first the scan's day is used, read in Bangkok time: 20:00 UTC on the
+// 29th is 03:00 on the 30th at the clinic, and filing it on the 29th would put it in the
+// previous day's visit.
+func TestPageVisitDateFallsBackToTheBangkokScanDay(t *testing.T) {
+	for _, tc := range []struct{ name, raw string }{
+		{"empty", `""`},
+		{"null", `null`},
+		{"day first", `"29/07/2026"`},
+		{"no such day", `"2026-02-30"`},
+		{"carries a time", `"2026-07-29T00:00:00Z"`},
+		{"year zero", `"0000-07-29"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			man, rep := buildOne(t, latestScanAt(withVdFirst(tc.raw), "2026-07-29T20:00:00.000Z"))
+			if got := man.Files[0].VisitDate; got != "2026-07-30" {
+				t.Errorf("visit_date = %q, want the Bangkok day of the 20:00Z scan, 2026-07-30", got)
+			}
+			if line := reportLine(rep.Notes, "วันของ visit"); !strings.Contains(line, "แทน 1 รูป") {
+				t.Errorf("the scan-day fallback was not counted: %q", line)
+			}
+		})
+	}
+}
+
+// A page whose วันตรวจ runs over several days is filed under the first, and says so.
+func TestPageVisitDateSpanningDaysUsesTheFirst(t *testing.T) {
+	body := strings.Replace(realSample, `"vd_last": "2026-07-29",`, `"vd_last": "2026-08-05",`, 1)
+	man, rep := buildOne(t, body)
+	if got := man.Files[0].VisitDate; got != "2026-07-29" {
+		t.Errorf("visit_date = %q, want vd_first 2026-07-29", got)
+	}
+	if reportLine(rep.Notes, "vd_first ≠ vd_last") == "" {
+		t.Errorf("the multi-day page was not reported; notes = %v", rep.Notes)
+	}
+}
+
+// A visit dated after its own scan keeps V2's date — that is the visit V2 shows — but is
+// warned about: a Buddhist-era year (2569 for 2026) looks exactly like this and would open
+// visits five centuries out.
+func TestPageVisitDateAfterTheScanIsKeptAndWarned(t *testing.T) {
+	man, rep := buildOne(t, withVdFirst(`"2569-07-29"`))
+	if got := man.Files[0].VisitDate; got != "2569-07-29" {
+		t.Errorf("visit_date = %q, want V2's own 2569-07-29", got)
+	}
+	w := reportLine(rep.Warnings, "หลังวันที่สแกน")
+	if w == "" || !strings.Contains(w, "016900066") {
+		t.Errorf("no warning naming the patient for a visit dated after its scan; warnings = %v", rep.Warnings)
+	}
+}
+
+// Neither a usable vd_first nor a revision timestamp: there is no day to give. The image is
+// still imported — the web tool files it under its fixed date — and the count is a warning.
+func TestPageWithNoDayAtAllIsWarned(t *testing.T) {
+	body := withVdFirst(`""`)
+	body = strings.Replace(body, `"created_at": ISODate("2026-07-29T08:33:57.787Z"),`, ``, 1)
+	body = strings.Replace(body, `"created_at": ISODate("2026-07-29T08:34:38.796Z"),`, ``, 1)
+	man, rep := buildOne(t, body)
+	if got := man.Files[0].VisitDate; got != "" {
+		t.Errorf("visit_date = %q, want empty when no day can be read", got)
+	}
+	if reportLine(rep.Warnings, "ไม่มีทั้ง vd_first และเวลาสแกน") == "" {
+		t.Errorf("an image with no day was not warned about; warnings = %v", rep.Warnings)
+	}
+}
+
+// Two pages of one patient on two days are two patient-days, i.e. two visits.
+func TestPageVisitDaysAreCountedPerPatientPerDay(t *testing.T) {
+	second := strings.NewReplacer(
+		`6a69baf5846d48306c9757fc`, `6a69baf5846d48306c9757fd`,
+		`6a69bb1ed60ec9308fa19098`, `6a69bb1ed60ec9308fa19099`,
+		`"vd_first": "2026-07-29",`, `"vd_first": "2026-08-02",`,
+	).Replace(realSample)
+	man, rep := buildOne(t, realSample+"\n"+second)
+	if len(man.Files) != 2 {
+		t.Fatalf("got %d files, want 2", len(man.Files))
+	}
+	days := map[string]bool{}
+	for _, f := range man.Files {
+		days[f.VisitDate] = true
+	}
+	if !days["2026-07-29"] || !days["2026-08-02"] {
+		t.Errorf("visit dates = %v, want 2026-07-29 and 2026-08-02", days)
+	}
+	if line := reportLine(rep.Notes, "วันของ visit"); !strings.Contains(line, "→ 2 visit") {
+		t.Errorf("visit-day note = %q, want 2 patient-days", line)
+	}
+}
+
+// The web tool reads the day under exactly this key. A renamed tag would send every image to
+// its scan day without one error anywhere, so the key is pinned.
+func TestPageVisitDateTravelsAsVisitDate(t *testing.T) {
+	man, _ := buildOne(t, realSample)
+	b, err := json.Marshal(man.Files[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"visit_date":"2026-07-29"`) {
+		t.Errorf("manifest entry %s does not carry visit_date", b)
 	}
 }
