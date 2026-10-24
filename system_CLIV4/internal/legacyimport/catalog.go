@@ -304,8 +304,9 @@ func catalogItemIDByCode(clinic, code string) string {
 // upsertCatalogItem renders the canonical catalog_item upsert. Every sellable thing
 // goes through here so there is one shape to review.
 //
-// sourceTable/sourceID tie a drug back to its `items` row the way the app's own
-// CreateSKU does; services and courses carry the default 'catalog'.
+// sourceTable/sourceID tie a row back to its register the way the app's own CreateSKU
+// does: a drug to its `items` row, a course to its `courses` row. Services carry the
+// default 'catalog' with no source_id, which is what V4 writes for a service too.
 //
 // WHY source_id IS IN THE DO UPDATE AND source_table / source_key ARE NOT
 //
@@ -1319,11 +1320,22 @@ func slotDoc(d mongodump.Doc, mongoID string) (string, error) {
 	return string(b), err
 }
 
-// buildCourses maps course_items onto catalog_item(course) + catalog_course, and its
-// list_item[] onto catalog_course_line.
+// buildCourses maps course_items onto courses + catalog_item(course) + catalog_course, and
+// its list_item[] onto catalog_course_line.
 //
-// The legacy collection has NO code, so one is minted per course in dump order (LC001,
-// LC002, …) — deterministic, so re-running the generator produces the same codes.
+// The legacy collection has NO code, so one is minted per course in dump order (CS001,
+// CS002, …) — deterministic, so re-running the generator produces the same codes.
+//
+// # WHY THE `courses` REGISTER IS WRITTEN TOO
+//
+// V4 keeps a course in seven tables, and the course SETTINGS screen reads the oldest one:
+// ListCourses selects FROM courses, and the editor's line queries (course_lines.sql)
+// require the head row to carry source_table='courses' with a source_id. The import used
+// to write the head as source_table='catalog' with no source_id and no register row at
+// all, so an imported course could be sold — checkout reads catalog_item_child — but never
+// opened in the screen that edits it. Measured on production 24 Oct 2026: 3,353 course
+// heads across 31 clinics in that state. This is the shape the app's own Insert writes:
+// the register row first, then the head pointing at it (coursesetting/repo.go).
 func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL string, err error) {
 	if len(mc.courseItems) == 0 {
 		return "", "", nil
@@ -1362,6 +1374,9 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 	for _, c := range mc.healCode {
 		taken[c] = true
 	}
+	// Every code this run writes, for the register guard at the end of the batch — scoped
+	// to these so a pre-existing V4 course elsewhere in the clinic cannot fail the import.
+	var runCodes []string
 
 	for n, d := range mc.courseItems {
 		code := mintCourseCode(n+1, taken)
@@ -1396,9 +1411,65 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 
 		nameThLit, _ := clip(nameTh, 500)
 		nameEnLit, _ := clip(nameEn, 500)
+		periods := intLitDefault(d.Text("number_of_time_total"), 1)
+		days := intLitDefault(d.Text("dayofcourse"), 0)
+		buffet := boolLit(docBool(d, "infinity_use"))
+		createdAt := tsLit(d.Text("created_at"), "now()")
+		clinicLit := lit(in.ClinicCode)
+		codeLit := lit(code)
+		runCodes = append(runCodes, code)
+
 		sCourse.comment("%s · %s (%d รายการในคอร์ส)", code, oneLine(nameTh), childCount)
+
+		// 1 · the register row, only while the code is FREE in both tables.
+		//
+		// A code the catalogue already holds is left exactly as it is. That covers a re-run
+		// (the head and its register row are both there already), a head written by an older
+		// version of this tool as source_table='catalog' — not converted, by the owner's
+		// decision 5ก (24 Oct 2026): this changes how new imports are written, it does not
+		// move old ones — and a row of another type that happens to use the code, which a
+		// register row would only tangle further. A register row with no head is the one
+		// thing that must never be left behind: V4's catalogue sync would mint a head for it
+		// and collide with the code.
+		//
+		// courses.status is the register's DELETE flag (1 = live), not whether the course
+		// sells — that is catalog_item.status, set by the head below. source_key is left to
+		// its column default, as for items: it is a globally unique opaque key, and the
+		// trigger copies it onto the head's legacy_source_key.
+		sCourse.addf(`INSERT INTO courses
+    (clinic_code, code, name_th, price, days, periods, months, point, is_buffet,
+     buffet_count, is_doctor_fee, status, created_at, updated_at)
+SELECT %s, %s, %s, %s, %s, %s, 0, 0, %s,
+       0, false, 1, %s, now()
+ WHERE NOT EXISTS (SELECT 1 FROM courses
+                    WHERE clinic_code = %s AND code = %s AND status = 1)
+   AND NOT EXISTS (SELECT 1 FROM catalog_item
+                    WHERE clinic_code = %s AND code = %s AND status IN (1, 2) AND NOT code_conflict);
+
+`, clinicLit, codeLit, lit(nameThLit), moneyLit(price), days, periods, buffet, createdAt,
+			clinicLit, codeLit, clinicLit, codeLit)
+
+		// 2 · the head, pointing at that register row the way the app's own Insert does.
 		sCourse.addf("%s", upsertCatalogItem(in.ClinicCode, code, "course", nameThLit, nameEnLit,
-			"", price, "0", status, "catalog", "NULL", tsLit(d.Text("created_at"), "now()")))
+			"", price, "0", status, "courses", courseRegisterIDByCode(in.ClinicCode, code), createdAt))
+
+		// 3 · keep the register saying what the head says. The course editor refuses to save
+		// a course whose code, name, price or source_key disagree between the two (409), and
+		// the head above is refreshed from V2 on every run — so the register row is refreshed
+		// with it. Only a row a head actually points at is touched.
+		sCourse.addf(`UPDATE courses c SET
+    name_th    = %s,
+    price      = %s,
+    days       = %s,
+    periods    = %s,
+    is_buffet  = %s,
+    updated_at = now()
+ WHERE c.clinic_code = %s AND c.code = %s AND c.status = 1
+   AND EXISTS (SELECT 1 FROM catalog_item ci
+                WHERE ci.clinic_code = c.clinic_code
+                  AND ci.source_table = 'courses' AND ci.source_id = c.id);
+
+`, lit(nameThLit), moneyLit(price), days, periods, buffet, clinicLit, codeLit)
 
 		sCourse.addf(`INSERT INTO catalog_course
     (catalog_item_id, clinic_code, periods, days, is_buffet, buffet_count,
@@ -1412,9 +1483,7 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
     updated_at = now();
 
 `, catalogItemIDByCode(in.ClinicCode, code), lit(in.ClinicCode),
-			intLitDefault(d.Text("number_of_time_total"), 1),
-			intLitDefault(d.Text("dayofcourse"), 0),
-			boolLit(docBool(d, "infinity_use")),
+			periods, days, buffet,
 			catalogItemIDByCode(in.ClinicCode, code))
 
 		// Course lines. Each list_item entry points at a listheal by ObjectId; V4 wants
@@ -1629,11 +1698,22 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 		}
 	}
 
+	// Last thing in the course batch, so it runs in the same transaction as the rows it
+	// judges and a failure takes them with it. See courseRegisterGuard.
+	if len(runCodes) > 0 {
+		sCourse.addf("%s", courseRegisterGuard(in.ClinicCode, runCodes))
+	}
+
 	eCourse.Statements = sCourse.stmts
 	eLine.Statements = sLine.stmts
 
 	rep.notef("catalog_item(course): ต้นทางไม่มีรหัสคอร์ส จึง mint ให้เป็น %s001.. ตามลำดับในไฟล์ (deterministic · เลี่ยงรหัสที่บริการใช้อยู่)",
 		CourseCodePrefix)
+	rep.notef("courses: เขียนทะเบียน courses คู่กับหัวคอร์สทุกใบ และหัวคอร์สชี้กลับด้วย source_table='courses' + source_id " +
+		"ตาม 01_AGENT — หน้าตั้งค่าคอร์สของ V4 อ่านจากทะเบียนนี้ เดิมคอร์สที่นำเข้าขายได้แต่เปิดแก้ในหน้านั้นไม่ได้ · " +
+		"list_price ของคอร์สเป็น NULL (V4 คิดราคาปกติจากรายการในคอร์สเอง) · " +
+		"หัวคอร์สที่เครื่องมือรุ่นก่อนเขียนไว้เป็น source_table='catalog' ไม่ถูกแปลงเมื่อรันซ้ำ (มติ 5ก 24 ต.ค. 2569) " +
+		"จำนวนจริงขึ้นเป็น NOTICE ตอนรันสคริปต์")
 	rep.notef("catalog_course_line: เขียน %d บรรทัดคู่กับ catalog_item_child อีก %d แถว (relation_kind='composition') — "+
 		"V4 เก็บองค์ประกอบคอร์สสองที่: catalog_course_line เป็นตัวตน ส่วน catalog_item_child เป็นตัวที่จอรายการคอร์ส "+
 		"การตัดใช้คอร์ส การกระจายภาษี และการออกบิลอ่าน · เขียนแค่ตารางแรกคอร์สจะขึ้นจอว่างเปล่าทั้งที่ข้อมูลอยู่ในฐาน",
@@ -1710,6 +1790,129 @@ func splitCode(code string) (prefix string, width int) {
 		i--
 	}
 	return code[:i], len(code) - i
+}
+
+// courseRegisterIDByCode resolves the live `courses` row a course head points at. The
+// partial unique index uniq_courses_clinic_code (status = 1) allows at most one.
+func courseRegisterIDByCode(clinic, code string) string {
+	return fmt.Sprintf(
+		"(SELECT id FROM courses WHERE clinic_code = %s AND code = %s AND status = 1 ORDER BY id LIMIT 1)",
+		lit(clinic), lit(code))
+}
+
+/*
+courseRegisterGuard refuses the course batch when a course of THIS run and its `courses`
+register row do not pair up exactly.
+
+Each failure is one that V4 does not survive quietly:
+
+  - a head that claims the register (source_table='courses') but points at no live row of
+    the same code — the course list and the editor lose it;
+  - a live register row with no head pointing at it — the catalogue sync
+    (syncFromSources) mints a second head for it on the next page load and collides with
+    the code;
+  - a pair whose code, name, price or source key disagree — the course editor refuses to
+    save it with a 409 (coursesetting Update's consistency check, which compares exactly
+    these four).
+
+Scoped to the codes this run wrote, so a course the clinic created in V4 cannot fail an
+import that never touched it. Heads an older version of this tool wrote as
+source_table='catalog' are counted, not refused: they are left as they were (5ก).
+*/
+func courseRegisterGuard(clinic string, codes []string) string {
+	quoted := make([]string, len(codes))
+	for i, code := range codes {
+		quoted[i] = lit(code)
+	}
+	arr := "ARRAY[" + strings.Join(quoted, ", ") + "]::text[]"
+	return fmt.Sprintf(`-- ── ด่าน: คอร์สที่นำเข้ารอบนี้ต้องจับคู่กับทะเบียน courses ครบทุกใบ ─────────────
+-- หัวคอร์สอ้างทะเบียนแต่ไม่มีแถว = หน้าตั้งค่าคอร์สไม่เห็น · ทะเบียนไม่มีหัวคอร์ส = V4 สร้างหัวซ้ำเองแล้วชนรหัส
+-- ชื่อ/ราคา/รหัส/source_key ไม่ตรงกัน = หน้าแก้คอร์สปฏิเสธการบันทึก (409)
+DO $courses$
+DECLARE head_no_reg bigint; reg_no_head bigint; drift bigint; old_shape bigint; linked bigint; sample text;
+BEGIN
+    SELECT count(*) INTO head_no_reg
+      FROM catalog_item ci
+     WHERE ci.clinic_code = %[1]s AND ci.item_type = 'course' AND ci.source_table = 'courses'
+       AND ci.status IN (1, 2) AND ci.code = ANY (%[2]s)
+       AND NOT EXISTS (SELECT 1 FROM courses c
+                        WHERE c.clinic_code = ci.clinic_code AND c.id = ci.source_id
+                          AND c.status = 1 AND c.code = ci.code);
+    IF head_no_reg > 0 THEN
+        SELECT string_agg(code, ', ' ORDER BY code) INTO sample
+          FROM (SELECT ci.code FROM catalog_item ci
+                 WHERE ci.clinic_code = %[1]s AND ci.item_type = 'course' AND ci.source_table = 'courses'
+                   AND ci.status IN (1, 2) AND ci.code = ANY (%[2]s)
+                   AND NOT EXISTS (SELECT 1 FROM courses c
+                                    WHERE c.clinic_code = ci.clinic_code AND c.id = ci.source_id
+                                      AND c.status = 1 AND c.code = ci.code)
+                 ORDER BY ci.code LIMIT 10) s;
+        RAISE EXCEPTION 'หัวคอร์ส %% ใบอ้างทะเบียน courses แต่ไม่มีแถวที่ใช้อยู่ด้วยรหัสเดียวกัน · ตัวอย่าง: %%', head_no_reg, sample;
+    END IF;
+
+    -- A register row nobody points at while its code is FREE can only come from this run
+    -- (the head below it would have adopted any older one), so it is refused.
+    SELECT count(*) INTO reg_no_head
+      FROM courses c
+     WHERE c.clinic_code = %[1]s AND c.status = 1 AND c.code = ANY (%[2]s)
+       AND NOT EXISTS (SELECT 1 FROM catalog_item ci
+                        WHERE ci.clinic_code = c.clinic_code
+                          AND ci.source_table = 'courses' AND ci.source_id = c.id)
+       AND NOT EXISTS (SELECT 1 FROM catalog_item ci
+                        WHERE ci.clinic_code = c.clinic_code AND ci.code = c.code
+                          AND ci.status IN (1, 2) AND NOT ci.code_conflict);
+    IF reg_no_head > 0 THEN
+        SELECT string_agg(code, ', ' ORDER BY code) INTO sample
+          FROM (SELECT c.code FROM courses c
+                 WHERE c.clinic_code = %[1]s AND c.status = 1 AND c.code = ANY (%[2]s)
+                   AND NOT EXISTS (SELECT 1 FROM catalog_item ci
+                                    WHERE ci.clinic_code = c.clinic_code
+                                      AND ci.source_table = 'courses' AND ci.source_id = c.id)
+                   AND NOT EXISTS (SELECT 1 FROM catalog_item ci
+                                    WHERE ci.clinic_code = c.clinic_code AND ci.code = c.code
+                                      AND ci.status IN (1, 2) AND NOT ci.code_conflict)
+                 ORDER BY c.code LIMIT 10) s;
+        RAISE EXCEPTION 'ทะเบียน courses %% แถวไม่มีหัวคอร์สชี้กลับ — V4 จะสร้างหัวคอร์สซ้ำเองแล้วชนรหัส · ตัวอย่าง: %%', reg_no_head, sample;
+    END IF;
+    -- One whose code another row already holds was there before this run and is left alone;
+    -- said out loud because V4's catalogue sync keeps trying, and failing, to adopt it.
+    SELECT count(*) INTO reg_no_head
+      FROM courses c
+     WHERE c.clinic_code = %[1]s AND c.status = 1 AND c.code = ANY (%[2]s)
+       AND NOT EXISTS (SELECT 1 FROM catalog_item ci
+                        WHERE ci.clinic_code = c.clinic_code
+                          AND ci.source_table = 'courses' AND ci.source_id = c.id);
+    IF reg_no_head > 0 THEN
+        RAISE NOTICE 'คอร์ส: ทะเบียน courses %% แถวที่มีอยู่ก่อนแล้วไม่มีหัวคอร์สชี้กลับ เพราะรหัสถูกรายการอื่นใช้อยู่ — ไม่แตะ ต้องให้คนตรวจ', reg_no_head;
+    END IF;
+
+    SELECT count(*) INTO drift
+      FROM courses c
+      JOIN catalog_item ci
+        ON ci.clinic_code = c.clinic_code AND ci.source_table = 'courses' AND ci.source_id = c.id
+     WHERE c.clinic_code = %[1]s AND c.status = 1 AND ci.status IN (1, 2) AND c.code = ANY (%[2]s)
+       AND (ci.code IS DISTINCT FROM c.code OR ci.name_th IS DISTINCT FROM c.name_th
+            OR ci.sell_price IS DISTINCT FROM c.price
+            OR ci.legacy_source_key IS DISTINCT FROM c.source_key);
+    IF drift > 0 THEN
+        RAISE EXCEPTION 'คอร์ส %% ใบที่หัวคอร์สกับทะเบียน courses ไม่ตรงกัน (รหัส/ชื่อ/ราคา/source_key) — หน้าแก้คอร์สจะปฏิเสธการบันทึก', drift;
+    END IF;
+
+    SELECT count(*) INTO old_shape
+      FROM catalog_item ci
+     WHERE ci.clinic_code = %[1]s AND ci.item_type = 'course' AND ci.source_table <> 'courses'
+       AND ci.status IN (1, 2) AND ci.code = ANY (%[2]s);
+    SELECT count(*) INTO linked
+      FROM catalog_item ci
+     WHERE ci.clinic_code = %[1]s AND ci.item_type = 'course' AND ci.source_table = 'courses'
+       AND ci.status IN (1, 2) AND ci.code = ANY (%[2]s);
+    RAISE NOTICE 'คอร์ส: ผูกทะเบียน courses ครบ %% ใบ', linked;
+    IF old_shape > 0 THEN
+        RAISE NOTICE 'คอร์ส: %% ใบยังเป็นรูปแบบของเครื่องมือรุ่นก่อน (source_table=catalog) ไม่ได้แปลงตามมติ 5ก — ขายได้ แต่เปิดในหน้าตั้งค่าคอร์สไม่ได้', old_shape;
+    END IF;
+END $courses$;
+
+`, lit(clinic), arr)
 }
 
 // mintCourseCode produces the nth course code, skipping anything the service codes

@@ -74,6 +74,9 @@ var columnWidths = map[string]map[string]int{
 	"catalog_item_child":       {"clinic_code": 32, "relation_kind": 16},
 	"catalog_item_sku_counter": {"clinic_code": 32, "item_type": 16},
 	"catalog_service":          {"clinic_code": 32, "service_kind_key": 32},
+	// Read from production (migration 728) on 24 Oct 2026, when the course register started
+	// being written.
+	"courses": {"clinic_code": 32, "code": 64, "group_key": 32, "source_key": 32},
 	"clinic_staff": {
 		"clinic_code": 32, "email": 255, "name": 255, "password_hash": 255,
 		"tel": 64, "username": 255,
@@ -175,6 +178,7 @@ var columnNumeric = map[string]map[string]numericLimit{
 		"ref_price_snapshot": {18, 2}, "used": {12, 2},
 	},
 	"course_bought_usage": {"material_cost": {14, 2}, "sessions_used": {12, 2}},
+	"courses":             {"price": {12, 2}},
 	"invoice":             {"bill_discount": {12, 2}, "paid_amount": {12, 2}},
 	"invoice_item":        {"discount": {12, 2}, "price": {12, 2}},
 	"items":               {"cost": {12, 2}, "min_alert": {12, 2}, "price": {12, 2}},
@@ -210,15 +214,19 @@ var columnIntegers = map[string]map[string]string{
 		"periods_total": "integer", "periods_used": "integer", "qty": "integer",
 	},
 	"course_bought_usage": {"material_cost_version": "integer"},
-	"invoice_item":        {"qty": "integer", "sort_order": "integer", "tax_rate_bps": "integer"},
-	"items":               {"units_per_package": "integer"},
-	"loyalty_account":     {"balance": "integer"},
-	"loyalty_policy":      {"min_redeem": "integer", "referral_points": "integer"},
-	"patient":             {"Braces_ID_int": "integer", "old_hn_int": "integer", "user_insert": "integer"},
-	"photos":              {"created_by": "integer", "file_size": "integer", "visit_id": "integer"},
-	"receipt":             {"installment_no": "integer", "point_earned": "integer", "point_spent": "integer"},
-	"receipt_payment":     {"payment_index": "smallint"},
-	"sequences":           {"counter": "integer"},
+	"courses": {
+		"buffet_count": "integer", "days": "integer", "months": "integer",
+		"periods": "integer", "point": "integer", "status": "smallint",
+	},
+	"invoice_item":    {"qty": "integer", "sort_order": "integer", "tax_rate_bps": "integer"},
+	"items":           {"units_per_package": "integer"},
+	"loyalty_account": {"balance": "integer"},
+	"loyalty_policy":  {"min_redeem": "integer", "referral_points": "integer"},
+	"patient":         {"Braces_ID_int": "integer", "old_hn_int": "integer", "user_insert": "integer"},
+	"photos":          {"created_by": "integer", "file_size": "integer", "visit_id": "integer"},
+	"receipt":         {"installment_no": "integer", "point_earned": "integer", "point_spent": "integer"},
+	"receipt_payment": {"payment_index": "smallint"},
+	"sequences":       {"counter": "integer"},
 }
 
 // intBounds are the platform ranges. Values are compared as big.Int against these, so a
