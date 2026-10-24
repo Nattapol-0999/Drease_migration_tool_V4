@@ -66,6 +66,13 @@ export interface ManifestFile {
   hn: string;
   clinic_code: string;
   taken_at: string;
+  /**
+   * The day this image is filed under, YYYY-MM-DD: V2's own วันตรวจ (page.vd_first), or the
+   * Bangkok day of the scan when the page had none. Decided by the CLI (page.go:
+   * photoVisitDate). Optional so a manifest from an older CLI still parses; see visitDateOf
+   * for what those fall back to.
+   */
+  visit_date?: string;
   doctor_code?: string;
   created_by?: string;
   area_tag: string;
@@ -659,45 +666,124 @@ function kindOf(f: ManifestFile): string {
 }
 
 /**
- * IMPORT_VISIT_DATE is the date of the visit every imported page is filed under.
+ * Images are filed one visit per patient per DAY — the day V2 showed the page under (owner's
+ * decision, 24 Oct 2026).
  *
- * Chosen by the clinic owner on 15 Sep 2026 over the alternative of using each page's own
- * วันตรวจ (page.vd_first, present on all 437 pages of the reference clinic and spread across
- * 68 real dates from Sep 2022 to Jul 2026). The tradeoff was put to them explicitly: one
- * visit per patient collapses years of treatment into a single encounter and shows a date the
- * patient never attended, but it is one row per patient instead of one per patient-per-day
- * and every old page lands in the same place. They picked the single date.
+ * That replaces the owner's choice of 15 Sep 2026, which filed every page of a patient under a
+ * single visit dated 2026-01-01. The cost of that choice turned out to be on screen: one visit
+ * for a patient's whole history collapses years of treatment into one encounter on a date
+ * nobody attended, and the before/after page — which places a photo by the date of its visit —
+ * could only ever show all of them on that one day.
  *
- * The real dates are NOT lost: taken_at still carries the exact revision timestamp and the
- * note still spells out "วันตรวจ YYYY-MM-DD" for every page.
+ * FALLBACK_VISIT_DATE is that old date, kept only for an image whose day cannot be read at all
+ * (see visitDateOf). Rows already imported under it stay where they are (same decision): this
+ * changes how new images are filed, it does not move old ones.
  */
-const IMPORT_VISIT_DATE = "2026-01-01";
+const FALLBACK_VISIT_DATE = "2026-01-01";
 
-/** Title shown on the visit so nobody mistakes it for an encounter that was keyed in v4. */
+/** Title shown on a visit this import opens, so nobody mistakes it for one keyed in v4. */
 const IMPORT_VISIT_TITLE = "นำเข้าจากระบบเดิม";
 
 /**
- * visitPlan groups the shipped images by HN and picks the values the visit row needs.
- *
- * doctor_code comes from the EARLIEST page of that patient (owner's choice, 15 Sep 2026):
- * one visit carries one doctor, 13 patients in the reference clinic had pages from more than
- * one, and the first page is the only pick that does not depend on iteration order.
+ * isCalendarDay accepts exactly YYYY-MM-DD naming a real day from 1900 on — the same floor as
+ * page.go, and for the same reason: PostgreSQL refuses year 0000, and one such value would cost
+ * the whole transaction rather than one date.
  */
-function visitPlan(files: ManifestFile[]): { hn: string; doctorCode?: string }[] {
-  const earliest = new Map<string, ManifestFile>();
-  for (const f of files) {
-    const prev = earliest.get(f.hn);
-    if (!prev || f.taken_at < prev.taken_at) earliest.set(f.hn, f);
-  }
-  return [...earliest.keys()]
-    .sort()
-    .map((hn) => ({ hn, doctorCode: earliest.get(hn)?.doctor_code }));
+function isCalendarDay(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split("-").map(Number);
+  if (y < 1900) return false;
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
+}
+
+/** clinicDay is the calendar day an instant falls on at the clinic: UTC+7, no daylight saving. */
+function clinicDay(ms: number): string {
+  return new Date(ms + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
 /**
- * buildInsertSQL renders the rows for the images that were actually shipped: a visit per
- * patient, the `photos` rows themselves, and a `face_chart` per visit that turns every
- * imported page into a page the doctor can draw on.
+ * visitDateOf is the day an image is filed under.
+ *
+ * The CLI decides it (page.go: photoVisitDate); this reads it back. The rest is a seatbelt, as
+ * kindOf is: a manifest from an older CLI has no visit_date at all, and a hand-edited one could
+ * carry anything. Without one, the Bangkok day of taken_at is exactly what the CLI picks for a
+ * page with no วันตรวจ (owner's fallback, 24 Oct 2026); without even a usable taken_at — a
+ * revision with no timestamp leaves year 1 behind — the old fixed date.
+ */
+function visitDateOf(f: ManifestFile): string {
+  const v = (f.visit_date ?? "").trim();
+  if (isCalendarDay(v)) return v;
+  const ms = Date.parse(f.taken_at);
+  if (Number.isFinite(ms)) {
+    const day = clinicDay(ms);
+    if (isCalendarDay(day)) return day;
+  }
+  return FALLBACK_VISIT_DATE;
+}
+
+/** One shipped image and the manifest entry that planned it. */
+interface PlannedPhoto {
+  file: ManifestFile;
+  shipped: SurveyFile;
+}
+
+/** The images of one patient on one day — one visit at the target. */
+interface PlannedVisit {
+  hn: string;
+  visitDate: string;
+  /** For a visit this import has to open; an existing visit keeps its own doctor. */
+  doctorCode?: string;
+  photos: PlannedPhoto[];
+}
+
+/** takenMs orders images by when they were taken; an unreadable time never wins. */
+function takenMs(f: ManifestFile): number {
+  const ms = Date.parse(f.taken_at);
+  return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * visitPlan groups the shipped images by patient and day.
+ *
+ * doctor_code comes from the EARLIEST image of that patient-day — the owner's rule of 15 Sep
+ * 2026, now applied per day instead of per patient: one visit carries one doctor, and the first
+ * image is the only pick that does not depend on iteration order. Times are compared as
+ * instants, not as text, because RFC3339Nano drops trailing zeros: "…38.79Z" sorts after
+ * "…38.796Z" as a string although it is earlier.
+ *
+ * Ordered by day, then HN, and that is not cosmetic: the app's visit-number lock is taken only
+ * for a day that can still be today (see buildInsertSQL), and with the days ascending today
+ * comes last, so that lock is held for the tail of the transaction instead of all of it.
+ */
+function visitPlan(photos: PlannedPhoto[]): PlannedVisit[] {
+  const byKey = new Map<string, { visit: PlannedVisit; first: ManifestFile }>();
+  for (const p of photos) {
+    const visitDate = visitDateOf(p.file);
+    // The day is a fixed 10 characters, so the key cannot be ambiguous whatever the HN holds.
+    const key = `${visitDate}|${p.file.hn}`;
+    const got = byKey.get(key);
+    if (!got) {
+      byKey.set(key, { visit: { hn: p.file.hn, visitDate, photos: [p] }, first: p.file });
+      continue;
+    }
+    got.visit.photos.push(p);
+    if (takenMs(p.file) < takenMs(got.first)) got.first = p.file;
+  }
+  return [...byKey.values()]
+    .map(({ visit, first }) => ({ ...visit, doctorCode: first.doctor_code }))
+    .sort((a, b) => compareText(a.visitDate, b.visitDate) || compareText(a.hn, b.hn));
+}
+
+/**
+ * buildInsertSQL renders the rows for the images that were actually shipped, one block per
+ * patient-day: the visit they file into (an existing one when V4 has it, a new one when not),
+ * the `photos` rows themselves, and a `face_chart` on that visit that turns every imported
+ * chart page into a page the doctor can draw on.
  *
  * Shape of each statement, and why:
  *
@@ -708,13 +794,14 @@ function visitPlan(files: ManifestFile[]): { hn: string; doctorCode?: string }[]
  *     precision from the source revision, so two genuinely different pages colliding on
  *     it AND on byte count is not a case that occurs; when the manifest itself contains
  *     such a pair the CLI says so in its warnings.
- *   - visit_id points at a visit this script creates, one per patient, dated
- *     IMPORT_VISIT_DATE. It used to be NULL because SaveMedia hard-deletes a visit's rows
- *     before rewriting them. That danger is real and has not gone away — it is now handled
- *     at the other end: v4 migration 0420 adds photos.legacy_import and scopes
- *     DeleteMediaByVisit to legacy_import = false, so the replace can no longer reach an
- *     imported page. Running this SQL against a database WITHOUT 0420 is refused by a guard
- *     below rather than left to fail on "column does not exist".
+ *   - visit_id points at the visit of that patient on the image's day (visitDateOf): the one
+ *     V4 already holds when there is one, else one this script opens. It used to be NULL
+ *     because SaveMedia hard-deletes a visit's rows before rewriting them. That danger is
+ *     real and has not gone away — it is now handled at the other end: v4 migration 0420
+ *     adds photos.legacy_import and scopes DeleteMediaByVisit to legacy_import = false, so
+ *     the replace can no longer reach an imported page. Running this SQL against a database
+ *     WITHOUT 0420 is refused by a guard below rather than left to fail on "column does not
+ *     exist".
  *
  *     The reason for binding at all: the before/after modal reads media per visit
  *     (ListMediaByVisit → WHERE visit_id = ?), so a page with visit_id NULL cannot appear
@@ -822,119 +909,182 @@ export function buildInsertSQL(
   out.push("END $guard418$;");
   out.push("");
 
-  // ── visit ที่รูปจะไปผูก ──────────────────────────────────────────────────────────
-  const plan = visitPlan(
-    survey.matched
-      .map((m) => byTarget.get(m.target_path))
-      .filter((f): f is ManifestFile => Boolean(f)),
+  // GUARD: since 0716 a deleted visit stays in visit_master with a row in opd_visit_deletion,
+  // and the statements below read that table twice — to never file a page into a deleted
+  // visit (RLS hides it and every photo bound to it from the app) and to never hand out a VN a
+  // deleted visit already held. Refused here in a sentence rather than by "relation does not
+  // exist" halfway through.
+  out.push("-- GUARD: ปลายทางต้องมี migration 0716 (opd_visit_deletion) ก่อน — visit ที่ถูกลบยังอยู่ใน");
+  out.push("-- visit_master จึงต้องอ่านตารางนี้เพื่อไม่ผูกรูปเข้าใบที่ลบแล้ว และไม่ใช้ VN ที่ใบที่ลบเคยถือ");
+  out.push("DO $guard716$");
+  out.push("BEGIN");
+  out.push("    IF to_regclass('public.opd_visit_deletion') IS NULL THEN");
+  out.push(
+    "        RAISE EXCEPTION 'ฐานปลายทางยังไม่มีตาราง opd_visit_deletion — " +
+      "รัน migration 0716 ของ drease-v4-backend ก่อน แล้วนำเข้ารูปอีกครั้ง';",
   );
+  out.push("    END IF;");
+  out.push("END $guard716$;");
+  out.push("");
+
+  // ── one block per patient-day: its visit, its images, its chart ─────────────────────────
+  const plan = visitPlan(
+    survey.matched.flatMap((m) => {
+      const f = byTarget.get(m.target_path);
+      return f ? [{ file: f, shipped: m }] : [];
+    }),
+  );
+  const days = new Set(plan.map((v) => v.visitDate)).size;
+  const c = lit(clinic);
+  const dateLit = (day: string): string => `DATE ${lit(day)}`;
+
+  // The visit a patient-day files into. ONE definition, used by every statement that needs it
+  // — "is there one already" before opening a visit, each image's visit_id, the chart, the
+  // closing count — because copies that drift would bind an image to one visit and draw its
+  // chart on another. It takes SQL expressions so the closing count can hand it columns.
+  //
+  //   - An existing visit is REUSED (owner's decision, 24 Oct 2026), lowest id first so the
+  //     pick is the same on every run. Most days of a migrated clinic already hold the visit
+  //     its V2 encounter became.
+  //   - A deleted visit is never picked. Since 0716 it stays in visit_master with a row in
+  //     opd_visit_deletion, and RLS hides it and every photo bound to it from the app — a page
+  //     filed there would vanish.
+  //   - A signed visit is never picked. The app changes a signed visit's media or face chart
+  //     only through an amendment (opdamend.Guard), so writing into one here would alter a
+  //     locked medical record with no amendment trail. A day whose only visits are signed gets
+  //     a visit of its own instead.
+  const liveVisit = (hnSQL: string, daySQL: string): string =>
+    `SELECT lv.id FROM visit_master lv
+         WHERE lv.clinic_code = ${c} AND lv."HN" = ${hnSQL} AND lv.visit_date = ${daySQL}
+           AND lv.signed_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM opd_visit_deletion dl
+                            WHERE dl.clinic_code = lv.clinic_code AND dl.visit_id = lv.id)
+         ORDER BY lv.id
+         LIMIT 1`;
+
+  // The next VN of a day, allocated the way the app allocates it (opdrecord.sql MaxVnForDay +
+  // nextVN): the highest number used that day — deleted visits included, their numbers stay
+  // spent ("VN allocations must include this ledger", migration 0716) — plus one, 3 digits.
+  //
+  // Compared as NUMBERS where the app compares text. The app can: it only ever numbers today,
+  // in fixed-width VNs it wrote itself. This numbers past days whose VNs came from elsewhere —
+  // 9,494 of Anjali's 36,369 visits are not three characters wide — and as text '99' > '100'.
+  //
+  // Padded only up to 999, then written as is, because PostgreSQL's lpad TRUNCATES:
+  // lpad('1000', 3, '0') is '100', the VN of visit 100 (met twice on 18 Sep 2026 — HN
+  // 016900214, visit 1,000 of 1,533).
+  const nextVN = (day: string): string =>
+    `(SELECT CASE WHEN q.n <= 999 THEN lpad(q.n::text, 3, '0') ELSE q.n::text END
+          FROM (SELECT coalesce(max(a.vn::bigint), 0) + 1 AS n
+                  FROM (SELECT vm."VN"::text AS vn FROM visit_master vm
+                         WHERE vm.clinic_code = ${c} AND vm.visit_date = ${dateLit(day)}
+                        UNION ALL
+                        SELECT dl.vn FROM opd_visit_deletion dl
+                         WHERE dl.clinic_code = ${c} AND dl.visit_date = ${dateLit(day)}) a
+                 WHERE a.vn ~ '^[0-9]{1,18}$') q)`;
+
+  // The app's own visit-number lock (opdrecord.sql LockVisitDay), so a visit this opens for
+  // TODAY cannot be handed the VN a receptionist is being handed at that moment.
+  //
+  // Taken only for a day that can still be today. The app numbers today and nothing else —
+  // OpenVisit is its only writer of visit_master, and it uses the clinic's current day — so no
+  // other day has anyone to race. Locking every day would not be free either: advisory locks
+  // share the lock table with relation locks and are held until COMMIT, and a clinic with
+  // years of pages has well over a thousand days against a budget of a few thousand locks (the
+  // CLI's guards.go: the patient import has run within 1% of it). current_date - 1 because
+  // current_date is the server's day (UTC on production) and the clinic's today can be a day
+  // ahead of it.
+  //
+  // The key is the literal string the app hashes ('opd_vn:<clinic>:<YYYY-MM-DD>'), not a date
+  // cast to text, whose form would follow DateStyle.
+  const lockDay = (day: string): string =>
+    `DO $lock$
+BEGIN
+    IF ${dateLit(day)} >= current_date - 1 THEN
+        PERFORM pg_advisory_xact_lock(hashtext(${lit(`opd_vn:${clinic}:${day}`)}));
+    END IF;
+END $lock$;`;
 
   out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push(`-- visit ของรูปที่นำเข้า — ${plan.length} ใบ (1 ใบต่อคนไข้) วันที่ ${IMPORT_VISIT_DATE}`);
+  out.push(`-- รูปแยกตามวันของ visit — ${plan.length} ชุด (คนไข้ × วัน) ใน ${days} วัน`);
   out.push("--");
-  out.push('-- โมดัล "รูป / ก่อน-หลัง" อ่านรูปทีละ visit (WHERE visit_id = ?) รูปที่ visit_id เป็น');
-  out.push("-- NULL จึงไม่มีทางโผล่ในโมดัลได้เลย — จึงต้องมี visit ให้ผูก");
+  out.push("-- วันของรูป = วันตรวจของ V2 (page.vd_first) ถ้าหน้านั้นไม่มีจึงใช้วันที่สแกนตามเวลาไทย");
+  out.push("-- (CLI เป็นคนตัดสิน) · แต่ละชุดทำสามอย่างตามลำดับ:");
+  out.push("--   1) visit ของคนไข้ในวันนั้น — V4 มีอยู่แล้วใช้ใบเดิม (id ต่ำสุด ข้ามใบที่ลบหรือเซ็นแล้ว)");
+  out.push('--      ไม่มีจึงเปิดใบใหม่ "นำเข้าจากระบบเดิม" และเปิดเฉพาะเมื่อมีรูปใหม่จริงอย่างน้อย 1 รูป');
+  out.push("--      รันซ้ำจึงไม่ได้ visit เปล่า");
+  out.push("--   2) รูปของชุดนั้น ผูกกับ visit ข้อ 1");
+  out.push("--   3) ผังหน้าของ visit นั้นจากรูปแฟ้ม (kind note) เท่านั้น — base_type ชี้หน้าที่ใหม่สุด");
+  out.push("--      strokes ไล่ทุกหน้าตามเวลาถ่าย (รูปแบบที่แอปเขียนเอง) · ถ้า visit มีผังอยู่แล้วไม่เขียนทับ");
+  out.push("--      รูปก่อน/หลังไม่เข้าแฟ้ม แต่ไปอยู่หน้ารูปก่อน-หลังตามวันของ visit");
   out.push("--");
-  out.push("-- VN คิดจากจำนวน visit ที่มีอยู่ในวันนั้น + 1 ไม่ใช่เลขที่ตายตัวในสคริปต์ เพราะ");
-  out.push("-- uniq_visit_master_clinic_day_vn บังคับให้ VN ไม่ซ้ำต่อ (คลินิก + วัน) ไม่ใช่ต่อคนไข้");
-  out.push("-- ถ้าวันนั้นมีใบของระบบอยู่ก่อนแล้ว เลขจะไล่ต่อจากของเดิมแทนที่จะชนกัน");
-  out.push("--");
-  out.push("-- เติมศูนย์เป็น 3 หลักได้แค่ถึง 999 — เกินจากนั้นใช้ตัวเลขตรง ๆ เพราะ lpad ของ");
-  out.push("-- PostgreSQL **ตัด** สตริงที่ยาวเกินความยาวที่สั่ง ไม่ได้แค่เติม: lpad('1000',3,'0')");
-  out.push("-- คืน '100' ซึ่งเป็น VN ของใบที่ 100 ทำให้ใบที่ 1000 ชนกับใบที่ 100 พอดี");
-  out.push("-- (เจอจริงสองรอบ 18 ก.ย. 2569 ที่ HN 016900214 ใบที่ 1000 จาก 1,533 ใบ)");
-  out.push("--");
-  out.push("-- insert-only · รันซ้ำไม่เพิ่มใบซ้ำ (กันด้วย clinic_code + HN + visit_date)");
+  out.push("-- VN ของใบใหม่ = เลขสูงสุดของวันนั้น (รวมใบที่ถูกลบ) + 1 เทียบเป็นตัวเลข เติมศูนย์ถึง 999");
+  out.push("-- แล้วใช้ตัวเลขตรง ๆ เพราะ lpad ของ PostgreSQL ตัดสตริงที่ยาวเกิน: lpad('1000',3,'0') = '100'");
+  out.push("-- ล็อกเลข VN ของแอปเฉพาะวันที่ยังอาจเป็นวันนี้ — แอปออกเลขให้วันนี้เท่านั้น");
   out.push("-- ══════════════════════════════════════════════════════════════════════════");
   out.push("");
 
-  // A patient whose branch is blank is SKIPPED rather than allowed to abort the run (owner's
-  // decision, 16 Sep 2026). visit_master.branch_code is NOT NULL with
-  // CHECK (branch_code <> ''), so handing it a blank takes the whole transaction down on one
-  // bad patient row and not a single image lands.
-  //
-  // Measured note: `patient` carries the same pair of constraints (NOT NULL +
-  // patient_branch_not_blank), so today this filters nothing — the counter below reads 0
-  // unless someone drops those. It is written anyway because the alternative is a 400-image
-  // import that dies on row one, and the guard costs one comparison.
-  //
-  // Reading the branch off `patient` in the FROM clause rather than as a scalar subquery also
-  // collapses what used to be two lookups of the same row into one.
+  let rows = 0;
+  let lockedDay = "";
   for (const v of plan) {
-    const c = lit(clinic);
     const hn = lit(v.hn);
-    out.push(`-- hn ${v.hn}`);
+    const day = dateLit(v.visitDate);
+
+    if (v.visitDate !== lockedDay) {
+      out.push(`-- ── ${v.visitDate} ──`);
+      out.push(lockDay(v.visitDate));
+      out.push("");
+      lockedDay = v.visitDate;
+    }
+
+    // Opened only when the patient-day has no visit to reuse AND at least one of its images is
+    // not in photos yet. The second half is what keeps a re-run from leaving an empty visit in
+    // a patient's history: an image imported last time is skipped by the duplicate key below,
+    // so a visit opened for a day made only of those would hold nothing. The VALUES list is
+    // that same key, image by image.
+    //
+    // A patient whose branch is blank is SKIPPED rather than allowed to abort the run (owner's
+    // decision, 16 Sep 2026): visit_master.branch_code is NOT NULL with CHECK (branch_code <>
+    // ''), so one bad patient row would take every image down with it. `patient` carries the
+    // same constraints, so today this filters nothing; it costs one comparison.
+    const keys = v.photos
+      .map((p) => `           (${lit(p.file.taken_at)}::timestamptz, ${p.shipped.bytes})`)
+      .join(",\n");
+    out.push(`-- hn ${v.hn} · ${v.visitDate} · ${v.photos.length} รูป`);
     out.push(
       `INSERT INTO visit_master (clinic_code, "HN", "VN", visit_date, branch_code, doctor_code, title)
 SELECT ${c}, ${hn},
-       (SELECT CASE WHEN q.n <= 999 THEN lpad(q.n::text, 3, '0') ELSE q.n::text END
-          FROM (SELECT count(*) + 1 AS n FROM visit_master
-                 WHERE clinic_code = ${c} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}) q),
-       DATE ${lit(IMPORT_VISIT_DATE)}, p.branch_code,
+       ${nextVN(v.visitDate)},
+       ${day}, p.branch_code,
        ${nullLit(v.doctorCode)}, ${lit(IMPORT_VISIT_TITLE)}
   FROM patient p
  WHERE p.clinic_code = ${c} AND p."HN" = ${hn}
    AND coalesce(p.branch_code, '') <> ''
-   AND NOT EXISTS (
-       SELECT 1 FROM visit_master
-        WHERE clinic_code = ${c} AND "HN" = ${hn} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
+   AND NOT EXISTS (${liveVisit(hn, day)})
+   AND EXISTS (
+       SELECT 1 FROM (VALUES
+${keys}
+       ) AS w(taken_at, file_size)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM photos ph
+             WHERE ph.clinic_code = ${c} AND ph.hn = ${hn}
+               AND ph.taken_at = w.taken_at AND ph.file_size = w.file_size)
    );`,
     );
     out.push("");
-  }
 
-  // How many patients ended up with no visit, and what that costs: their pages keep visit_id
-  // NULL and cannot appear in the before/after modal. Stated with a number rather than left
-  // to be discovered when a doctor opens an empty modal.
-  //
-  // The two reasons are counted SEPARATELY, because they need different fixes: a missing
-  // `patient` row is solved by importing the patients group first, a blank branch is a data
-  // problem in the source. The old version of this block counted visits whose branch_code was
-  // NULL, which could never happen — the column is NOT NULL, so such a row would have aborted
-  // the transaction long before the count ran.
-  out.push("-- ใบที่มีอยู่จริงหลังรัน (คนไข้ที่ยังไม่มีในตาราง patient จะไม่ได้ใบ)");
-  out.push("DO $visits$");
-  out.push("DECLARE");
-  out.push("    made bigint;");
-  out.push("BEGIN");
-  out.push("    SELECT count(*) INTO made");
-  out.push("      FROM visit_master");
-  out.push(`     WHERE clinic_code = ${lit(clinic)} AND visit_date = DATE ${lit(IMPORT_VISIT_DATE)}`);
-  out.push(`       AND title = ${lit(IMPORT_VISIT_TITLE)};`);
-  out.push(`    IF made < ${plan.length} THEN`);
-  out.push(
-    `        RAISE NOTICE 'visit: มี % ใบ จากที่ต้องการ ${plan.length} ใบ — ส่วนที่ขาดคือ HN ` +
-      "ที่ยังไม่มีในตาราง patient หรือคนไข้ที่ไม่มีสาขา (จำนวนแยกอยู่ในบล็อกสาขาถัดไป ซึ่งนับหลังรูป " +
-      "เข้าฐานแล้ว) · รูปของคนเหล่านั้นเข้าฐานแต่จะไม่โผล่ในโมดัลก่อน-หลัง', made;",
-  );
-  out.push("    ELSE");
-  out.push("        RAISE NOTICE 'visit: มีครบ % ใบสำหรับรูปที่นำเข้า', made;");
-  out.push("    END IF;");
-  out.push("END $visits$;");
-  out.push("");
-
-  let rows = 0;
-  for (const m of survey.matched) {
-    const f = byTarget.get(m.target_path);
-    if (!f) continue;
-    rows++;
-
-    const c = lit(clinic);
-    const hn = lit(f.hn);
-    const taken = `${lit(f.taken_at)}::timestamptz`;
-    const size = String(m.bytes);
-
-    out.push(`-- hn ${f.hn} · ${f.source_url}`);
-    out.push(
-      `INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
+    for (const { file: f, shipped: m } of v.photos) {
+      rows++;
+      const taken = `${lit(f.taken_at)}::timestamptz`;
+      const size = String(m.bytes);
+      out.push(`-- hn ${f.hn} · ${f.source_url}`);
+      out.push(
+        `INSERT INTO photos (clinic_code, hn, branch_code, visit_id, area_tag, kind, file_path,
                     thumb_path, file_size, consent_given, note, doctor_code, created_by,
                     taken_at, annotations, legacy_import, created_at, updated_at)
 SELECT ${c}, ${hn},
        (SELECT p.branch_code FROM patient p WHERE p.clinic_code = ${c} AND p."HN" = ${hn}),
-       (SELECT vm.id FROM visit_master vm
-         WHERE vm.clinic_code = ${c} AND vm."HN" = ${hn}
-           AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
-         LIMIT 1),
+       (${liveVisit(hn, day)}),
        ${nullLit(f.area_tag) === "NULL" ? lit("other") : lit(f.area_tag)}, ${lit(kindOf(f))},
        ${lit(f.target_path)}, ${m.thumb ? lit(m.thumb.target_path) : "NULL"},
        ${size}, true, ${nullLit(f.note)}, ${nullLit(f.doctor_code)}, ${intOrNull(f.created_by)}, ${taken},
@@ -944,6 +1094,55 @@ WHERE NOT EXISTS (
      WHERE clinic_code = ${c} AND hn = ${hn}
        AND taken_at = ${taken} AND file_size = ${size}
 );`,
+      );
+      out.push("");
+    }
+
+    // ── face_chart: the day's chart pages as pages the doctor can draw on ──
+    //
+    // base_type = 'photo:<photos.id>' and a strokes element {"page":true,"view":"photo:<id>"}
+    // are the app's OWN convention, not something devised here: verified against rows the
+    // running app wrote (8 of 8 face_chart rows shaped photo:<n> point at a photos.id of the
+    // same clinic, HN and visit), and normalizeFaceView (clinicalengine/service.go) accepts
+    // photo:<positive int> as a page — TestNormalizeFaceViewKeepsEveryPage pins "photo:42".
+    //
+    // face_chart is UNIQUE (clinic_code, visit_id): one chart per visit, listing that visit's
+    // imported pages in the order they were taken. base_type holds one value and names the
+    // NEWEST (owner's decision, 15 Sep 2026). Only chart pages — kind note — go in (owner's
+    // decision, 24 Oct 2026): a before/after photo is not a page of the record, and the
+    // before/after page shows it by its visit's day instead. A day with no chart page in it
+    // gets no chart statement at all.
+    //
+    // Computed in SQL because photos.id is generated by the inserts just above; reading it
+    // back is exact, carrying it across would be a guess. ON CONFLICT DO NOTHING, not DO
+    // UPDATE: when the visit already has a chart — a doctor's drawing on a reused visit — the
+    // import must not overwrite it. Those pages stay reachable from the visit's photo strip,
+    // and the closing count says how many.
+    if (!v.photos.some((p) => kindOf(p.file) === "note")) continue;
+    out.push(`-- ผังหน้า hn ${v.hn} · ${v.visitDate}`);
+    out.push(
+      `INSERT INTO face_chart (clinic_code, "HN", visit_id, base_type, doctor_code, strokes,
+                        version, created_at, updated_at)
+SELECT ${c}, ${hn}, vm.id,
+       'photo:' || (SELECT p.id FROM photos p
+                     WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
+                       AND p.legacy_import AND p.deleted_at IS NULL AND p.kind = 'note'
+                     ORDER BY p.taken_at DESC, p.id DESC
+                     LIMIT 1)::text,
+       vm.doctor_code,
+       (SELECT coalesce(jsonb_agg(jsonb_build_object('page', true, 'view', 'photo:' || p.id::text)
+                                  ORDER BY p.taken_at, p.id), '[]'::jsonb)
+          FROM photos p
+         WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
+           AND p.legacy_import AND p.deleted_at IS NULL AND p.kind = 'note'),
+       1, now(), now()
+  FROM visit_master vm
+ WHERE vm.id = (${liveVisit(hn, day)})
+   AND EXISTS (
+       SELECT 1 FROM photos p
+        WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
+          AND p.legacy_import AND p.deleted_at IS NULL AND p.kind = 'note')
+ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
     );
     out.push("");
   }
@@ -997,112 +1196,74 @@ WHERE NOT EXISTS (
   out.push("END $branch$;");
   out.push("");
 
-  // ── face_chart: ทำให้รูปที่นำเข้าเป็น "หน้า" ที่วาดทับได้ ─────────────────────────
+  // What the plan came to, counted after every statement above has run, so a shortfall is read
+  // off the log rather than found by a doctor opening an empty visit. It goes through the same
+  // liveVisit with the plan's own columns, so it counts exactly the visits the rows went to.
   //
-  // WHY THIS IS NOT AN INVENTION
-  //
-  // base_type = 'photo:<photos.id>' and a strokes element {"page":true,"view":"photo:<id>"}
-  // are the app's OWN convention, not something devised here. Verified against rows the
-  // running app wrote: 8 of 8 face_chart rows whose base_type looks like photo:<n> point at
-  // a photos.id that exists and belongs to the SAME clinic, HN and visit, and
-  // normalizeFaceView (clinicalengine/service.go) accepts photo:<positive int> as a page —
-  // there is a test pinning it (TestNormalizeFaceViewKeepsEveryPage, case "photo:42").
-  //
-  // SHAPE FORCED BY THE SCHEMA
-  //
-  // face_chart is UNIQUE (clinic_code, visit_id) — one row per visit. The import files every
-  // page of a patient under ONE visit, so a patient gets ONE chart whose strokes array lists
-  // every imported page. base_type holds a single value, so it names one page: the NEWEST
-  // (owner's decision, 15 Sep 2026), while the pages themselves stay in chronological order.
-  //
-  // Everything is computed in SQL, deliberately: photos.id is generated by the database
-  // during the inserts above, so this side cannot know it. Reading it back is exact; carrying
-  // it across would be a guess.
-  //
-  // ON CONFLICT DO NOTHING, not DO UPDATE: if a doctor has already drawn on that visit's
-  // chart, re-running the import must not overwrite the drawing.
-  out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push("-- face_chart — ทำให้รูปที่นำเข้าเปิดเป็น \"หน้า\" ที่วาดทับได้ในผังหน้า");
-  out.push("--");
-  out.push("-- base_type = 'photo:<photos.id>' และ strokes = [{\"page\":true,\"view\":\"photo:<id>\"}]");
-  out.push("-- เป็นรูปแบบที่แอปเขียนเองอยู่แล้ว (ยืนยันจากแถวจริง 8/8 ที่ชี้ photos.id ถูกคนไข้");
-  out.push("-- ถูกคลินิก ถูก visit) และ normalizeFaceView รับ photo:<เลขบวก> เป็น page ที่ถูกต้อง");
-  out.push("--");
-  out.push("-- face_chart มี UNIQUE (clinic_code, visit_id) = 1 แถวต่อ visit ฉะนั้นคนไข้หนึ่งคน");
-  out.push("-- ได้ 1 แถว ที่ strokes ไล่ทุกหน้าของเขา · base_type ใส่ได้ค่าเดียวจึงชี้หน้าที่ใหม่สุด");
-  out.push("--");
-  out.push("-- id ของรูปถูกอ่านกลับจากฐาน ไม่ใช่ส่งมาจากฝั่งนี้ เพราะ photos.id ฐานออกให้เองตอน");
-  out.push("-- insert ข้างบน · ON CONFLICT DO NOTHING เพื่อไม่ทับภาพวาดที่หมอทำไว้แล้ว");
-  out.push("-- ══════════════════════════════════════════════════════════════════════════");
-  out.push("");
-
-  for (const v of plan) {
-    const c = lit(clinic);
-    const hn = lit(v.hn);
-    out.push(`-- hn ${v.hn}`);
-    out.push(
-      `INSERT INTO face_chart (clinic_code, "HN", visit_id, base_type, doctor_code, strokes,
-                        version, created_at, updated_at)
-SELECT ${c}, ${hn}, vm.id,
-       'photo:' || (SELECT p.id FROM photos p
-                     WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
+  //   - bound / opened: patient-days that found a visit, and how many of those visits this run
+  //     opened. A visit opened here takes visit_master.created_at's default, now(), which is
+  //     this transaction's start and nobody else's; the rest were reused, as the owner chose.
+  //   - paired: before/after photos now on a visit, i.e. placeable on the before/after page.
+  //   - inChart / outChart: chart pages listed in their visit's chart, and those that are not
+  //     because the visit already had a chart of its own (ON CONFLICT DO NOTHING above).
+  if (plan.length > 0) {
+    const planRows = plan.map((v) => `        (${lit(v.hn)}, ${dateLit(v.visitDate)})`).join(",\n");
+    const listed =
+      "pg.strokes @> jsonb_build_array(jsonb_build_object('page', true, 'view', 'photo:' || pg.id::text))";
+    out.push("-- visit · รูปก่อน/หลัง · ผังหน้า ที่ได้จริงของแผนนี้");
+    out.push("DO $plan$");
+    out.push("DECLARE");
+    out.push("    bound    bigint;");
+    out.push("    opened   bigint;");
+    out.push("    paired   bigint;");
+    out.push("    inChart  bigint;");
+    out.push("    outChart bigint;");
+    out.push("BEGIN");
+    out.push(`    WITH pl(hn, visit_date) AS (VALUES
+${planRows}
+    ),
+    v AS (
+        SELECT x.id, x.created_at
+          FROM pl
+          JOIN visit_master x ON x.id = (${liveVisit("pl.hn", "pl.visit_date")})
+    ),
+    pg AS (
+        SELECT p.id, p.kind, fc.strokes
+          FROM v
+          JOIN photos p ON p.clinic_code = ${c} AND p.visit_id = v.id
                        AND p.legacy_import AND p.deleted_at IS NULL
-                     ORDER BY p.taken_at DESC, p.id DESC
-                     LIMIT 1)::text,
-       vm.doctor_code,
-       (SELECT coalesce(jsonb_agg(jsonb_build_object('page', true, 'view', 'photo:' || p.id::text)
-                                  ORDER BY p.taken_at, p.id), '[]'::jsonb)
-          FROM photos p
-         WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
-           AND p.legacy_import AND p.deleted_at IS NULL),
-       1, now(), now()
-FROM visit_master vm
-WHERE vm.clinic_code = ${c} AND vm."HN" = ${hn}
-  AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)}
-  AND EXISTS (
-      SELECT 1 FROM photos p
-       WHERE p.clinic_code = ${c} AND p.visit_id = vm.id
-         AND p.legacy_import AND p.deleted_at IS NULL
-  )
-ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
+          LEFT JOIN face_chart fc ON fc.clinic_code = ${c} AND fc.visit_id = v.id
+    )
+    SELECT (SELECT count(*) FROM v),
+           (SELECT count(*) FROM v WHERE v.created_at = now()),
+           (SELECT count(*) FROM pg WHERE pg.kind IN ('before', 'after')),
+           (SELECT count(*) FROM pg WHERE pg.kind = 'note' AND ${listed}),
+           (SELECT count(*) FROM pg WHERE pg.kind = 'note' AND (pg.strokes IS NULL OR NOT ${listed}))
+      INTO bound, opened, paired, inChart, outChart;`);
+    out.push(
+      `    RAISE NOTICE 'visit: แผน ${plan.length} ชุด (คนไข้ × วัน) · ผูก visit ได้ % ชุด — ` +
+        "ใช้ใบที่มีอยู่แล้ว % ใบ · เปิดใบใหม่ % ใบ', bound, bound - opened, opened;",
     );
+    out.push(`    IF bound < ${plan.length} THEN`);
+    out.push(
+      "        RAISE NOTICE 'visit: % ชุดไม่มี visit — คนไข้ยังไม่มีในตาราง patient, ไม่มีสาขา " +
+        "หรือรูปทุกใบของวันนั้นมีอยู่แล้วจากรอบก่อน (จึงไม่เปิดใบเปล่า) · " +
+        `รูปที่เข้าฐานแต่ไม่มี visit นับแยกไว้ในบล็อกสาขาด้านบน', ${plan.length} - bound;`,
+    );
+    out.push("    END IF;");
+    out.push(
+      "    RAISE NOTICE 'ก่อน/หลัง: % รูปผูก visit ตามวันแล้ว — หน้ารูปก่อน-หลังวางตามวันของ visit', paired;",
+    );
+    out.push("    RAISE NOTICE 'face_chart: หน้ารูปแฟ้มอยู่ในผังหน้าของ visit แล้ว % หน้า', inChart;");
+    out.push("    IF outChart > 0 THEN");
+    out.push(
+      "        RAISE NOTICE 'face_chart: % หน้ายังไม่อยู่ในผังหน้า — visit นั้นมีผังหน้าอยู่ก่อนแล้ว " +
+        "จึงไม่เขียนทับ · รูปยังเปิดได้จากแถบรูปของ visit', outChart;",
+    );
+    out.push("    END IF;");
+    out.push("END $plan$;");
     out.push("");
   }
-
-  // What actually landed, and what a shortfall means. A patient with no `patient` row got no
-  // visit (see above) and therefore gets no chart — their pages are still in the record, they
-  // just cannot be opened as drawable pages. Said with a number rather than left to be found.
-  out.push("-- ผังหน้าที่สร้างได้จริง + จำนวนหน้าที่ผูกไว้ในแต่ละใบ");
-  out.push("DO $face$");
-  out.push("DECLARE");
-  out.push("    charts   bigint;");
-  out.push("    pages    bigint;");
-  out.push("    noPages  bigint;");
-  out.push("BEGIN");
-  out.push("    SELECT count(*),");
-  out.push("           coalesce(sum(jsonb_array_length(fc.strokes)), 0),");
-  out.push("           count(*) FILTER (WHERE jsonb_array_length(fc.strokes) = 0)");
-  out.push("      INTO charts, pages, noPages");
-  out.push("      FROM face_chart fc");
-  out.push("      JOIN visit_master vm ON vm.id = fc.visit_id");
-  out.push(`     WHERE fc.clinic_code = ${lit(clinic)}`);
-  out.push(`       AND vm.visit_date = DATE ${lit(IMPORT_VISIT_DATE)};`);
-  out.push(`    IF charts < ${plan.length} THEN`);
-  out.push(
-    `        RAISE NOTICE 'face_chart: มี % ใบ จากคนไข้ที่มีรูป ${plan.length} คน — ส่วนที่ขาดคือคนที่ยังไม่มีใน ` +
-      "ตาราง patient จึงไม่มี visit ให้ผูก · รูปยังอยู่ในแฟ้มแต่เปิดเป็นหน้าวาดทับไม่ได้', charts;",
-  );
-  out.push("    ELSE");
-  out.push("        RAISE NOTICE 'face_chart: มีครบ % ใบสำหรับคนไข้ที่มีรูป', charts;");
-  out.push("    END IF;");
-  out.push("    RAISE NOTICE 'face_chart: ผูกหน้ารูปไว้รวม % หน้า', pages;");
-  out.push("    IF noPages > 0 THEN");
-  out.push(
-    "        RAISE NOTICE 'face_chart: % ใบที่ strokes ว่าง — ไม่ควรเกิด เพราะสร้างเฉพาะใบที่มีรูปอยู่แล้ว', noPages;",
-  );
-  out.push("    END IF;");
-  out.push("END $face$;");
-  out.push("");
   out.push("COMMIT;");
   out.push("");
   return { sql: out.join("\n"), rows };
