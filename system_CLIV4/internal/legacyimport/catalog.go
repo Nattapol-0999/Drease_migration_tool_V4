@@ -325,6 +325,17 @@ func catalogItemIDByCode(clinic, code string) string {
 // source_table stays out because changing it would re-point provenance at a different
 // table, and source_key stays out because re-minting the key of a row a fee rule already
 // points at is how that rule silently stops matching.
+//
+// The fill is also limited to a row whose source_table is the one this write would have
+// given it. A source_id only means something next to its own table: filling the id of an
+// `items` or `courses` row into a row that says 'catalog' — a course head an older version
+// of this tool wrote, or a row of another type that shares the code — would leave it
+// pointing at a table it does not name, and the trigger then clears its legacy key.
+//
+// item_type stays out too — decided at the first write, then LOCKED, which is how V4
+// itself treats it (a drug/goods row's type is fixed when the app adopts it). It used to be
+// overwritten on every run, so re-running with another -stock-item-type flipped every SKU
+// and undid a pharmacist's manual drug↔goods fixes.
 func upsertCatalogItem(clinic, code, itemType, nameTh, nameEn, categoryName,
 	sellPrice, cost string, status int, sourceTable, sourceIDExpr, createdAt string) string {
 	if sourceTable == "" {
@@ -344,15 +355,16 @@ VALUES (%s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, false, %d,
         %s, now())
 ON CONFLICT (clinic_code, code) WHERE status IN (1, 2) AND NOT code_conflict
-DO UPDATE SET item_type  = EXCLUDED.item_type,
-              name_th    = EXCLUDED.name_th,
+DO UPDATE SET name_th    = EXCLUDED.name_th,
               name_en    = EXCLUDED.name_en,
               category_id = COALESCE(EXCLUDED.category_id, catalog_item.category_id),
               list_price = EXCLUDED.list_price,
               sell_price = EXCLUDED.sell_price,
               cost       = EXCLUDED.cost,
               status     = EXCLUDED.status,
-              source_id  = COALESCE(catalog_item.source_id, EXCLUDED.source_id),
+              source_id  = CASE WHEN catalog_item.source_table = EXCLUDED.source_table
+                               THEN COALESCE(catalog_item.source_id, EXCLUDED.source_id)
+                               ELSE catalog_item.source_id END,
               updated_at = now();
 
 `, lit(clinic), lit(code), lit(itemType), lit(nameTh), nullLit(nameEn),
