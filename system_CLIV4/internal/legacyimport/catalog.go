@@ -418,6 +418,9 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 	// Services the arithmetic let through while the NAME says stored value. Reported for a
 	// human to judge, never refused here.
 	var nameSuspect []string
+	// Priced services drafted because V2 switched them off — named, because each one is a
+	// service that used to arrive sellable.
+	var switchedOff []string
 	for n, d := range mc.listheals {
 		code := d.Text("code")
 		if code == "" {
@@ -470,6 +473,17 @@ func buildCatalogServices(mc *mongoCatalog, in Input, rep *Report) (string, erro
 		if status == statusDraft {
 			draft++
 		}
+		// A service V2 switched off arrives as a draft (owner's decision ก, 24 Oct 2026):
+		// visible to staff and usable inside a course, but not sellable on its own and kept
+		// off the storefront, which shows status 1 only. It used to arrive sellable, because
+		// only the price was consulted. An ABSENT flag is not "off" — docSaysFalse reads
+		// the field's presence, unlike docBool.
+		if docSaysFalse(d, "active") {
+			if status != statusDraft {
+				switchedOff = append(switchedOff, fmt.Sprintf("%s %s", code, oneLine(firstNonEmpty(d.Text("name_th"), d.Text("name_en")))))
+			}
+			status = statusDraft
+		}
 		category := mc.categoryName[docObjectID(d, "category")]
 
 		nameThLit, _ := clip(nameTh, 500)
@@ -521,6 +535,11 @@ ON CONFLICT (catalog_item_id) DO UPDATE SET
 	}
 	if draft > 0 {
 		rep.warnf("catalog_item(service): %d รายการไม่มีราคา → status=draft (ขายไม่ได้จนกว่าจะใส่ราคา)", draft)
+	}
+	if len(switchedOff) > 0 {
+		rep.notef("catalog_item(service): %d รายการที่มีราคาแต่ V2 ปิดใช้งาน (active=false) → status=2 ร่าง "+
+			"ตามมติ 24 ต.ค. 2569 — เห็นในจอและใช้ในคอร์สได้ แต่ขายเดี่ยวไม่ได้และไม่ขึ้นหน้าร้าน · เปิดใช้ในจอได้ทีละรายการ: %s",
+			len(switchedOff), strings.Join(capList(switchedOff, 25), " · "))
 	}
 	if len(creditLike) > 0 {
 		rep.warnf("catalog_service: %d รายการมี point ที่ไม่น้อยกว่าราคาขาย — เป็นวงเงิน/เครดิตบาท ไม่ใช่แต้มสะสม "+
@@ -1377,6 +1396,8 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 	// Every code this run writes, for the register guard at the end of the batch — scoped
 	// to these so a pre-existing V4 course elsewhere in the clinic cannot fail the import.
 	var runCodes []string
+	// Priced courses with lines that are drafted because V2 marks them inactive.
+	var inactiveCourses []string
 
 	for n, d := range mc.courseItems {
 		code := mintCourseCode(n+1, taken)
@@ -1406,6 +1427,16 @@ func buildCourses(mc *mongoCatalog, in Input, rep *Report) (courseSQL, lineSQL s
 		}
 		status := catalogStatus("course", price, true)
 		if childCount == 0 {
+			status = statusDraft
+		}
+		// V2's switch for a course is `status` ('active' / 'inactive') — course_items has no
+		// `active` field at all. An inactive course arrives as a draft (owner's decision ก,
+		// 24 Oct 2026): listed and editable, not sellable. It used to arrive sellable, because
+		// only the price and the line count were consulted.
+		if strings.EqualFold(strings.TrimSpace(d.Text("status")), "inactive") {
+			if status != statusDraft {
+				inactiveCourses = append(inactiveCourses, fmt.Sprintf("%s %s", code, oneLine(nameTh)))
+			}
 			status = statusDraft
 		}
 
@@ -1714,6 +1745,11 @@ WHERE %s IS NOT NULL AND %s IS NOT NULL
 		"list_price ของคอร์สเป็น NULL (V4 คิดราคาปกติจากรายการในคอร์สเอง) · " +
 		"หัวคอร์สที่เครื่องมือรุ่นก่อนเขียนไว้เป็น source_table='catalog' ไม่ถูกแปลงเมื่อรันซ้ำ (มติ 5ก 24 ต.ค. 2569) " +
 		"จำนวนจริงขึ้นเป็น NOTICE ตอนรันสคริปต์")
+	if len(inactiveCourses) > 0 {
+		rep.notef("catalog_item(course): %d คอร์สที่ V2 ตั้งเป็น inactive → status=2 ร่าง ตามมติ 24 ต.ค. 2569 — "+
+			"อยู่ในรายการคอร์สและแก้ได้ แต่ขายไม่ได้จนกว่าจะเปิดใช้ · %s",
+			len(inactiveCourses), strings.Join(capList(inactiveCourses, 25), " · "))
+	}
 	rep.notef("catalog_course_line: เขียน %d บรรทัดคู่กับ catalog_item_child อีก %d แถว (relation_kind='composition') — "+
 		"V4 เก็บองค์ประกอบคอร์สสองที่: catalog_course_line เป็นตัวตน ส่วน catalog_item_child เป็นตัวที่จอรายการคอร์ส "+
 		"การตัดใช้คอร์ส การกระจายภาษี และการออกบิลอ่าน · เขียนแค่ตารางแรกคอร์สจะขึ้นจอว่างเปล่าทั้งที่ข้อมูลอยู่ในฐาน",

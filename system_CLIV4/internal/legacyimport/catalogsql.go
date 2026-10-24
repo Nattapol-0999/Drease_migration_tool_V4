@@ -163,4 +163,15 @@ func docBool(d mongodump.Doc, path string) bool {
 	return isBool && b
 }
 
+// docSaysFalse reports whether a boolean field is PRESENT and false. docBool cannot tell
+// "switched off" from "the export never said", and only the first may switch a row off.
+func docSaysFalse(d mongodump.Doc, path string) bool {
+	v, ok := d.Get(path)
+	if !ok {
+		return false
+	}
+	b, isBool := v.(bool)
+	return isBool && !b
+}
+
 var _ = fmt.Sprintf
