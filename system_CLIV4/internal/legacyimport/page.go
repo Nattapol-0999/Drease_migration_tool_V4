@@ -51,6 +51,12 @@ import (
 //     the loss is visible rather than silent.
 //   - consent_given = true on every row.
 //   - No schema change, so no migrate_source_ref column to dedup on.
+//   - FILED BY VISIT DAY (24 Oct 2026). Every image carries the day it belongs to
+//     (PhotoFile.VisitDate): the page's own วันตรวจ, page.vd_first — the visit V2 shows it
+//     under — or, when the page has no usable vd_first, the Bangkok calendar day of the
+//     scan. The web tool files one visit per patient per such day, so chart pages and
+//     before/after photos land on the day they were taken instead of in the single
+//     2026-01-01 import visit per patient that the 15 Sep 2026 decision produced.
 //
 // DECISIONS TAKEN HERE (implementation, reversible):
 //
@@ -146,6 +152,14 @@ type PhotoFile struct {
 	// TakenAt is rev.created_at as RFC3339 UTC. It is half of the duplicate key the
 	// caller uses (with file_size), because no column exists to record the source ref.
 	TakenAt string `json:"taken_at"`
+	// VisitDate is the day the image is filed under at the target, YYYY-MM-DD: page.vd_first
+	// when it names a real day, else the Bangkok day of TakenAt. See photoVisitDate. The
+	// web tool groups images into one visit per (HN, VisitDate) — reusing a visit V4 already
+	// holds for that patient and day, opening one only when there is none.
+	//
+	// Empty only when the page has neither a usable vd_first nor a revision timestamp; the
+	// report counts those, and the web tool files them under its fixed import date.
+	VisitDate string `json:"visit_date,omitempty"`
 	// DoctorCode is page.doctor. The legacy numeric code is KEPT by the doctor import
 	// (see doctor.go), so this value resolves at the target as-is.
 	DoctorCode string `json:"doctor_code,omitempty"`
@@ -220,6 +234,61 @@ func areaKind(areaTag string) string {
 	}
 }
 
+// visitDateLayout is the one shape V2 writes vd_first in, and the one the target's DATE
+// literal is rendered from.
+const visitDateLayout = "2006-01-02"
+
+// earliestVisitYear is the floor below which a vd_first is not believed. No clinic record
+// predates it, and PostgreSQL refuses year 0000 outright, so letting such a value through
+// would cost the whole import rather than one date.
+const earliestVisitYear = 1900
+
+// clinicZone is where a scan's calendar day is read. A fixed +07:00 rather than
+// time.LoadLocation("Asia/Bangkok"): Thailand keeps no daylight saving, and a fixed zone
+// keeps the manifest identical whether or not the machine running the CLI ships tzdata.
+var clinicZone = time.FixedZone("Asia/Bangkok", 7*60*60)
+
+// visitDateSource says where a VisitDate came from, so the report can count each kind.
+type visitDateSource int
+
+const (
+	visitDateFromV2 visitDateSource = iota
+	visitDateFromScan
+	visitDateUnknown
+)
+
+// photoVisitDate decides the day an image is filed under.
+//
+// page.vd_first first, because it is the visit V2 itself shows the page under, and a form
+// scanned a week after the visit belongs to the visit rather than to the day it was fed to
+// the scanner (measured on Anjali's V2: 3,522 of 239,812 pages scanned after their วันตรวจ,
+// none before). It is accepted only as an exact YYYY-MM-DD naming a real day: anything else
+// would either be refused by the DATE column or file a page on a day that never existed.
+//
+// The scan day is the fallback the owner chose. It is read in clinic time because that is
+// the day the clinic lived: 08:00 UTC is the same afternoon, 20:00 UTC is already the next
+// morning in Bangkok.
+func photoVisitDate(pd mongodump.Doc, scannedAt time.Time) (string, visitDateSource) {
+	if v := strings.TrimSpace(pd.Text("vd_first")); v != "" {
+		if t, err := time.Parse(visitDateLayout, v); err == nil && t.Year() >= earliestVisitYear {
+			return t.Format(visitDateLayout), visitDateFromV2
+		}
+	}
+	if day := clinicDayOf(scannedAt); day != "" {
+		return day, visitDateFromScan
+	}
+	return "", visitDateUnknown
+}
+
+// clinicDayOf is the clinic-time calendar day of an instant, or "" for an instant that is
+// not one (a revision with no timestamp leaves the zero time behind).
+func clinicDayOf(at time.Time) string {
+	if at.IsZero() || at.In(clinicZone).Year() < earliestVisitYear {
+		return ""
+	}
+	return at.In(clinicZone).Format(visitDateLayout)
+}
+
 // buildPhotos reads the `page` collection and returns the copy plan. It renders no SQL:
 // see the package comment above for why.
 func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
@@ -290,6 +359,15 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	// its two slots from before/after, so this number is what says how much of the record
 	// will be reachable there.
 	kinds := map[string]int{}
+	// Where each VisitDate came from, how many distinct patient-days that makes (the most
+	// visits the web tool can open), and the two shapes of vd_first worth a sentence: a page
+	// whose visit is dated AFTER its own scan (a form filled in ahead, or a bad date — a
+	// Buddhist-era year looks exactly like this) and a page spanning several visit days
+	// (filed under the first).
+	dateFrom := map[visitDateSource]int{}
+	patientDays := map[string]bool{}
+	datedAfterScan, spansDays := 0, 0
+	afterScanSample := ""
 
 	for n, d := range docs {
 		hn := strings.TrimSpace(d.Text("hn"))
@@ -370,6 +448,24 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 			key := hn + "|" + takenAt
 			sameInstant[key] = append(sameInstant[key], url)
 
+			visitDate, from := photoVisitDate(pd, latestAt)
+			dateFrom[from]++
+			if visitDate != "" {
+				patientDays[hn+"|"+visitDate] = true
+			}
+			if from == visitDateFromV2 {
+				// Both strings are YYYY-MM-DD, so string order is calendar order.
+				if scanned := clinicDayOf(latestAt); scanned != "" && visitDate > scanned {
+					datedAfterScan++
+					if afterScanSample == "" {
+						afterScanSample = fmt.Sprintf("hn %s วันตรวจ %s แต่สแกน %s", hn, visitDate, scanned)
+					}
+				}
+				if last := strings.TrimSpace(pd.Text("vd_last")); last != "" && last != visitDate {
+					spansDays++
+				}
+			}
+
 			doctorCode, cut := clip(strings.TrimSpace(pd.Text("doctor")), 32)
 			tr.note("doctor_code", cut)
 
@@ -400,6 +496,7 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				HN:         hn,
 				ClinicCode: in.ClinicCode,
 				TakenAt:    takenAt,
+				VisitDate:  visitDate,
 				DoctorCode: doctorCode,
 				CreatedBy:  createdBy,
 				AreaTag:    areaTag,
@@ -440,6 +537,22 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	rep.notef("photos: kind ที่ได้ — before %d · after %d · note %d · "+
 		"โมดัลก่อน-หลังเติมช่องได้จาก before/after เท่านั้น ส่วน note อ่านได้จากแถบรูปของแฟ้ม",
 		kinds["before"], kinds["after"], kinds["note"])
+	rep.notef("photos: วันของ visit — ตามวันตรวจของ V2 (vd_first) %d รูป · ใช้วันที่สแกนตามเวลาไทยแทน %d รูป "+
+		"(vd_first ว่างหรือไม่ใช่วันที่แบบ YYYY-MM-DD) → %d visit (คนไข้ × วัน) · "+
+		"เว็บทูลผูกกับ visit ของคนไข้ในวันนั้นที่ V4 มีอยู่แล้ว ถ้าไม่มีจึงเปิดใบใหม่",
+		dateFrom[visitDateFromV2], dateFrom[visitDateFromScan], len(patientDays))
+	if n := dateFrom[visitDateUnknown]; n > 0 {
+		rep.warnf("photos: %d รูปไม่มีทั้ง vd_first และเวลาสแกน — บอกวันของ visit ไม่ได้ "+
+			"เว็บทูลจะยื่นไว้ที่ visit นำเข้าวันคงที่ 2026-01-01 แบบเครื่องมือรุ่นก่อน", n)
+	}
+	if datedAfterScan > 0 {
+		rep.warnf("photos: %d รูปมีวันตรวจ (vd_first) หลังวันที่สแกน เช่น %s — ยังยื่นตามวันตรวจของ V2 "+
+			"แต่ควรตรวจก่อนว่าไม่ใช่ปี พ.ศ. หรือวันที่พิมพ์ผิด เพราะจะได้ visit ในวันนั้นจริง ๆ",
+			datedAfterScan, afterScanSample)
+	}
+	if spansDays > 0 {
+		rep.notef("photos: %d หน้ามีวันตรวจหลายวัน (vd_first ≠ vd_last) — ยื่นไว้ที่วันแรก (vd_first)", spansDays)
+	}
 	for key, urls := range sameInstant {
 		if len(urls) > 1 {
 			parts := strings.SplitN(key, "|", 2)
