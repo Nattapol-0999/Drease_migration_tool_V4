@@ -949,10 +949,10 @@ export function buildInsertSQL(
   //   - A deleted visit is never picked. Since 0716 it stays in visit_master with a row in
   //     opd_visit_deletion, and RLS hides it and every photo bound to it from the app — a page
   //     filed there would vanish.
-  //   - A signed visit is never picked. The app changes a signed visit's media or face chart
-  //     only through an amendment (opdamend.Guard), so writing into one here would alter a
-  //     locked medical record with no amendment trail. A day whose only visits are signed gets
-  //     a visit of its own instead.
+  //   - A signed visit is never picked (owner's decision, 24 Oct 2026). The app changes a
+  //     signed visit's media or face chart only through an amendment (opdamend.Guard), so
+  //     writing into one here would alter a locked medical record with no amendment trail. A
+  //     day whose only visits are signed gets a visit of its own instead.
   const liveVisit = (hnSQL: string, daySQL: string): string =>
     `SELECT lv.id FROM visit_master lv
          WHERE lv.clinic_code = ${c} AND lv."HN" = ${hnSQL} AND lv.visit_date = ${daySQL}
