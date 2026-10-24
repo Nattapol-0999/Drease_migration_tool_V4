@@ -336,6 +336,10 @@ func catalogItemIDByCode(clinic, code string) string {
 // itself treats it (a drug/goods row's type is fixed when the app adopts it). It used to be
 // overwritten on every run, so re-running with another -stock-item-type flipped every SKU
 // and undid a pharmacist's manual drug↔goods fixes.
+//
+// list_price is NULL for a course: V4 derives a course's ราคาปกติ from its children when
+// it reads one, and its own course editor never stores one (CreateSKU writes
+// nullif(list_price, 0)). Every other type keeps the selling price there, as before.
 func upsertCatalogItem(clinic, code, itemType, nameTh, nameEn, categoryName,
 	sellPrice, cost string, status int, sourceTable, sourceIDExpr, createdAt string) string {
 	if sourceTable == "" {
@@ -346,6 +350,10 @@ func upsertCatalogItem(clinic, code, itemType, nameTh, nameEn, categoryName,
 	}
 	if createdAt == "" {
 		createdAt = "now()"
+	}
+	listPrice := moneyLit(sellPrice)
+	if itemType == "course" {
+		listPrice = "NULL"
 	}
 	return fmt.Sprintf(`INSERT INTO catalog_item
     (clinic_code, code, item_type, name_th, name_en, category_id,
@@ -369,7 +377,7 @@ DO UPDATE SET name_th    = EXCLUDED.name_th,
 
 `, lit(clinic), lit(code), lit(itemType), lit(nameTh), nullLit(nameEn),
 		categoryIDByName(clinic, categoryName),
-		moneyLit(sellPrice), moneyLit(sellPrice), moneyLit(cost),
+		listPrice, moneyLit(sellPrice), moneyLit(cost),
 		lit(sourceTable), sourceIDExpr, status, createdAt)
 }
 
