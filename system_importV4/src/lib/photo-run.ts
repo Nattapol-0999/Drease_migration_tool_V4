@@ -310,9 +310,10 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
     }
 
     // 4 · then the rows, in one transaction on the database host. More than `rows` rows land:
-    // the script also writes one visit and one face_chart per PATIENT, so the tables are named
-    // without a total. Saying "404 rows" while three tables fill up is the kind of half-truth
-    // that makes a later count look like a bug.
+    // the script also files each patient-DAY into a visit — reusing the one V4 already holds,
+    // opening one only when there is none — and gives that visit a face_chart of its chart
+    // pages, so the tables are named without a total. Saying "404 rows" while three tables fill
+    // up is the kind of half-truth that makes a later count look like a bug.
     phase(`เขียน ${rows} รูป → photos + visit + ผังหน้า`);
     const r = await runSSH(sshArgs(dbTarget, psqlCommand(dbTarget)), sql);
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
