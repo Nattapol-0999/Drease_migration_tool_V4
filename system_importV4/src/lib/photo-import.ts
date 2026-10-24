@@ -1163,8 +1163,11 @@ ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
   out.push("      INTO n, total");
   out.push(`      FROM photos WHERE clinic_code = ${lit(clinic)};`);
   // Why the two reasons are separated: a missing `patient` row is fixed by importing the
-  // patients group first, a blank branch is a data problem in the source. Counted here rather
-  // than in the visit block above because that block runs BEFORE these rows exist.
+  // patients group first, a blank branch is a data problem in the source. Counted here, after
+  // every block above, so the rows of this run are in the count.
+  //
+  // "First" is the operative word. A re-run does NOT bind a row that went in without a visit:
+  // the duplicate key skips the row, and a visit is opened only for images that are new.
   out.push("    SELECT count(*) FILTER (WHERE p.id IS NULL),");
   out.push("           count(*) FILTER (WHERE p.id IS NOT NULL AND coalesce(p.branch_code, '') = '')");
   out.push("      INTO noPatient, noBranch");
@@ -1174,7 +1177,8 @@ ON CONFLICT (clinic_code, visit_id) DO NOTHING;`,
   out.push("    IF noPatient > 0 OR noBranch > 0 THEN");
   out.push(
     "        RAISE NOTICE 'รูปที่ไม่ได้ผูก visit: [HN ไม่มีในตาราง patient: %, คนไข้ไม่มีสาขา: %] " +
-      "— รูปเข้าฐานแล้วแต่เปิดในโมดัลก่อน-หลังไม่ได้ · นำเข้ากลุ่ม patients ก่อนแล้วรันรูปซ้ำจะผูกให้', " +
+      "— รูปเข้าฐานแล้วแต่เปิดในโมดัลก่อน-หลังไม่ได้ · ต้องนำเข้ากลุ่ม patients ก่อนนำเข้ารูป " +
+      "รันรูปซ้ำทีหลังไม่ผูกแถวที่เข้าไปแล้ว (ตัวกันซ้ำข้ามแถวเดิม)', " +
       "noPatient, noBranch;",
   );
   out.push("    END IF;");
