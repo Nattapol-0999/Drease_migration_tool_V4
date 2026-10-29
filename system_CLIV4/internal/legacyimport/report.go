@@ -43,7 +43,7 @@ var order = append(append(append(append(append(append([]string{
 	EntDoctor, EntRoom, EntPatient,
 }, addressOrder...), []string{EntAppointment}...),
 	append(catalogOrder, moneyOrder...)...), courseBoughtOrder...), loyaltyOrder...),
-	append(linebindOrder, photoOrder...)...)
+	append(append(linebindOrder, opdNoteOrder...), photoOrder...)...)
 
 // EntityOrder returns a copy of the order, for callers that render entities without
 // holding a Report. A copy, not the slice: the order is policy, and a caller must not
@@ -95,6 +95,10 @@ var entityGroups = map[string][]string{
 	// group cannot exist (NOT NULL FK), and a pointer with no binding is the old flow the
 	// owner closed — so the three travel together or not at all.
 	"linebind": {EntLineoaGroup, EntPatientLineBinding, EntPatientLineID},
+	// opdnote is ONE entity because its passes share temporary tables, and the script
+	// commits between entities. Visits, notes, advice and vital signs travel together: a
+	// note is bound to the visit the same transaction opened for it.
+	"opdnote": {EntOpdNote},
 	// photos produces no SQL, so selecting it changes nothing in the .sql artifact — it
 	// is here so `-only photos` is not rejected as an unknown group when an operator
 	// wants the image manifest and nothing else.
@@ -126,6 +130,9 @@ var groupDependsOn = map[string][]string{
 	// nothing (and the script's closing NOTICE counts the shortfall). Listed so the
 	// report says so before the run rather than after.
 	"linebind": {"patients"},
+	// opdnote is NOT advisory in effect: its SQL guard refuses the whole lane when an HN
+	// is not a patient of the clinic, or a patient has no branch to open the visit at.
+	"opdnote": {"patients"},
 }
 
 // GroupNames lists the selectable groups, sorted for a stable UI and help text.

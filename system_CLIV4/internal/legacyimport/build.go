@@ -172,6 +172,12 @@ type Input struct {
 	*/
 	StockItemType string
 
+	// The OPD note lane (opdnote.go): legacy `patient_visit_mater` (sic), `patient_opd_note`
+	// and `patient_vital_sign`. The author is translated through DoctorDump.
+	VisitDump     []byte
+	OpdNoteDump   []byte
+	VitalSignDump []byte
+
 	// PageDump is the mongo export of `mris.page` — the patient record pages and the
 	// images attached to them. It is a SEPARATE flag from MongoDump because it is a
 	// different database (mris, not the catalog one) and because it is the only input
@@ -281,7 +287,8 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	// after the whole file has been uploaded and started. BuildScript re-checks that
 	// invariant on the assembled text, so forgetting -users is refused rather than emitted.
 	needUsers := wants(EntUsers, EntClinicUser, EntClinicStaff, EntAppointment, EntPatient)
-	needDoctor := wants(EntDoctor, EntClinicStaff, EntAppointment)
+	// EntOpdNote: a note's author is a V2 user id, translated to doctor_code through this table.
+	needDoctor := wants(EntDoctor, EntClinicStaff, EntAppointment, EntOpdNote)
 
 	if len(in.UsersDump) > 0 && needUsers {
 		_, userRows, err = legacydump.Parse(string(in.UsersDump), "users")
@@ -397,7 +404,7 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 	// able to tell whether that patient exists. Without the dump it cannot, and the SQL
 	// guard is left to check against the live table instead.
 	if len(in.PatientDump) > 0 &&
-		wants(EntPatient, EntAppointment, EntInvoice, EntCourseBought, EntLoyaltyAccount) {
+		wants(EntPatient, EntAppointment, EntInvoice, EntCourseBought, EntLoyaltyAccount, EntOpdNote) {
 		// The column list is kept, not discarded: buildPatient needs it to tell a file with
 		// a few unusable rows apart from a file whose HN column is spelled differently.
 		patientCols, patientRows, err := legacydump.Parse(string(in.PatientDump), "patient")
@@ -424,6 +431,45 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 		}
 		out[EntPatientAddress] = addrSQL
 		out[EntPatientAddressFill] = fillSQL
+	}
+
+	// ── OPD note: visits, notes and vital signs ─────────────────────────────────
+	//
+	// After patients for the same reason as appointments: knownHN lets the report say before
+	// the run which HNs the SQL guard is going to refuse.
+	if (len(in.VisitDump) > 0 || len(in.OpdNoteDump) > 0 || len(in.VitalSignDump) > 0) && wants(EntOpdNote) {
+		parse := func(body []byte, table string) ([]legacydump.Row, error) {
+			if len(body) == 0 {
+				return nil, nil
+			}
+			_, rows, perr := legacydump.Parse(string(body), table)
+			if perr != nil {
+				return nil, fmt.Errorf("%s dump: %w", table, perr)
+			}
+			return rows, nil
+		}
+		visitRows, verr := parse(in.VisitDump, "patient_visit_mater")
+		if verr != nil {
+			return nil, nil, money, verr
+		}
+		noteRows, nerr := parse(in.OpdNoteDump, "patient_opd_note")
+		if nerr != nil {
+			return nil, nil, money, nerr
+		}
+		vitalRows, serr := parse(in.VitalSignDump, "patient_vital_sign")
+		if serr != nil {
+			return nil, nil, money, serr
+		}
+		if len(visitRows) == 0 && len(vitalRows) > 0 {
+			rep.warnf("opd_note: มีสัญญาณชีพแต่ไม่มีตาราง patient_visit_mater — ผูกสัญญาณชีพกับ visit ไม่ได้เลย")
+		}
+		opdSQL, oerr := buildOpdNote(visitRows, noteRows, vitalRows, doctorRows, knownHN, in, rep)
+		if oerr != nil {
+			return nil, nil, money, oerr
+		}
+		if strings.TrimSpace(opdSQL) != "" {
+			out[EntOpdNote] = opdSQL
+		}
 	}
 
 	if len(apptRows) > 0 {
