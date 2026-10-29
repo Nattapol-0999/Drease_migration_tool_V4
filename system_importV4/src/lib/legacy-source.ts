@@ -100,7 +100,13 @@ const MAX_STDERR_CHARS = 64 * 1024;
 // clinic has, which company owns each one, and how much data names it. Without it a
 // multi-branch tenant pulled through this tab looks single-branch, and every patient in it
 // gets filed at one branch with no error anywhere to say so. It is a handful of rows.
-const DEFAULT_TABLES = "users,doctor,clinic,patient,appointment,branch";
+//
+// patient_visit_mater (the legacy spelling), patient_opd_note and patient_vital_sign feed the
+// opdnote group: visits on their real dates, the OPD note boxes and the vital-sign form.
+// Production sets LEGACY_MYSQL_TABLES, which REPLACES this list, so they must be added there
+// too or the pull never fetches them and the group has nothing to import.
+const DEFAULT_TABLES =
+  "users,doctor,clinic,patient,appointment,branch,patient_visit_mater,patient_opd_note,patient_vital_sign";
 
 // The catalog collections the CLI reads out of the dbmongo half. `stocks` is here
 // because slot_stock (one row per lot) is built from it.

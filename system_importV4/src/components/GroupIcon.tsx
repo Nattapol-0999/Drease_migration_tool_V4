@@ -86,6 +86,14 @@ const PATHS: Record<ImportGroup, React.ReactNode> = {
   loyalty: (
     <path d="M8 2.2l1.9 3.9 4.3.6-3.1 3 .7 4.2L8 11.9l-3.8 2 .7-4.2-3.1-3 4.3-.6z" />
   ),
+  // opdnote — a clipboard with a written line, i.e. a visit note
+  opdnote: (
+    <>
+      <path d="M5.2 2.6H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-10a1 1 0 0 0-1-1h-1.2" />
+      <path d="M6 1.6h4v2H6z" />
+      <path d="M5.4 7h5.2M5.4 9.4h5.2M5.4 11.8h3" />
+    </>
+  ),
 };
 
 export function GroupIcon({ group }: { group: ImportGroup }) {

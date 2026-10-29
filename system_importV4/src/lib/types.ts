@@ -169,6 +169,14 @@ export const IMPORT_GROUPS = [
     detail:
       "loyalty_account (ยอดแต้มต่อคนไข้ · ไม่รวมประวัติการได้/ใช้แต้ม และยังแลกไม่ได้จนตั้งอัตราในจอ)",
   },
+  {
+    group: "opdnote",
+    label: "OPD note",
+    // The Anjali rules (C1, 22 Oct 2026). The diagnosis box of V2's OPD page (patient_diag)
+    // is NOT part of it, said here so the label does not promise the whole page.
+    detail:
+      "visit ตามวันจริง · OPD note → S/O/A/P + คำแนะนำ · สัญญาณชีพ (ต้องมีคนไข้ในระบบก่อน · ไม่รวมกล่องการวินิจฉัย)",
+  },
 ] as const;
 
 export type ImportGroup = (typeof IMPORT_GROUPS)[number]["group"];
