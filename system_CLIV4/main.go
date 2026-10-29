@@ -270,6 +270,10 @@ var combinedTables = []struct {
 	{"patient", "patient", func(in *legacyimport.Input) *[]byte { return &in.PatientDump }},
 	{"patient_address", "patient_address (ที่อยู่คนไข้)", func(in *legacyimport.Input) *[]byte { return &in.AddressDump }},
 	{"appointment", "appointment", func(in *legacyimport.Input) *[]byte { return &in.AppointmentDump }},
+	// The OPD note lane (-only opdnote). The table name is the legacy spelling, not a typo here.
+	{"patient_visit_mater", "visit_master (visit ตามวันจริงของ V2)", func(in *legacyimport.Input) *[]byte { return &in.VisitDump }},
+	{"patient_opd_note", "opd_record + opd_visit_advice (OPD note → S/O/A/P + คำแนะนำ)", func(in *legacyimport.Input) *[]byte { return &in.OpdNoteDump }},
+	{"patient_vital_sign", "vital_sign + อาการเบื้องต้นลงช่อง S", func(in *legacyimport.Input) *[]byte { return &in.VitalSignDump }},
 	// No table is written FROM branch, but it is not optional either: branch.stock_id is
 	// what decides the branch of every slot_stock lot (see stockOwners). Calling it
 	// survey-only is what invited leaving it out, and leaving it out used to send a whole
@@ -282,7 +286,8 @@ var combinedTables = []struct {
 // they hand over a whole-database export. Saying "present but not read" out loud is the
 // difference between a limitation and a silent data loss.
 var knownUnsupported = map[string]string{
-	"patient_diag": "การวินิจฉัย — เวชระเบียนยังไม่อยู่ในเฟสนี้",
+	"patient_diag":         "กล่อง \"การวินิจฉัย\" และ \"Note เพิ่มเติม\" ของหน้า OPD — ไม่นำเข้า (เหมือนรอบ Anjali)",
+	"patient_opd_physical": "แบบประเมินกายภาพ — V4 ไม่มีตารางรองรับ",
 	// Read, and needed — just not copied into a table of its own. Said here too because an
 	// operator who skips it on the strength of this list breaks the stock import.
 	"branch":      "สาขา — V4 ใช้ตาราง clinic เป็นทะเบียนสาขา สร้างตอนตั้งคลินิก · แต่ยังต้องส่งตารางนี้มา เพราะ branch.stock_id เป็นตัวกำหนดสาขาของทุกล็อตสต็อก",
