@@ -28,12 +28,18 @@ const opdNoteDump = "INSERT INTO `patient_opd_note` (`id`, `HN`, `visitDate`, `c
 
 func opdBuild(t *testing.T, visits, notes, vitals string) (string, *Report) {
 	t.Helper()
+	return opdBuildKnown(t, nil, visits, notes, vitals)
+}
+
+// opdBuildKnown is opdBuild with the patient dump's HN set; nil is a run that read none.
+func opdBuildKnown(t *testing.T, knownHN map[string]bool, visits, notes, vitals string) (string, *Report) {
+	t.Helper()
 	in := Input{ClinicCode: "CTEST01"}
 	rep := NewReport(in.ClinicCode)
 	vr := parseOpt(t, "patient_visit_mater", visits)
 	nr := parseOpt(t, "patient_opd_note", notes)
 	sr := parseOpt(t, "patient_vital_sign", vitals)
-	sqlText, err := buildOpdNote(vr, nr, sr, parseTable(t, "doctor", opdDoctorDump), nil, in, rep)
+	sqlText, err := buildOpdNote(vr, nr, sr, parseTable(t, "doctor", opdDoctorDump), knownHN, in, rep)
 	if err != nil {
 		t.Fatalf("buildOpdNote: %v", err)
 	}
@@ -206,5 +212,104 @@ func TestOpdNoteIsAGroupOfItsOwnAfterPatients(t *testing.T) {
 	}
 	if !strings.Contains(script, "-- ── opd_note") {
 		t.Errorf("the script has no opd_note section")
+	}
+}
+
+// 016500001 is a real case (soel, 23 Oct 2026): a V2 visit whose HN V2's own patient table
+// does not carry. It is skipped and named instead of stopping the whole lane at the HN
+// guard; the patient who does exist keeps every record.
+const opdOrphanVisitDump = "INSERT INTO `patient_visit_mater` (`id`, `visitdate`, `VN`, `HN`, `user_id`, `create_at`, `active`) VALUES\n" +
+	"(1, '2026-10-30 00:00:00', '001', '016900002', 391, '2026-10-30 01:41:40', '1'),\n" +
+	"(4, '2026-10-30 00:00:00', '003', '016500001', 391, '2026-10-30 03:00:00', '1');\n"
+
+const opdOrphanNoteDump = "INSERT INTO `patient_opd_note` (`id`, `HN`, `visitDate`, `chief_complaint`, `presen_illness`, `physical_exam`, `diagnosis_impression`, `management`, `advice`, `user_id`, `created_at`, `update_at`) VALUES\n" +
+	"(10, '016900002', '2026-10-30 00:00:00', 'cc one', '', '', '', '', '', '391', NULL, NULL),\n" +
+	"(13, '016500001', '2026-10-30 00:00:00', 'cc orphan', '', '', '', '', '', '391', NULL, NULL);\n"
+
+const opdOrphanVitalDump = "INSERT INTO `patient_vital_sign` (`id`, `visitdate`, `VN`, `weight`, `heart_rate`) VALUES\n" +
+	"(21, '2026-10-30 00:00:00', '001', 60, 72),\n" +
+	"(30, '2026-10-30 00:00:00', '003', 55, 80);\n"
+
+func TestOpdNoteSkipsAnHNThatV2HasNoPatientFor(t *testing.T) {
+	known := map[string]bool{"016900002": true}
+	sqlText, rep := opdBuildKnown(t, known, opdOrphanVisitDump, opdOrphanNoteDump, opdOrphanVitalDump)
+
+	if strings.Contains(sqlText, "'016500001'") || strings.Contains(sqlText, "cc orphan") || strings.Contains(sqlText, "  (30, ") {
+		t.Errorf("a record of an HN with no V2 patient reached the script:\n%s", head(sqlText, 3000))
+	}
+	for _, want := range []string{"(1, '2026-10-30', '001', '016900002', '1000')", "cc one", "  (21, "} {
+		if !strings.Contains(sqlText, want) {
+			t.Errorf("the patient who exists lost a record, want %q in:\n%s", want, head(sqlText, 3000))
+		}
+	}
+	e := rep.Entities[EntOpdNote]
+	for reason, want := range map[string]int{
+		"visit: HN ไม่มีในทะเบียนคนไข้ของ V2":                   1,
+		"note: HN ไม่มีในทะเบียนคนไข้ของ V2":                    1,
+		"vital: เป็นของ visit ที่ HN ไม่มีในทะเบียนคนไข้ของ V2": 1,
+	} {
+		if e == nil || e.Skipped[reason] != want {
+			t.Errorf("skip %q counted %d, want %d: %+v", reason, e.Skipped[reason], want, e)
+		}
+	}
+	if !hasText(rep.Warnings, "HN 1 ราย") || !hasText(rep.Warnings, "016500001") {
+		t.Errorf("the report does not name the skipped HN: %v", rep.Warnings)
+	}
+	// The SQL guard stays: an HN V2 does carry but V4 does not is still refused at run time.
+	if !strings.Contains(sqlText, "ไม่มีในทะเบียนคนไข้ของคลินิกนี้") {
+		t.Errorf("the HN guard was dropped from the script")
+	}
+
+	// A vital's (date, VN) shared with an orphan's visit still names two patients.
+	shared := strings.Replace(opdOrphanVisitDump, "(4, '2026-10-30 00:00:00', '003'", "(4, '2026-10-30 00:00:00', '001'", 1)
+	sqlText, rep = opdBuildKnown(t, known, shared, "", opdOrphanVitalDump)
+	if strings.Contains(sqlText, "  (21, ") {
+		t.Errorf("a vital whose (date, VN) is shared with an orphan's visit was given to the other patient")
+	}
+	if e := rep.Entities[EntOpdNote]; e == nil || e.Skipped["vital: วันที่+VN ตรงกับคนไข้มากกว่า 1 คน — ไม่รู้ว่าเป็นของใคร"] != 1 {
+		t.Errorf("the shared vital was not counted as ambiguous: %+v", e)
+	}
+}
+
+func TestOpdNoteWithNoPatientDumpLeavesTheHNToTheGuard(t *testing.T) {
+	// nil = this run read no patient file and cannot tell an orphan from a patient, so
+	// nothing is skipped and the script's HN guard decides against V4's patient table.
+	sqlText, rep := opdBuildKnown(t, nil, opdOrphanVisitDump, opdOrphanNoteDump, opdOrphanVitalDump)
+	for _, want := range []string{"'016500001'", "cc orphan", "  (30, "} {
+		if !strings.Contains(sqlText, want) {
+			t.Errorf("want %q staged when no patient file was read", want)
+		}
+	}
+	if hasText(rep.Warnings, "016500001") {
+		t.Errorf("an HN was reported skipped although no patient file was read: %v", rep.Warnings)
+	}
+	if !hasText(rep.Notes, "ไม่ได้อ่านไฟล์คนไข้") {
+		t.Errorf("the report does not say the guard decides: %v", rep.Notes)
+	}
+}
+
+func TestOpdNoteBuildScriptSkipsOrphansFromThePatientDump(t *testing.T) {
+	in := Input{
+		ClinicCode:    "CTEST01",
+		Groups:        []string{"opdnote"},
+		PatientDump:   []byte("INSERT INTO `patient` (`HN`, `branch_code`) VALUES ('016900002', 'B1');\n"),
+		VisitDump:     []byte(opdOrphanVisitDump),
+		OpdNoteDump:   []byte(opdOrphanNoteDump),
+		VitalSignDump: []byte(opdOrphanVitalDump),
+		DoctorDump:    []byte(opdDoctorDump),
+	}
+	script, rep, err := BuildScript(in)
+	if err != nil {
+		t.Fatalf("BuildScript: %v", err)
+	}
+	// Quoted: the bare HN is expected in the header, which repeats the report's warnings.
+	if strings.Contains(script, "'016500001'") || strings.Contains(script, "cc orphan") {
+		t.Errorf("BuildScript did not hand the patient dump's HNs to the OPD lane")
+	}
+	if !strings.Contains(script, "'016900002'") {
+		t.Errorf("the patient in the dump lost its visit")
+	}
+	if !hasText(rep.Warnings, "016500001") {
+		t.Errorf("the skipped HN is not in the report: %v", rep.Warnings)
 	}
 }
