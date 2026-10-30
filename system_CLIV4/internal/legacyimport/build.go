@@ -435,8 +435,8 @@ func BuildAll(in Input, rep *Report) (batches map[string]string, userRows []lega
 
 	// ── OPD note: visits, notes and vital signs ─────────────────────────────────
 	//
-	// After patients for the same reason as appointments: knownHN lets the report say before
-	// the run which HNs the SQL guard is going to refuse.
+	// After patients for the same reason as appointments: knownHN lets the lane skip, and
+	// name, the records whose HN V2's own patient table does not carry.
 	if (len(in.VisitDump) > 0 || len(in.OpdNoteDump) > 0 || len(in.VitalSignDump) > 0) && wants(EntOpdNote) {
 		parse := func(body []byte, table string) ([]legacydump.Row, error) {
 			if len(body) == 0 {

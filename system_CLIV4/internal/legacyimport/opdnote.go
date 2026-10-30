@@ -74,6 +74,9 @@ const (
 	opdAuthorWidth = 32
 	opdHNWidth     = 32
 	opdVNWidth     = 8
+
+	// opdOrphanShown caps the orphan HNs named in the report; the count is always whole.
+	opdOrphanShown = 20
 )
 
 // opdSymptomLabels are the V2 vital form's own field labels. In C1's source 341 of 345
@@ -303,8 +306,26 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 		}
 	}
 
+	// A medical record whose HN V2's own patient table does not carry belongs to nobody the
+	// clinic can name, so it is skipped and listed rather than refusing the whole lane
+	// (owner's call, 23 Oct 2026 — the same as orphan bills and the Anjali photos). Only
+	// when the patient dump was read: with knownHN nil this run cannot tell, and the SQL
+	// guard decides against the live patient table instead. An HN that V2 does carry but
+	// V4 does not is still refused there — that is "import patients first", not an orphan.
+	orphans := map[string]bool{}
+	orphan := func(hn string) bool {
+		if knownHN == nil || knownHN[hn] {
+			return false
+		}
+		orphans[hn] = true
+		return true
+	}
+
 	// ── visits ──────────────────────────────────────────────────────────────────
 	var visits []opdVisit
+	// hnsAt is filled before the orphan filter: a vital's (date, VN) is checked against
+	// every V2 visit, so one shared with an orphan's visit still counts as ambiguous.
+	hnsAt := map[[2]string]map[string]bool{}
 	for _, r := range visitRows {
 		// C1 took active = '1' only. A dump whose table has no active column at all (older
 		// V2) is all active — reading the missing column as "closed" would drop every visit.
@@ -330,6 +351,15 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 		if len([]rune(hn)) > opdHNWidth || len([]rune(vn)) > opdVNWidth {
 			// Clipping either would quietly move the visit to another patient or number.
 			e.skip("visit: HN หรือ VN ยาวเกินช่องของ V4")
+			continue
+		}
+		k := [2]string{day, vn}
+		if hnsAt[k] == nil {
+			hnsAt[k] = map[string]bool{}
+		}
+		hnsAt[k][hn] = true
+		if orphan(hn) {
+			e.skip("visit: HN ไม่มีในทะเบียนคนไข้ของ V2")
 			continue
 		}
 		countEra(day)
@@ -358,6 +388,10 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 		hn := r.Get("HN")
 		if hn == "" || len([]rune(hn)) > opdHNWidth {
 			e.skip("note: ไม่มี HN หรือ HN ยาวเกินช่องของ V4")
+			continue
+		}
+		if orphan(hn) {
+			e.skip("note: HN ไม่มีในทะเบียนคนไข้ของ V2")
 			continue
 		}
 		k := [2]string{hn, day}
@@ -415,14 +449,6 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 	// belongs to is looked up among the staged visits, and a vital whose (date, VN) names
 	// more than one patient is dropped: a blood pressure filed under the wrong person is
 	// worse than a blank one.
-	hnsAt := map[[2]string]map[string]bool{}
-	for _, v := range visits {
-		k := [2]string{v.day, v.vn}
-		if hnsAt[k] == nil {
-			hnsAt[k] = map[string]bool{}
-		}
-		hnsAt[k][v.hn] = true
-	}
 	type rawVital struct {
 		id int64
 		r  legacydump.Row
@@ -448,6 +474,14 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 			continue
 		case n > 1:
 			e.skip("vital: วันที่+VN ตรงกับคนไข้มากกว่า 1 คน — ไม่รู้ว่าเป็นของใคร")
+			continue
+		}
+		owner := ""
+		for hn := range hnsAt[k] {
+			owner = hn
+		}
+		if orphans[owner] {
+			e.skip("vital: เป็นของ visit ที่ HN ไม่มีในทะเบียนคนไข้ของ V2")
 			continue
 		}
 		if _, seen := vitalGroups[k]; !seen {
@@ -512,25 +546,29 @@ func buildOpdNote(visitRows, noteRows, vitalRows, doctorRows []legacydump.Row,
 	sort.Slice(vitals, func(i, j int) bool { return vitals[i].src < vitals[j].src })
 
 	// ── what the operator should know before running it ─────────────────────────
+	//
+	// Named before the early return: a file whose every record is an orphan's still has to
+	// say why nothing was written.
+	if len(orphans) > 0 {
+		list := make([]string, 0, len(orphans))
+		for hn := range orphans {
+			list = append(list, hn)
+		}
+		sort.Strings(list)
+		shown := list
+		more := ""
+		if len(shown) > opdOrphanShown {
+			shown, more = shown[:opdOrphanShown], fmt.Sprintf(" …และอีก %d ราย", len(list)-opdOrphanShown)
+		}
+		rep.warnf("opd_note: ข้าม visit/OPD note/สัญญาณชีพของ HN %d ราย ที่ไม่มีในทะเบียนคนไข้ของ V2 เอง (เวชระเบียนที่ไม่รู้ว่าเป็นของใคร ไม่ถูกเขียน): %s%s",
+			len(list), strings.Join(shown, ", "), more)
+	}
+	if knownHN == nil && (len(visits) > 0 || len(notes) > 0) {
+		rep.notef("opd_note: รอบนี้ไม่ได้อ่านไฟล์คนไข้ จึงเทียบ HN ล่วงหน้าไม่ได้ — ด่าน HN ในสคริปต์จะเทียบกับทะเบียนคนไข้ของ V4 และหยุดทั้งกลุ่มถ้ามี HN ที่ไม่มีคนไข้")
+	}
 	if len(visits) == 0 && len(notes) == 0 {
 		rep.notef("opd_note: ไม่มี visit หรือ OPD note ที่นำเข้าได้ในไฟล์ — ไม่มีอะไรให้เขียน")
 		return "", nil
-	}
-	if knownHN != nil {
-		missing := map[string]bool{}
-		for _, v := range visits {
-			if !knownHN[v.hn] {
-				missing[v.hn] = true
-			}
-		}
-		for _, n := range notes {
-			if !knownHN[n.hn] {
-				missing[n.hn] = true
-			}
-		}
-		if len(missing) > 0 {
-			rep.warnf("opd_note: HN %d รายของ visit/OPD note ไม่มีในไฟล์คนไข้ — ถ้าปลายทางก็ไม่มีคนไข้เหล่านี้ สคริปต์จะหยุดที่ด่าน HN ทั้งกลุ่ม (เวชระเบียนของคนที่ไม่มีอยู่จะไม่ถูกเขียน)", len(missing))
-		}
 	}
 	if buddhistEra > 0 {
 		rep.warnf("opd_note: %d visit/note ลงปี ≥ 2400 (น่าจะเป็นปี พ.ศ. ในช่อง ค.ศ.) — จะขึ้นบนสุดของรายการ visit ตลอดไป ตรวจก่อนรัน", buddhistEra)
