@@ -45,8 +45,9 @@ func main() {
 		address     = flag.String("patient_address", "", "ไฟล์ dump ตาราง patient_address (.sql)")
 		appointment = flag.String("appointment", "", "ไฟล์ dump ตาราง appointment (.sql)")
 
-		mongo = flag.String("mongo", "", "ไฟล์ dump MongoDB (.js) — แคตตาล็อก: category, items, listheals, course_items")
-		page  = flag.String("page", "", "ไฟล์ dump MongoDB ของ mris.page (.js) — หน้าเวชระเบียน + รูปแนบ · ออกเป็น manifest ไม่ใช่ SQL")
+		mongo     = flag.String("mongo", "", "ไฟล์ dump MongoDB (.js) — แคตตาล็อก: category, items, listheals, course_items")
+		page      = flag.String("page", "", "ไฟล์ dump MongoDB ของ mris.page (.js) — หน้าเวชระเบียน + รูปแนบ · ออกเป็น manifest ไม่ใช่ SQL")
+		pageTypes = flag.String("page-type-map", "", "JSON mapping doctype → before_after/form/drawing สำหรับรหัสเฉพาะคลินิก")
 
 		combined = flag.String("sql", "", "ไฟล์ dump MySQL รวมทุกตารางไว้ไฟล์เดียว — ระบบหาตาราง users/doctor/clinic/patient/appointment ให้เอง (ถ้าระบุช่องเฉพาะด้านบนด้วย ช่องนั้นชนะ)")
 
@@ -149,6 +150,11 @@ func main() {
 
 		MongoDump: mustRead("mongo", *mongo),
 		PageDump:  mustRead("page", *page),
+	}
+	if strings.TrimSpace(*pageTypes) != "" {
+		if err := json.Unmarshal([]byte(*pageTypes), &in.PageTypeMap); err != nil {
+			fail("page-type-map ต้องเป็น JSON object ของ doctype → ประเภท: " + err.Error())
+		}
 	}
 
 	// One combined dump instead of one file per table. A phpMyAdmin export of the whole
