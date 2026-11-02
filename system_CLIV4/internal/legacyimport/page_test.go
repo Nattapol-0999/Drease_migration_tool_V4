@@ -375,6 +375,7 @@ func TestPageTrashDoesNotStealTheSurvivorsFilename(t *testing.T) {
         {
             "page_id": ObjectId("6a69baf5846d48306c9757fd"),
             "page": "002",
+            "vd_first": "2026-07-29",
             "doctype": "before",
             "doctor": "4764",
             "rev": [
@@ -617,7 +618,6 @@ func TestPageVisitDateFallsBackToTheBangkokScanDay(t *testing.T) {
 	for _, tc := range []struct{ name, raw string }{
 		{"empty", `""`},
 		{"null", `null`},
-		{"day first", `"29/07/2026"`},
 		{"no such day", `"2026-02-30"`},
 		{"carries a time", `"2026-07-29T00:00:00Z"`},
 		{"year zero", `"0000-07-29"`},
@@ -649,29 +649,19 @@ func TestPageVisitDateSpanningDaysUsesTheFirst(t *testing.T) {
 // A visit dated after its own scan keeps V2's date — that is the visit V2 shows — but is
 // warned about: a Buddhist-era year (2569 for 2026) looks exactly like this and would open
 // visits five centuries out.
-func TestPageVisitDateAfterTheScanIsKeptAndWarned(t *testing.T) {
-	man, rep := buildOne(t, withVdFirst(`"2569-07-29"`))
-	if got := man.Files[0].VisitDate; got != "2569-07-29" {
-		t.Errorf("visit_date = %q, want V2's own 2569-07-29", got)
-	}
-	w := reportLine(rep.Warnings, "หลังวันที่สแกน")
-	if w == "" || !strings.Contains(w, "016900066") {
-		t.Errorf("no warning naming the patient for a visit dated after its scan; warnings = %v", rep.Warnings)
+func TestPageInvalidYearUsesScanDay(t *testing.T) {
+	man, _ := buildOne(t, withVdFirst(`"2569-07-29"`))
+	if man.Files[0].VisitDate != "2026-07-29" {
+		t.Fatal(man.Files[0].VisitDate)
 	}
 }
 
-// Neither a usable vd_first nor a revision timestamp: there is no day to give. The image is
-// still imported — the web tool files it under its fixed date — and the count is a warning.
-func TestPageWithNoDayAtAllIsWarned(t *testing.T) {
+func TestPageWithNoDayAtAllIsRefused(t *testing.T) {
 	body := withVdFirst(`""`)
-	body = strings.Replace(body, `"created_at": ISODate("2026-07-29T08:33:57.787Z"),`, ``, 1)
-	body = strings.Replace(body, `"created_at": ISODate("2026-07-29T08:34:38.796Z"),`, ``, 1)
-	man, rep := buildOne(t, body)
-	if got := man.Files[0].VisitDate; got != "" {
-		t.Errorf("visit_date = %q, want empty when no day can be read", got)
-	}
-	if reportLine(rep.Warnings, "ไม่มีทั้ง vd_first และเวลาสแกน") == "" {
-		t.Errorf("an image with no day was not warned about; warnings = %v", rep.Warnings)
+	body = strings.ReplaceAll(body, `"created_at": ISODate("2026-07-29T08:33:57.787Z"),`, ``)
+	body = strings.ReplaceAll(body, `"created_at": ISODate("2026-07-29T08:34:38.796Z"),`, ``)
+	if _, err := buildPhotos([]byte(body), Input{ClinicCode: "TEST"}, NewReport("TEST")); err == nil {
+		t.Fatal("missing date and time accepted")
 	}
 }
 

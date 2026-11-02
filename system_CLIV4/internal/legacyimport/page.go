@@ -3,6 +3,7 @@ package legacyimport
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -12,79 +13,16 @@ import (
 	"system_cliv4/internal/mongodump"
 )
 
-// Patient page images: the legacy `mris.page` collection onto V4 `public.photos`.
+// Patient page images: mris.page -> V4 photos and per-day encounters.
+// The CLI creates a versioned copy manifest and never opens a database. The web
+// importer copies bytes, then renders/executes reviewable SQL against V4.
 //
-// WHY THIS ENTITY PRODUCES NO SQL
-//
-// Every other entity here renders INSERT statements. This one renders a MANIFEST
-// instead, because one column cannot be known from the dump: photos.file_size is the
-// byte count of the actual image, and the images arrive separately as a tar of the
-// legacy public/ folder. The dump names the file; only the caller holding the tar can
-// weigh it.
-//
-// So the split is: this file decides EVERYTHING about the mapping — which revision
-// wins, which HN owns the image, what taken_at/doctor_code/area_tag become, where the
-// bytes must land — and the caller does exactly two things it cannot get wrong: read
-// the size off the file it is copying, and fill those values into a row. No mapping
-// decision leaves this package.
-//
-// WHAT THE SOURCE LOOKS LIKE
-//
-//	{ _id, hn: "016900066",
-//	  page: [ { page_id, page: "001", an, vn, vd_first, vd_last, docgroup,
-//	            doctype: "OPD01004", clinic, doctor: "4764", ward, ed, dd,
-//	            hyperlink, parent_page_id, bookmark,
-//	            rev: [ { rev_id, url: "2026/<dir>/<file>.jpg", created_at, user } ],
-//	            anno: [] } ] }
-//
-// One document per PATIENT, holding an array of pages, each holding an array of
-// revisions. A revision is a re-scan/re-save of the same page, so the revisions of one
-// page are versions of one thing, not separate images.
-//
-// DECISIONS TAKEN BY THE CLINIC OWNER (7 Sep 2026), recorded because each one loses or
-// keeps real patient data:
-//
-//   - LATEST REVISION ONLY. Older revisions are neither copied nor recorded. `photos`
-//     has no column that could mark one row as "the current version of that page", so
-//     importing every revision would show the doctor several near-identical images with
-//     nothing to say which one is current. The count of skipped revisions is reported so
-//     the loss is visible rather than silent.
-//   - consent_given = true on every row.
-//   - No schema change, so no migrate_source_ref column to dedup on.
-//   - FILED BY VISIT DAY (24 Oct 2026). Every image carries the day it belongs to
-//     (PhotoFile.VisitDate): the page's own วันตรวจ, page.vd_first — the visit V2 shows it
-//     under — or, when the page has no usable vd_first, the Bangkok calendar day of the
-//     scan. The web tool files one visit per patient per such day, so chart pages and
-//     before/after photos land on the day they were taken instead of in the single
-//     2026-01-01 import visit per patient that the 15 Sep 2026 decision produced.
-//
-// DECISIONS TAKEN HERE (implementation, reversible):
-//
-//   - visit_id is NO LONGER left NULL. It used to be, on the grounds that SaveMedia (PUT
-//     /v3/charts/:hn/:vn/media) does `DELETE FROM photos WHERE clinic_code = ? AND
-//     visit_id = ?` — a hard delete — so a bound row would be destroyed the first time a
-//     doctor saved media on that encounter.
-//
-//     That reasoning was right about the danger and wrong about the outcome: the
-//     before/after modal reads media PER VISIT, so a page with visit_id NULL can never
-//     appear in it at all. Measured on a real migrated clinic: 435 of 437 imported rows
-//     had visit_id NULL and the modal was empty. The pages are therefore bound to a visit
-//     by the caller (see the web tool's buildInsertSQL), and v4 migration 0420 adds
-//     photos.legacy_import so DeleteMediaByVisit skips them instead. Binding without
-//     that column deployed WILL destroy the scans — the two changes ship together.
-//   - kind comes from the area_tag family: before → before, after → after, everything
-//     else → note. The column is CHECK (before|after|note). A scanned OPD form is
-//     neither a before nor an after photo, and calling it one would file a lab result in
-//     the "ก่อนทำ" slot; but V2's own before/after pages ARE those things and belong in
-//     the slots, which is why they are no longer flattened to note.
-//   - doctype "trash" is NOT imported (owner's decision, 15 Sep 2026). V2 already threw
-//     those pages away; carrying them over refills a bin the clinic emptied. The count is
-//     reported so the omission is visible rather than silent.
-//   - The on-disk filename is a hash of clinic+rev_id, not a random UUID and not the
-//     rev_id itself. Random would break this package's determinism promise (the same
-//     dump must produce a byte-identical artifact, so two runs can be diffed); the raw
-//     rev_id was declined by the owner. A hash is deterministic, opaque, and collision-
-//     free for distinct revisions.
+// Each page keeps its newest timestamped revision. Examination date comes from
+// vd_first, with the Bangkok scan day as an explicit fallback. A stable page identity and full original
+// metadata preserve exact doctypes, old VN, revisions and annotation data.
+// Before/After and known V2 composites are separate from E1 form/drawing pages.
+// Unknown types stay unknown; missing/invalid dates are reported, never invented.
+// V4 migrations 0420 and 0798 are required before applying the manifest.
 
 // EntPhoto is the entity name for imported patient page images.
 const EntPhoto = "photos"
@@ -123,6 +61,12 @@ const photoThumbCategory = "opd-photo-thumb"
 // PhotoFile is one image to copy, plus every column value the row needs except the
 // byte count. The caller reads that off the file and fills FileSize in.
 type PhotoFile struct {
+	// VisitDate is vd_first or, when unavailable, the Bangkok scan day.
+	VisitDate  string `json:"visit_date"`
+	SourceType string `json:"source_type"`
+	SourceRef  string `json:"source_ref"`
+	// Preserve the full legacy page, including exact doctype, VN and annotation data.
+	SourceMetadata json.RawMessage `json:"source_metadata"`
 	// SourcePath is the path INSIDE the exported tar, e.g.
 	// "nas-doctorease/mris_images/page/2026/<dir>/<file>.jpg".
 	SourcePath string `json:"source_path"`
@@ -149,24 +93,13 @@ type PhotoFile struct {
 	// ── photos columns ───────────────────────────────────────────────────────
 	HN         string `json:"hn"`
 	ClinicCode string `json:"clinic_code"`
-	// TakenAt is rev.created_at as RFC3339 UTC. It is half of the duplicate key the
-	// caller uses (with file_size), because no column exists to record the source ref.
+	// TakenAt is rev.created_at as RFC3339 UTC, independent of VisitDate.
 	TakenAt string `json:"taken_at"`
-	// VisitDate is the day the image is filed under at the target, YYYY-MM-DD: page.vd_first
-	// when it names a real day, else the Bangkok day of TakenAt. See photoVisitDate. The
-	// web tool groups images into one visit per (HN, VisitDate) — reusing a visit V4 already
-	// holds for that patient and day, opening one only when there is none.
-	//
-	// Empty only when the page has neither a usable vd_first nor a revision timestamp; the
-	// report counts those, and the web tool files them under its fixed import date.
-	VisitDate string `json:"visit_date,omitempty"`
 	// DoctorCode is page.doctor. The legacy numeric code is KEPT by the doctor import
 	// (see doctor.go), so this value resolves at the target as-is.
 	DoctorCode string `json:"doctor_code,omitempty"`
-	// CreatedBy is rev.user. users.id is preserved by the users import
-	// (KeepLegacyUserIDs), so the legacy number identifies the same person at the
-	// target — but only when that import ran for this clinic. Empty when the value is
-	// not a number.
+	// CreatedBy stays empty: rev.user is a legacy id, not a V4 account identity.
+	// Its original value is retained in SourceMetadata instead.
 	CreatedBy string `json:"created_by,omitempty"`
 	// AreaTag is page.doctype folded to its FAMILY: every "OPD…" code becomes "OPD",
 	// every "BA…" becomes "BA", and "before"/"after" pass through untouched. One real
@@ -179,7 +112,7 @@ type PhotoFile struct {
 	// per-visit before/after modal drops the image into. Derived from AreaTag, never read
 	// from the source: see areaKind.
 	Kind string `json:"kind"`
-	// Note carries the page identity that photos has no columns for: page number,
+	// Note is a human-readable summary; SourceMetadata preserves the structured identity: page number,
 	// docgroup, and the visit dates. Written for a human reading the record, not for
 	// this tool to parse back.
 	Note string `json:"note,omitempty"`
@@ -187,6 +120,7 @@ type PhotoFile struct {
 
 // PhotoManifest is the whole copy plan for one clinic.
 type PhotoManifest struct {
+	Version    int    `json:"version"`
 	ClinicCode string `json:"clinic_code"`
 	// UploadsSubdir is the directory every TargetPath sits under, so a caller can
 	// create it once.
@@ -226,9 +160,9 @@ func areaFamily(doctype string) string {
 // scanned form, a lab result or a consent page is not a before-photo, and putting one in
 // that slot would make the modal state something the source never said.
 func areaKind(areaTag string) string {
-	switch areaTag {
+	switch strings.ToLower(areaTag) {
 	case "before", "after":
-		return areaTag
+		return strings.ToLower(areaTag)
 	default:
 		return "note"
 	}
@@ -270,8 +204,8 @@ const (
 // morning in Bangkok.
 func photoVisitDate(pd mongodump.Doc, scannedAt time.Time) (string, visitDateSource) {
 	if v := strings.TrimSpace(pd.Text("vd_first")); v != "" {
-		if t, err := time.Parse(visitDateLayout, v); err == nil && t.Year() >= earliestVisitYear {
-			return t.Format(visitDateLayout), visitDateFromV2
+		if day, err := examinationDate(v); err == nil {
+			return day, visitDateFromV2
 		}
 	}
 	if day := clinicDayOf(scannedAt); day != "" {
@@ -283,15 +217,74 @@ func photoVisitDate(pd mongodump.Doc, scannedAt time.Time) (string, visitDateSou
 // clinicDayOf is the clinic-time calendar day of an instant, or "" for an instant that is
 // not one (a revision with no timestamp leaves the zero time behind).
 func clinicDayOf(at time.Time) string {
-	if at.IsZero() || at.In(clinicZone).Year() < earliestVisitYear {
+	if at.IsZero() || at.In(clinicZone).Year() < earliestVisitYear || at.In(clinicZone).Year() > 2200 {
 		return ""
 	}
 	return at.In(clinicZone).Format(visitDateLayout)
 }
 
+// examinationDate validates the source day; photoVisitDate applies the scan-day fallback.
+func examinationDate(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	for _, layout := range []string{"2006-01-02", "02/01/2006"} {
+		if d, err := time.Parse(layout, raw); err == nil && d.Year() >= 1900 && d.Year() <= 2200 {
+			return d.Format("2006-01-02"), nil
+		}
+	}
+	return "", fmt.Errorf("วันที่ตรวจ vd_first ไม่ถูกต้อง: %q", raw)
+}
+
+func pageSourceType(pd mongodump.Doc, overrides map[string]string) (string, error) {
+	doctype := strings.ToLower(strings.TrimSpace(pd.Text("doctype")))
+	if doctype == "before" || doctype == "after" {
+		return "before_after", nil
+	}
+	for code, sourceType := range overrides {
+		if strings.EqualFold(strings.TrimSpace(code), doctype) {
+			switch sourceType {
+			case "before_after", "form", "drawing":
+				return sourceType, nil
+			default:
+				return "", fmt.Errorf("page type mapping %q: ประเภท %q ไม่ถูกต้อง", code, sourceType)
+			}
+		}
+	}
+	// BeforeAfterController produces these composites; neither side may be invented.
+	if strings.TrimSpace(pd.Text("docgroup")) == "29" {
+		return "before_after", nil
+	}
+	switch doctype {
+	case "ba2", "ba6", "ba10", "bav":
+		return "before_after", nil
+	case "drawing", "draw", "freehand":
+		return "drawing", nil
+	}
+	if strings.HasPrefix(strings.ToUpper(doctype), "OPD") {
+		return "form", nil
+	}
+	// Annotation data alone does not identify the originating function: a scanned
+	// form or lab result may have ink too. Require a known doctype or explicit mapping.
+	return "unknown", nil
+}
+
 // buildPhotos reads the `page` collection and returns the copy plan. It renders no SQL:
 // see the package comment above for why.
 func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
+	normalizedTypes := map[string]string{}
+	for code, sourceType := range in.PageTypeMap {
+		key := strings.ToLower(strings.TrimSpace(code))
+		if key == "" || (sourceType != "before_after" && sourceType != "form" && sourceType != "drawing") {
+			return nil, fmt.Errorf("page type mapping %q: ประเภท %q ไม่ถูกต้อง", code, sourceType)
+		}
+		if previous, ok := normalizedTypes[key]; ok && previous != sourceType {
+			return nil, fmt.Errorf("page type mapping %q มีประเภทขัดแย้งกัน", code)
+		}
+		if (key == "before" || key == "after") && sourceType != "before_after" {
+			return nil, fmt.Errorf("ไม่เปลี่ยนประเภท %q ออกจาก Before–After", code)
+		}
+		normalizedTypes[key] = sourceType
+	}
+	in.PageTypeMap = normalizedTypes
 	cols, err := mongodump.Parse(body)
 	if err != nil {
 		return nil, fmt.Errorf("page dump: %w", err)
@@ -321,6 +314,7 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	droppedCreatedBy := 0
 
 	man := &PhotoManifest{
+		Version:            2,
 		ClinicCode:         in.ClinicCode,
 		UploadsSubdir:      path.Join(in.ClinicCode, photoCategory),
 		UploadsThumbSubdir: path.Join(in.ClinicCode, photoThumbCategory),
@@ -346,10 +340,6 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	// malformed export could repeat a document, and copying the same bytes twice would
 	// produce two rows for one image.
 	seenTarget := map[string]bool{}
-	// The caller's duplicate key at the target is (hn, taken_at, file_size). If two
-	// DIFFERENT images in this very manifest share hn+taken_at, that key can only
-	// separate them by size — worth saying out loud rather than discovering later.
-	sameInstant := map[string][]string{}
 
 	pages, revs, skippedRevs := 0, 0, 0
 	// Pages V2 had already deleted. Counted rather than dropped in silence: "437 files in
@@ -390,6 +380,15 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				continue
 			}
 			pages++
+			if strings.EqualFold(strings.TrimSpace(pd.Text("doctype")), legacyTrashDoctype) || strings.TrimSpace(pd.Text("docgroup")) == "11" {
+				e.skip("V2 ทิ้งหน้านี้แล้ว (doctype=trash)")
+				trashed++
+				continue
+			}
+			sourceType, typeErr := pageSourceType(pd, in.PageTypeMap)
+			if typeErr != nil {
+				return nil, typeErr
+			}
 
 			revList, hasRev := arrayOf(pd, "rev")
 			if !hasRev || len(revList) == 0 {
@@ -403,6 +402,18 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				e.skip("หน้ามี rev แต่ทุกอันไม่มี url")
 				continue
 			}
+			if latestAt.IsZero() {
+				e.skip("revision ไม่มีเวลาที่ใช้ตรวจล่าสุดได้")
+				rep.warnf("photos: hn %s หน้า %s ไม่มีเวลา revision ที่ใช้ได้ — ต้องตรวจสอบ", hn, pd.Text("page"))
+				continue
+			}
+			visitDate, from := photoVisitDate(pd, latestAt)
+			if visitDate == "" {
+				e.skip("ไม่มีวันตรวจหรือวันสแกนที่ใช้ได้ — ต้องตรวจสอบ")
+				continue
+			}
+			dateFrom[from]++
+			patientDays[hn+"|"+visitDate] = true
 			skippedRevs += count - 1
 
 			url := strings.TrimSpace(latest.Text("url"))
@@ -439,20 +450,62 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 			areaTag, cut := clip(areaFamily(doctype), 16)
 			tr.note("area_tag", cut)
 			kind := areaKind(areaTag)
+			if kind == "before" || kind == "after" {
+				areaTag = kind
+			}
 			kinds[kind]++
+			if sourceType == "unknown" {
+				rep.warnf("photos: hn %s doctype %q ไม่ทราบฟังก์ชัน — เก็บในคลังภาพพร้อมประเภท unknown; ใช้ -page-type-map ระบุประเภท", hn, doctype)
+			}
+			if anno, ok := arrayOf(pd, "anno"); ok && len(anno) > 0 {
+				rep.warnf("photos: hn %s หน้า %s เก็บ anno เดิมใน source_metadata; ยังไม่แปลงเป็นเส้นวาด V4", hn, pd.Text("page"))
+			}
+			sourceRef := docObjectID(pd, "page_id")
+			if sourceRef == "" {
+				if strings.TrimSpace(pd.Text("page")) == "" {
+					e.skip("ไม่มี page_id หรือเลขหน้าให้ระบุตัวตน")
+					continue
+				}
+				sourceRef = "page-key:" + photoFileName(in.ClinicCode, hn+"\x00"+visitDate+"\x00"+doctype+"\x00"+pd.Text("page"))
+				rep.warnf("photos: hn %s หน้า %s ไม่มี page_id — ใช้วันที่+doctype+เลขหน้าเป็นตัวระบุ", hn, pd.Text("page"))
+			}
+			metadataDoc := mongodump.Doc{}
+			for k, value := range pd {
+				metadataDoc[k] = value
+			}
+			var legacyPaths []string
+			for _, value := range revList {
+				if rev, ok := value.(mongodump.Doc); ok {
+					u := strings.TrimSpace(rev.Text("url"))
+					if u == "" {
+						continue
+					}
+					id := docObjectID(rev, "rev_id")
+					if id == "" {
+						id = u
+					}
+					ext := strings.ToLower(path.Ext(u))
+					if ext == "" {
+						ext = ".jpg"
+					}
+					legacyPaths = append(legacyPaths, path.Join(man.UploadsSubdir, photoFileName(nameSalt, id)+ext))
+				}
+			}
+			metadataDoc["_legacy_file_paths"] = legacyPaths
+			metadataDoc["_visit_date_source"] = "vd_first"
+			if from == visitDateFromScan {
+				metadataDoc["_visit_date_source"] = "scan"
+			}
+			metadata, err := json.Marshal(metadataDoc)
+			if err != nil {
+				return nil, fmt.Errorf("page metadata: %w", err)
+			}
 
 			note, cut := clip(photoNote(pd), 0)
 			tr.note("note", cut)
 
 			takenAt := latestAt.UTC().Format(time.RFC3339Nano)
-			key := hn + "|" + takenAt
-			sameInstant[key] = append(sameInstant[key], url)
 
-			visitDate, from := photoVisitDate(pd, latestAt)
-			dateFrom[from]++
-			if visitDate != "" {
-				patientDays[hn+"|"+visitDate] = true
-			}
 			if from == visitDateFromV2 {
 				// Both strings are YYYY-MM-DD, so string order is calendar order.
 				if scanned := clinicDayOf(latestAt); scanned != "" && visitDate > scanned {
@@ -483,9 +536,13 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 			}
 
 			man.Files = append(man.Files, PhotoFile{
-				SourcePath: path.Join(nasFolder, legacyPageSubdir, url),
-				SourceURL:  url,
-				TargetPath: target,
+				VisitDate:      visitDate,
+				SourceType:     sourceType,
+				SourceRef:      "mris.page:" + sourceRef,
+				SourceMetadata: metadata,
+				SourcePath:     path.Join(nasFolder, legacyPageSubdir, url),
+				SourceURL:      url,
+				TargetPath:     target,
 				// Same `url`, the other tree, and the SAME hashed name so the pair is
 				// obvious on disk: <hash>.jpg in opd-photo and <hash>.jpg in
 				// opd-photo-thumb. Determinism is preserved because the name is still
@@ -496,7 +553,6 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 				HN:         hn,
 				ClinicCode: in.ClinicCode,
 				TakenAt:    takenAt,
-				VisitDate:  visitDate,
 				DoctorCode: doctorCode,
 				CreatedBy:  createdBy,
 				AreaTag:    areaTag,
@@ -537,31 +593,16 @@ func buildPhotos(body []byte, in Input, rep *Report) (*PhotoManifest, error) {
 	rep.notef("photos: kind ที่ได้ — before %d · after %d · note %d · "+
 		"โมดัลก่อน-หลังเติมช่องได้จาก before/after เท่านั้น ส่วน note อ่านได้จากแถบรูปของแฟ้ม",
 		kinds["before"], kinds["after"], kinds["note"])
-	rep.notef("photos: วันของ visit — ตามวันตรวจของ V2 (vd_first) %d รูป · ใช้วันที่สแกนตามเวลาไทยแทน %d รูป "+
-		"(vd_first ว่างหรือไม่ใช่วันที่แบบ YYYY-MM-DD) → %d visit (คนไข้ × วัน) · "+
-		"เว็บทูลผูกกับ visit ของคนไข้ในวันนั้นที่ V4 มีอยู่แล้ว ถ้าไม่มีจึงเปิดใบใหม่",
+	rep.notef("photos: วันของ visit — ตามวันตรวจของ V2 (vd_first) %d รูป · ใช้วันที่สแกนตามเวลาไทยแทน %d รูป → %d visit (คนไข้ × วัน)",
 		dateFrom[visitDateFromV2], dateFrom[visitDateFromScan], len(patientDays))
-	if n := dateFrom[visitDateUnknown]; n > 0 {
-		rep.warnf("photos: %d รูปไม่มีทั้ง vd_first และเวลาสแกน — บอกวันของ visit ไม่ได้ "+
-			"เว็บทูลจะยื่นไว้ที่ visit นำเข้าวันคงที่ 2026-01-01 แบบเครื่องมือรุ่นก่อน", n)
-	}
 	if datedAfterScan > 0 {
-		rep.warnf("photos: %d รูปมีวันตรวจ (vd_first) หลังวันที่สแกน เช่น %s — ยังยื่นตามวันตรวจของ V2 "+
-			"แต่ควรตรวจก่อนว่าไม่ใช่ปี พ.ศ. หรือวันที่พิมพ์ผิด เพราะจะได้ visit ในวันนั้นจริง ๆ",
-			datedAfterScan, afterScanSample)
+		rep.warnf("photos: %d รูปมีวันตรวจหลังวันที่สแกน เช่น %s", datedAfterScan, afterScanSample)
 	}
 	if spansDays > 0 {
-		rep.notef("photos: %d หน้ามีวันตรวจหลายวัน (vd_first ≠ vd_last) — ยื่นไว้ที่วันแรก (vd_first)", spansDays)
-	}
-	for key, urls := range sameInstant {
-		if len(urls) > 1 {
-			parts := strings.SplitN(key, "|", 2)
-			rep.warnf("photos: hn %s มี %d รูปที่ created_at ตรงกันเป๊ะ (%s) — ตัวกันนำเข้าซ้ำแยกได้ด้วยขนาดไฟล์เท่านั้น ถ้าขนาดเท่ากันด้วยจะถูกมองเป็นรูปเดียว",
-				parts[0], len(urls), parts[1])
-		}
+		rep.notef("photos: %d หน้ามีวันตรวจหลายวัน (vd_first ≠ vd_last) — ยื่นไว้ที่วันแรก", spansDays)
 	}
 	if len(man.Files) == 0 {
-		return nil, fmt.Errorf("ไฟล์ -page ไม่มีรูปที่นำเข้าได้เลย (ไม่มี hn ที่มี rev พร้อม url)")
+		return nil, fmt.Errorf("ไฟล์ -page ไม่มีหน้าที่ผ่านการตรวจวันที่ตรวจ revision และตัวระบุ — ตรวจรายงานก่อนนำเข้า")
 	}
 	return man, nil
 }

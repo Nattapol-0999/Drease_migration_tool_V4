@@ -1,4 +1,6 @@
 import "server-only";
+import { executePhotoImport as executeLegacyPhotoImport, PhotoRunError as LegacyPhotoRunError } from "@/lib/photo-run-legacy";
+import { usesPhotoManifestV2 } from "@/lib/photo-rollout";
 
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -45,6 +47,8 @@ const run = promisify(execFile);
  */
 
 export interface PhotoRunOptions {
+  /** Explicit site-specific doctype mapping; never infer a type from the image bytes. */
+  pageTypeMap?: Record<string, 'before_after' | 'form' | 'drawing'>;
   /** Path to system_cliv4. */
   cli: string;
   clinic: string;
@@ -146,6 +150,15 @@ export class PhotoRunError extends Error {
 }
 
 export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRunResult> {
+  // Roll out to v4demo first. Production retains its deployed CLI and original importer.
+  if (!usesPhotoManifestV2(opts.targetId, process.env.PHOTO_IMPORT_V2_TARGETS)) {
+    try { return await executeLegacyPhotoImport(opts); }
+    catch (err) {
+      if (err instanceof LegacyPhotoRunError) throw new PhotoRunError(err.message, err.status, err.partial);
+      throw err;
+    }
+  }
+  opts = { ...opts, cli: process.env.IMPORT_PHOTO_CLI_PATH?.trim() || opts.cli };
   const { cli, clinic, targetId, sessionId, mode, user, onPhase } = opts;
   const phase = (s: string) => onPhase?.(s);
   const photoNameSalt = (opts.photoNameSalt ?? "").trim();
@@ -225,6 +238,7 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       // an ordinary run is byte-identical to every run before this option existed.
       const cliArgs = ["-clinic", clinic, "-page", pagePath, "-out", work];
       if (photoNameSalt) cliArgs.push("-photo-name-salt", photoNameSalt);
+      if (opts.pageTypeMap) cliArgs.push('-page-type-map', JSON.stringify(opts.pageTypeMap));
       const { stdout } = await run(cli, cliArgs, {
         maxBuffer: 32 * 1024 * 1024,
         windowsHide: true,
@@ -309,12 +323,9 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
       );
     }
 
-    // 4 · then the rows, in one transaction on the database host. More than `rows` rows land:
-    // the script also files each patient-DAY into a visit — reusing the one V4 already holds,
-    // opening one only when there is none — and gives that visit a face_chart of its chart
-    // pages, so the tables are named without a total. Saying "404 rows" while three tables fill
-    // up is the kind of half-truth that makes a later count look like a bug.
-    phase(`เขียน ${rows} รูป → photos + visit + ผังหน้า`);
+    // 4 · Then the rows, in one transaction. `rows` is the number of planned photos;
+    // the script also matches visits by examination day and creates form/drawing pages.
+    phase(`เขียน ${rows} รูป → Visit ตามวันตรวจ + Before–After/ฟอร์ม/วาดเขียน`);
     const r = await runSSH(sshArgs(dbTarget, psqlCommand(dbTarget)), sql);
     const seconds = ((Date.now() - started) / 1000).toFixed(1);
     const log = [trimLog, ship.log, r.stdout, r.stderr].filter(Boolean).join("\n").trim();
@@ -344,7 +355,7 @@ export async function executePhotoImport(opts: PhotoRunOptions): Promise<PhotoRu
     if (r.code !== 0) {
       throw new PhotoRunError(
         `เขียนแถวไม่สำเร็จ (exit ${r.code}) — ฐานข้อมูลไม่ถูกเปลี่ยนเพราะอยู่ในทรานแซกชันเดียว ` +
-          `แต่ไฟล์รูป ${ship.filesSent} ไฟล์ถูกคัดลอกขึ้นเครื่องปลายทางแล้ว (ไม่มีแถวอ้างถึง จึงไม่มีใครเห็น)`,
+          `ตรวจและส่งไฟล์รูป ${ship.filesSent} ไฟล์แล้ว — ไฟล์เดิมไม่ถูกเขียนทับ ส่วนไฟล์ใหม่อาจค้างโดยยังไม่มีแถวอ้างถึง`,
         422,
         { ...base, filesSent: ship.filesSent, bytesSent: ship.bytesSent, seconds, log },
       );

@@ -38,6 +38,9 @@ import (
 // supplied. An empty file means "skip that entity", so a clinic can be migrated in
 // stages.
 type Input struct {
+	// PageTypeMap maps exact legacy doctypes to before_after, form, or drawing.
+	// Unknown doctypes stay unknown unless the export contains explicit evidence.
+	PageTypeMap map[string]string
 	// ClinicCode is the tenant every generated row is stamped with. The clinic must
 	// already exist in V4 — see BuildScript's guard.
 	ClinicCode string
